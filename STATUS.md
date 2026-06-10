@@ -9,8 +9,8 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `ba8e564` — feat(ingestion): wire optional fixture classification stage
-- This commit: docs(event-study): add Phase 4 price reaction design plan
+- Previous: `f0617b8` — docs(event-study): add Phase 4 price reaction design plan
+- This commit: docs(workflow): add compact Claude task template
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -107,6 +107,10 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   canonical-event rule for duplicates, decision to keep one row per
   (event, horizon); migration 003 rebuild and fixture PriceSource step
   documented as future work only.
+- Compact Claude/Cowork task template (docs/claude-task-template.md,
+  linked from README, referenced by a CLAUDE.md rule): routine prompts now
+  reference STATUS.md/CLAUDE.md instead of restating project history;
+  long prompts reserved for risky work.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).

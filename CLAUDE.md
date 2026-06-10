@@ -167,3 +167,7 @@ For all tasks:
 
 * Report the intended changed files before commit.
 * If the actual changed files differ from the expected files, stop and explain before staging.
+
+## Task prompt template
+
+Routine tasks should use the compact prompt in `docs/claude-task-template.md` instead of restating the full project history. STATUS.md is the current-state source of truth; this file is the standing-rules source of truth. Longer prompts are reserved for risky work: schema migrations, provider/model integration, or trading-adjacent changes.

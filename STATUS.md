@@ -9,8 +9,8 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `4e5e392` — feat(db): add sentiment_scores Phase 3 columns and writer
-- This commit: feat(ingestion): wire optional fixture classification stage
+- Previous: `ba8e564` — feat(ingestion): wire optional fixture classification stage
+- This commit: docs(event-study): add Phase 4 price reaction design plan
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -100,6 +100,13 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   and per-event errors; ingestNews behavior unchanged when no classifier is
   supplied; full local pipeline proven news -> normalized event ->
   news_events row -> fixture classifier -> sentiment_scores row; 10 tests.
+- Phase 4 event-study design (docs/event-study-plan.md, linked from
+  README): canonical horizons (10s/1m/5m/30m/1h/eod), windows anchored at
+  received_at to avoid look-ahead bias, measurement_status for unavailable
+  prices (failures are data), score linkage grouped by prompt_version,
+  canonical-event rule for duplicates, decision to keep one row per
+  (event, horizon); migration 003 rebuild and fixture PriceSource step
+  documented as future work only.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -160,13 +167,11 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Phase 3 is now functionally complete in fixture-only form pending review.
-Next: planning prompt for Phase 4 event-study design (price_reactions
-measurement windows, baseline/reaction sourcing, return calculation,
-linkage to sentiment_scores by prompt_version) — planning/design only, or
-alternatively a reviewed real-model transport design for Phase 3 if that
-is preferred first. No model calls, no provider API calls, no trading
-logic, no dependencies without approval.
+Implement the reviewed event-study storage foundation in one small task:
+migration 003 (price_reactions rebuild per docs/event-study-plan.md §6),
+a PriceSource contract with fixture price source (injected data, throwing
+default), an insertPriceReaction writer, and tests. No market-data API
+calls, no model calls, no trading logic, no dependencies.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

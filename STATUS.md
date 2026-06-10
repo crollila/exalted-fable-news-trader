@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (53/53).
+- Stable. All tests passing (63/63).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `4e2c074` — feat(providers): add Alpaca News adapter skeleton with fixture tests
-- This commit: feat(providers): add Benzinga News adapter skeleton with fixture tests
+- Previous: `b5a3ab0` — feat(providers): add Benzinga News adapter skeleton with fixture tests
+- This commit: feat(providers): add Alpha Vantage News adapter skeleton with fixture tests
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -35,6 +35,14 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   fixture tests including RFC-2822 timestamp normalization; fixture-backed
   ingestion integration proving insert/dedup/query; provider-scoped dedup
   verified across Alpaca and Benzinga shared numeric IDs.
+- Alpha Vantage News Sentiment adapter skeleton
+  (src/providers/alphaVantageNewsProvider.js): injected transport only, no
+  default network calls; static fixture tests; deterministic providerEventId
+  derived from article URL (fallback for URL-less items); compact UTC
+  timestamp parsing; ticker_sentiment mapped to canonical symbols; provider
+  sentiment fields retained only in raw_payload; fixture-backed ingestion
+  integration proving insert/dedup/query; cross-provider shared-ID dedup
+  remains scoped by provider name.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -50,10 +58,10 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   abstraction to persistence; the mock provider supports end-to-end local
   ingestion tests. Still no real provider API calls, no sentiment/model
   calls, no trading logic.
-- Alpaca and Benzinga adapters map provider-shaped raw items into canonical
-  normalized events. Both adapters are non-network until real
-  transports/clients are explicitly added later. No API keys anywhere,
-  no sentiment/model calls, no trading logic.
+- Alpaca, Benzinga, and Alpha Vantage adapters map provider-shaped raw
+  items into canonical normalized events. Adapters are non-network until
+  real transports/clients are explicitly added later. No API keys anywhere,
+  no sentiment/model calls, no writes to sentiment_scores, no trading logic.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -74,14 +82,16 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   news_events.raw_payload (JSON) until they earn columns.
 - dedup_group remains null until cross-provider story grouping is built.
 - Ingestion is mock/local only until real provider adapters are added.
-- Provider adapters (Alpaca, Benzinga) are fixture/transport-injection
-  only; no real API clients yet.
+- Provider adapters (Alpaca, Benzinga, Alpha Vantage) are
+  fixture/transport-injection only; no real API clients yet.
+- Alpha Vantage article IDs are derived (from URL) because the provider
+  feed lacks a dedicated event ID.
 - receivedAt is stamped at normalization time for now (true wire-receipt
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Alpha Vantage News Sentiment adapter skeleton with fixture tests, same
-pattern: injected transport, no real API calls, no keys.
+Polygon/Massive News adapter skeleton with fixture tests, same pattern:
+injected transport, no real API calls, no keys.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

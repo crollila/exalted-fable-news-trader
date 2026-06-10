@@ -142,3 +142,28 @@ GitHub repo target:
 * `https://github.com/crollila/exalted-fable-news-trader`
 
 Do not touch, rename, overwrite, or push to the old V1 repository.
+
+## Standing task rules
+
+For every task, infer and preserve the safest project state from `STATUS.md`, `BUILD_PLAN.md`, `PROJECT_CONTEXT.md`, and relevant docs before editing.
+
+For documentation, planning, checkpoint, or phase-transition tasks:
+
+* Treat `STATUS.md` as an expected changed file when the task changes current phase, completed work, architecture notes, warnings/technical debt, or next recommended task.
+* Do not modify source behavior.
+* Do not add database migrations.
+* Do not add dependencies.
+* Do not add API/model/provider calls.
+* Do not add trading logic.
+* Keep the change documentation-only unless the prompt explicitly approves code changes.
+
+For provider-related or sentiment/classification-related tasks:
+
+* Read `docs/providers.md` first if it exists.
+* Provider-supplied sentiment must remain provider metadata in `raw_payload` until Phase 3 explicitly implements ExaltedFable's own sentiment/classification engine.
+* Do not write provider-supplied sentiment into `sentiment_scores` unless a later reviewed task explicitly approves that behavior.
+
+For all tasks:
+
+* Report the intended changed files before commit.
+* If the actual changed files differ from the expected files, stop and explain before staging.

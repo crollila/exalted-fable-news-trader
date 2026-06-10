@@ -9,14 +9,15 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `0af9a9c` — test(providers): add registry tests for exports, names, and contracts
-- This commit: docs(providers): document adapter pattern and Phase 2 readiness
+- Previous: `5c4ca2b` — docs(providers): document adapter pattern and Phase 2 readiness
+- This commit: docs(planning): add standing task rules and Phase 3 sentiment plan
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
-Phase 2 — News Provider Abstraction. The Phase 2 skeleton is functionally
-complete (contract, normalization, four adapter skeletons, ingestion,
-persistence, registry tests, docs) pending ChatGPT/user decision to move on.
+Phase 2 functionally complete (contract, normalization, four adapter
+skeletons, ingestion, persistence, registry tests, docs).
+Phase 3 — Sentiment & Classification: planning started (design doc only;
+implementation not started).
 
 ## Completed Work
 - Initial setup (repo, docs, .gitignore, .env.example).
@@ -64,6 +65,13 @@ persistence, registry tests, docs) pending ChatGPT/user decision to move on.
   abstraction purpose, canonical event path, injected-transport pattern,
   fixture-only safety, provider table, limitations, how to add a provider.
   Phase 2 readiness checkpoint recorded.
+- Standing workflow/task rules added to CLAUDE.md (safest-state inference,
+  expected-changed-files reporting, docs-only defaults for planning tasks,
+  provider-sentiment isolation rules).
+- Phase 3 sentiment/classification planning doc created
+  (docs/sentiment-classification-plan.md): taxonomy v1, scoring output
+  schema, prompt versioning, parser_status/fallback handling, storage
+  mapping with gaps, future testing plan. README linked to the new doc.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -86,6 +94,9 @@ persistence, registry tests, docs) pending ChatGPT/user decision to move on.
   no writes to sentiment_scores, no trading logic.
 - Provider exports are covered by registry tests; contract drift or a
   missing export is caught by the test suite.
+- Sentiment/classification remains design-only. Provider-supplied sentiment
+  remains in raw_payload only. No model calls, no writes to
+  sentiment_scores, no trading logic.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -105,6 +116,8 @@ persistence, registry tests, docs) pending ChatGPT/user decision to move on.
 - url/author/symbols/summary have no dedicated columns yet; they live in
   news_events.raw_payload (JSON) until they earn columns.
 - dedup_group remains null until cross-provider story grouping is built.
+- Phase 3 implementation not started yet; sentiment_scores table exists but
+  the Phase 3 writer/parser is not implemented.
 - Ingestion is mock/local only until real provider adapters are added.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
@@ -114,9 +127,10 @@ persistence, registry tests, docs) pending ChatGPT/user decision to move on.
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Planning prompt for Phase 3 sentiment/classification design (prompt
-versioning, news type taxonomy, model response storage, malformed-output
-fallback). Planning only — no immediate coding, no real API clients.
+Fixture-only classifier contract and parser tests: define the classifier
+interface and output parser against fixture model responses (valid and
+malformed). No model calls, no dependencies, no schema migration unless
+explicitly approved.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

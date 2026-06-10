@@ -9,8 +9,8 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `79e17cc` — docs(planning): add standing task rules and Phase 3 sentiment plan
-- This commit: feat(sentiment): add fixture-only classifier contract and parser
+- Previous: `8f89814` — feat(sentiment): add fixture-only classifier contract and parser
+- This commit: docs(sentiment): add sentiment_scores storage design (hybrid)
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -79,6 +79,12 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   score ranges, enum fallback handling, model_error, raw response
   preservation, required prompt_version, and classification failure not
   blocking ingestion and not writing to sentiment_scores (13 tests).
+- Sentiment storage design (docs/sentiment-storage-plan.md, linked from
+  README): gap analysis of sentiment_scores vs parser output; decision is
+  hybrid — explicit columns for parser_status, impact_score, direction,
+  time_horizon plus one JSON detail column for affected_symbols, rationale,
+  errors; planned migration 002 and writer mapping documented as future
+  work only.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -124,9 +130,9 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 - url/author/symbols/summary have no dedicated columns yet; they live in
   news_events.raw_payload (JSON) until they earn columns.
 - dedup_group remains null until cross-provider story grouping is built.
-- No sentiment_scores writer yet; no schema migration yet. Storage gaps
-  remain unresolved for impact_score, direction, time_horizon,
-  affected_symbols, rationale, and parser_status (plan §7).
+- No sentiment_scores writer yet; no schema migration yet. The storage
+  approach is now decided (hybrid, docs/sentiment-storage-plan.md) but
+  migration 002 and the writer are not implemented.
 - Ingestion is mock/local only until real provider adapters are added.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
@@ -136,9 +142,10 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Design the sentiment_scores persistence/writer mapping and decide
-migration-vs-JSON detail column before implementing storage. No model
-calls, no provider API calls, no trading logic, no dependencies.
+Implement the reviewed storage design in one small task: migration
+002_sentiment_scores_phase3.sql plus the insertSentimentScore writer and
+tests (fixture classifier results only). No model calls, no provider API
+calls, no trading logic, no dependencies.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

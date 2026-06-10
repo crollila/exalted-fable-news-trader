@@ -4,20 +4,20 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (78/78).
+- Stable. All tests passing (91/91).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `5c4ca2b` — docs(providers): document adapter pattern and Phase 2 readiness
-- This commit: docs(planning): add standing task rules and Phase 3 sentiment plan
+- Previous: `79e17cc` — docs(planning): add standing task rules and Phase 3 sentiment plan
+- This commit: feat(sentiment): add fixture-only classifier contract and parser
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
 Phase 2 functionally complete (contract, normalization, four adapter
 skeletons, ingestion, persistence, registry tests, docs).
-Phase 3 — Sentiment & Classification: planning started (design doc only;
-implementation not started).
+Phase 3 — Sentiment & Classification: fixture-only implementation started
+(contract/parser/fixture classifier only; no model calls, no storage writer).
 
 ## Completed Work
 - Initial setup (repo, docs, .gitignore, .env.example).
@@ -72,6 +72,13 @@ implementation not started).
   (docs/sentiment-classification-plan.md): taxonomy v1, scoring output
   schema, prompt versioning, parser_status/fallback handling, storage
   mapping with gaps, future testing plan. README linked to the new doc.
+- Phase 3 step 1 (src/sentiment/): fixture-only classifier contract;
+  parser/validator for model response fixtures; fixture classifier with
+  injected responder and no default model access; parser outcome tests
+  covering valid output, malformed JSON, missing required fields, invalid
+  score ranges, enum fallback handling, model_error, raw response
+  preservation, required prompt_version, and classification failure not
+  blocking ingestion and not writing to sentiment_scores (13 tests).
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -94,9 +101,10 @@ implementation not started).
   no writes to sentiment_scores, no trading logic.
 - Provider exports are covered by registry tests; contract drift or a
   missing export is caught by the test suite.
-- Sentiment/classification remains design-only. Provider-supplied sentiment
-  remains in raw_payload only. No model calls, no writes to
-  sentiment_scores, no trading logic.
+- src/sentiment is pure/local: no model, API, or network calls anywhere in
+  the module. Provider-supplied sentiment remains in raw_payload only.
+- The parser/classifier is fixture-only and writes nothing to
+  sentiment_scores. No trading logic.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -116,8 +124,9 @@ implementation not started).
 - url/author/symbols/summary have no dedicated columns yet; they live in
   news_events.raw_payload (JSON) until they earn columns.
 - dedup_group remains null until cross-provider story grouping is built.
-- Phase 3 implementation not started yet; sentiment_scores table exists but
-  the Phase 3 writer/parser is not implemented.
+- No sentiment_scores writer yet; no schema migration yet. Storage gaps
+  remain unresolved for impact_score, direction, time_horizon,
+  affected_symbols, rationale, and parser_status (plan §7).
 - Ingestion is mock/local only until real provider adapters are added.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
@@ -127,10 +136,9 @@ implementation not started).
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Fixture-only classifier contract and parser tests: define the classifier
-interface and output parser against fixture model responses (valid and
-malformed). No model calls, no dependencies, no schema migration unless
-explicitly approved.
+Design the sentiment_scores persistence/writer mapping and decide
+migration-vs-JSON detail column before implementing storage. No model
+calls, no provider API calls, no trading logic, no dependencies.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (91/91).
+- Stable. All tests passing (100/100).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `8f89814` — feat(sentiment): add fixture-only classifier contract and parser
-- This commit: docs(sentiment): add sentiment_scores storage design (hybrid)
+- Previous: `f89fa19` — docs(sentiment): add sentiment_scores storage design
+- This commit: feat(db): add sentiment_scores Phase 3 columns and writer
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -85,6 +85,14 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   time_horizon plus one JSON detail column for affected_symbols, rationale,
   errors; planned migration 002 and writer mapping documented as future
   work only.
+- Sentiment storage implementation (migration
+  002_sentiment_scores_phase3.sql + src/database/sentimentScores.js):
+  additive columns with CHECK constraints per the storage plan;
+  insertSentimentScore writer mapping ClassificationResult to rows with
+  parse_ok derived from parser_status, NULL scores for failed parses
+  (failures stored as data), byte-for-byte raw_response preservation, JSON
+  detail column for affected_symbols/rationale/errors; read/aggregate
+  helpers; 9 tests, fixture classifier/parser results only.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -109,8 +117,9 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   missing export is caught by the test suite.
 - src/sentiment is pure/local: no model, API, or network calls anywhere in
   the module. Provider-supplied sentiment remains in raw_payload only.
-- The parser/classifier is fixture-only and writes nothing to
-  sentiment_scores. No trading logic.
+- The parser/classifier remains fixture-only. sentiment_scores rows are
+  written ONLY via insertSentimentScore from fixture results in tests; no
+  model calls anywhere. No trading logic.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -130,9 +139,9 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 - url/author/symbols/summary have no dedicated columns yet; they live in
   news_events.raw_payload (JSON) until they earn columns.
 - dedup_group remains null until cross-provider story grouping is built.
-- No sentiment_scores writer yet; no schema migration yet. The storage
-  approach is now decided (hybrid, docs/sentiment-storage-plan.md) but
-  migration 002 and the writer are not implemented.
+- parser_status is nullable at the schema level (SQLite additive-column
+  limitation); presence is enforced by the writer, so rows must not be
+  inserted into sentiment_scores except through insertSentimentScore.
 - Ingestion is mock/local only until real provider adapters are added.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
@@ -142,10 +151,12 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Implement the reviewed storage design in one small task: migration
-002_sentiment_scores_phase3.sql plus the insertSentimentScore writer and
-tests (fixture classifier results only). No model calls, no provider API
-calls, no trading logic, no dependencies.
+Wire classification into the ingestion path as an optional, separate
+stage: classify-and-store for ingested events using the fixture
+classifier (classifyAndStore helper or ingestion option), proving the
+end-to-end pipeline news -> normalized event -> classification ->
+sentiment_scores with zero model calls. No provider API calls, no
+trading logic, no dependencies.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (100/100).
+- Stable. All tests passing (110/110).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `f89fa19` — docs(sentiment): add sentiment_scores storage design
-- This commit: feat(db): add sentiment_scores Phase 3 columns and writer
+- Previous: `4e5e392` — feat(db): add sentiment_scores Phase 3 columns and writer
+- This commit: feat(ingestion): wire optional fixture classification stage
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -93,6 +93,13 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   (failures stored as data), byte-for-byte raw_response preservation, JSON
   detail column for affected_symbols/rationale/errors; read/aggregate
   helpers; 9 tests, fixture classifier/parser results only.
+- Optional classification stage (src/ingestion/classifyNews.js):
+  classifyAndStore for explicit event ids and ingestAndClassify for newly
+  inserted events only; idempotent reruns via (event, model, prompt_version)
+  existence check, no schema change; observable summaries with statusCounts
+  and per-event errors; ingestNews behavior unchanged when no classifier is
+  supplied; full local pipeline proven news -> normalized event ->
+  news_events row -> fixture classifier -> sentiment_scores row; 10 tests.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -118,8 +125,10 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 - src/sentiment is pure/local: no model, API, or network calls anywhere in
   the module. Provider-supplied sentiment remains in raw_payload only.
 - The parser/classifier remains fixture-only. sentiment_scores rows are
-  written ONLY via insertSentimentScore from fixture results in tests; no
-  model calls anywhere. No trading logic.
+  written ONLY via insertSentimentScore (directly or through the optional
+  classifyAndStore/ingestAndClassify stage); no model calls anywhere. No
+  trading logic. Classification is a separate optional stage that can never
+  block or delete news_events rows.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -151,12 +160,13 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Wire classification into the ingestion path as an optional, separate
-stage: classify-and-store for ingested events using the fixture
-classifier (classifyAndStore helper or ingestion option), proving the
-end-to-end pipeline news -> normalized event -> classification ->
-sentiment_scores with zero model calls. No provider API calls, no
-trading logic, no dependencies.
+Phase 3 is now functionally complete in fixture-only form pending review.
+Next: planning prompt for Phase 4 event-study design (price_reactions
+measurement windows, baseline/reaction sourcing, return calculation,
+linkage to sentiment_scores by prompt_version) — planning/design only, or
+alternatively a reviewed real-model transport design for Phase 3 if that
+is preferred first. No model calls, no provider API calls, no trading
+logic, no dependencies without approval.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

@@ -4,13 +4,14 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (31/31).
+- Stable. All tests passing (38/38).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- feat(db): add news event persistence with provider dedup
-  (this commit; hash cannot self-reference — verify with `git log -1 --oneline`)
+- Previous: `5683186` — feat(db): add news event persistence with provider dedup
+- This commit: feat(ingestion): add provider-to-database ingestion pipeline
+  (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
 Phase 2 — News Provider Abstraction (skeleton done; real adapters not started).
@@ -23,6 +24,9 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   canonical news event normalization, mock provider, 12 provider tests.
 - News-event persistence helpers (src/database/newsEvents.js): insert with
   provider + provider_event_id dedup, find/list/count queries, 8 tests.
+- Mock provider-to-database ingestion flow (src/ingestion/ingestNews.js):
+  summary counts for fetched/inserted/duplicates/failed, per-event error
+  capture without aborting the batch, 7 tests.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -34,6 +38,10 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   `src/providers/newsProvider.js`, built by `src/providers/normalize.js`.
 - Normalized provider events can now be persisted and queried
   (`src/database/newsEvents.js`); duplicates return the existing row id.
+- Ingestion (`src/ingestion/ingestNews.js`) connects the provider
+  abstraction to persistence; the mock provider supports end-to-end local
+  ingestion tests. Still no real provider API calls, no sentiment/model
+  calls, no trading logic.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -53,10 +61,11 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
 - url/author/symbols/summary have no dedicated columns yet; they live in
   news_events.raw_payload (JSON) until they earn columns.
 - dedup_group remains null until cross-provider story grouping is built.
+- Ingestion is mock/local only until real provider adapters are added.
 
 ## Next Recommended Task
-Mock ingestion flow: fetch from the mock provider through normalization and
-persist via the new helpers (end-to-end test, still no real API calls).
+Alpaca News adapter skeleton without network calls: adapter structure,
+raw-item fixture tests against the provider contract, no API keys yet.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

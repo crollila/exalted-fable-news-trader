@@ -33,3 +33,4 @@ https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-S
 - [Sentiment storage plan](docs/sentiment-storage-plan.md) — sentiment_scores writer mapping and the hybrid columns-plus-JSON-detail storage decision (design only).
 - [Phase 4 event-study plan](docs/event-study-plan.md) — price reaction measurement design: horizons, anchoring, unavailable-price handling, and the row-per-window decision (design only).
 - [Claude task template](docs/claude-task-template.md) — compact reusable prompt for routine Claude/Cowork tasks.
+- [Real-data tier plan](docs/real-data-tier-plan.md) — first real-data step decision: provider transport vs market-data client, key safety, and disabled-by-default rules (design only).

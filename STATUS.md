@@ -9,8 +9,8 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `8f6050d` — feat(event-study): add fixture-only price reaction measurement engine
-- This commit: test(pipeline): add fixture-only end-to-end research loop proof
+- Previous: `534fa41` — test(pipeline): add fixture-only end-to-end research loop proof
+- This commit: docs(real-data): plan first real-data tier step
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -136,6 +136,13 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   dedup, classification skip for existing model + prompt_version,
   measurement replace-on-remeasure); zero network across the loop.
   The fixture tier is now complete as a local proof.
+- Real-data tier plan (docs/real-data-tier-plan.md, linked from README):
+  compares first real provider transport vs first real market-data client;
+  recommends the Alpaca News transport first because it fits entirely
+  behind the existing provider abstraction (prices-before-news would
+  measure nothing); defines the API-key/.env safety plan, no-secret
+  logging rules, fake-HTTP test strategy, and disabled-by-default rule.
+  Implementation deferred until separately approved.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -200,11 +207,12 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Plan the first real-data tier step (design/review only, implementation
-deferred until separately approved): a short design doc for the first
-real provider transport vs the first real market-data client, comparing
-which should come first. No API keys committed, no .env edits, no
-trading logic.
+If the real-data plan is approved: implement
+createAlpacaNewsHttpTransport(config) per docs/real-data-tier-plan.md §8
+— one-shot fetch, injected HTTP layer, key from config only,
+not-configured throw, fake-HTTP tests, key-redaction test, no polling,
+no scheduling, no dependencies. Requires separate explicit approval
+before any implementation begins.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

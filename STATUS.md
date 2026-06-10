@@ -6,9 +6,10 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 ## Current Status
 - Stable. All tests passing (23/23).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
+- Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- `9ecf2e1` — feat(providers): add news provider normalization layer
+- `4de84e1` — docs(claude): add commit/push workflow with review-first default
 
 ## Current Phase
 Phase 2 — News Provider Abstraction (skeleton done; real adapters not started).

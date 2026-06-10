@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (130/130).
+- Stable. All tests passing (132/132).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `9f2547f` — feat(db): add price_reactions event-study storage and fixture PriceSource
-- This commit: feat(event-study): add fixture-only price reaction measurement engine
+- Previous: `8f6050d` — feat(event-study): add fixture-only price reaction measurement engine
+- This commit: test(pipeline): add fixture-only end-to-end research loop proof
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -127,6 +127,15 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   no_baseline/no_reaction/source_error stored as data; temporary fixture
   EOD policy = same UTC day 21:00:00.000Z (documented in the plan);
   market_closed policy still deferred; batch helper; 10 tests.
+- End-to-end fixture pipeline proof (tests/pipeline.test.js): full local
+  research loop proven — provider fixture -> news_events row -> fixture
+  classifier -> sentiment_scores row -> fixture PriceSource ->
+  price_reactions rows; research join proven across news_events x
+  sentiment_scores x price_reactions grouped/filtered by prompt_version
+  and parser/measurement status; idempotency proven at every stage (news
+  dedup, classification skip for existing model + prompt_version,
+  measurement replace-on-remeasure); zero network across the loop.
+  The fixture tier is now complete as a local proof.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -191,10 +200,10 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Fixture-only end-to-end research pipeline test: provider fixture ->
-news_events row -> fixture classifier -> sentiment_scores row -> fixture
-PriceSource -> price_reactions rows, verifying the local research loop
-works end-to-end with no provider/model/market-data API calls and no
+Plan the first real-data tier step (design/review only, implementation
+deferred until separately approved): a short design doc for the first
+real provider transport vs the first real market-data client, comparing
+which should come first. No API keys committed, no .env edits, no
 trading logic.
 
 ## Maintenance Rule

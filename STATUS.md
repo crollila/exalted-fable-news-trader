@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (45/45).
+- Stable. All tests passing (53/53).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `1b26eb6` — feat(ingestion): add provider-to-database ingestion pipeline
-- This commit: feat(providers): add Alpaca News adapter skeleton with fixture tests
+- Previous: `4e2c074` — feat(providers): add Alpaca News adapter skeleton with fixture tests
+- This commit: feat(providers): add Benzinga News adapter skeleton with fixture tests
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -30,6 +30,11 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
 - Alpaca News adapter skeleton (src/providers/alpacaNewsProvider.js):
   injected transport only, no default network calls; static Alpaca fixture
   tests; fixture-backed ingestion integration proving insert/dedup/query.
+- Benzinga News adapter skeleton (src/providers/benzingaNewsProvider.js):
+  same injected-transport pattern, no default network calls; static Benzinga
+  fixture tests including RFC-2822 timestamp normalization; fixture-backed
+  ingestion integration proving insert/dedup/query; provider-scoped dedup
+  verified across Alpaca and Benzinga shared numeric IDs.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -45,9 +50,10 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   abstraction to persistence; the mock provider supports end-to-end local
   ingestion tests. Still no real provider API calls, no sentiment/model
   calls, no trading logic.
-- Provider adapters can map real-provider-shaped raw items into canonical
-  normalized events. The Alpaca adapter is non-network until a real
-  transport/client is explicitly added later. No API keys anywhere.
+- Alpaca and Benzinga adapters map provider-shaped raw items into canonical
+  normalized events. Both adapters are non-network until real
+  transports/clients are explicitly added later. No API keys anywhere,
+  no sentiment/model calls, no trading logic.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -68,13 +74,14 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   news_events.raw_payload (JSON) until they earn columns.
 - dedup_group remains null until cross-provider story grouping is built.
 - Ingestion is mock/local only until real provider adapters are added.
-- Alpaca adapter is fixture/transport-injection only; no real API client yet.
+- Provider adapters (Alpaca, Benzinga) are fixture/transport-injection
+  only; no real API clients yet.
 - receivedAt is stamped at normalization time for now (true wire-receipt
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Benzinga adapter skeleton with fixture tests, same pattern as the Alpaca
-skeleton: injected transport, no real API calls, no keys.
+Alpha Vantage News Sentiment adapter skeleton with fixture tests, same
+pattern: injected transport, no real API calls, no keys.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (63/63).
+- Stable. All tests passing (72/72).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `b5a3ab0` — feat(providers): add Benzinga News adapter skeleton with fixture tests
-- This commit: feat(providers): add Alpha Vantage News adapter skeleton with fixture tests
+- Previous: `d85e07e` — feat(providers): add Alpha Vantage News adapter skeleton with fixture tests
+- This commit: feat(providers): add Polygon News adapter skeleton with fixture tests
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -43,6 +43,15 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   sentiment fields retained only in raw_payload; fixture-backed ingestion
   integration proving insert/dedup/query; cross-provider shared-ID dedup
   remains scoped by provider name.
+- Polygon/Massive News adapter skeleton (src/providers/polygonNewsProvider.js):
+  injected transport only, no default network calls; static Polygon fixture
+  tests; providerEventId mapped directly from Polygon hash ID; published_utc
+  ISO timestamp validation; tickers mapped to canonical symbols; publisher
+  and insights/sentiment fields retained only in raw_payload; fixture-backed
+  ingestion integration proving insert/dedup/query; cross-provider shared-ID
+  dedup remains scoped by provider name.
+- All four planned provider adapter skeletons are now complete:
+  Alpaca, Benzinga, Alpha Vantage, Polygon/Massive.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -58,10 +67,11 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   abstraction to persistence; the mock provider supports end-to-end local
   ingestion tests. Still no real provider API calls, no sentiment/model
   calls, no trading logic.
-- Alpaca, Benzinga, and Alpha Vantage adapters map provider-shaped raw
-  items into canonical normalized events. Adapters are non-network until
-  real transports/clients are explicitly added later. No API keys anywhere,
-  no sentiment/model calls, no writes to sentiment_scores, no trading logic.
+- All planned provider adapters (Alpaca, Benzinga, Alpha Vantage,
+  Polygon/Massive) map provider-shaped raw items into canonical normalized
+  events. Adapters are non-network until real transports/clients are
+  explicitly added later. No API keys anywhere, no sentiment/model calls,
+  no writes to sentiment_scores, no trading logic.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -82,16 +92,17 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   news_events.raw_payload (JSON) until they earn columns.
 - dedup_group remains null until cross-provider story grouping is built.
 - Ingestion is mock/local only until real provider adapters are added.
-- Provider adapters (Alpaca, Benzinga, Alpha Vantage) are
-  fixture/transport-injection only; no real API clients yet.
+- Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
+  are fixture/transport-injection only; no real API clients yet.
 - Alpha Vantage article IDs are derived (from URL) because the provider
   feed lacks a dedicated event ID.
 - receivedAt is stamped at normalization time for now (true wire-receipt
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Polygon/Massive News adapter skeleton with fixture tests, same pattern:
-injected transport, no real API calls, no keys.
+Phase 2 hardening (no real API clients yet): consolidate shared provider
+adapter test helpers and/or add provider registry tests verifying all
+adapters are exported and contract-valid.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

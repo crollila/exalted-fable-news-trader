@@ -1,8 +1,8 @@
 // src/providers/index.js — Public surface of the providers module.
 //
-// Real transports for Alpaca, Benzinga, Alpha Vantage (and later
-// Polygon/Massive) are added in later phases; adapters here are non-network
-// until a transport is injected or configured.
+// All four planned provider adapters (Alpaca, Benzinga, Alpha Vantage,
+// Polygon/Massive) now exist as non-network skeletons; real transports are
+// added in later phases via injection or explicit configuration.
 
 export { normalizeNewsEvent, toUtcIso, upperOrNull, normalizeSymbols } from './normalize.js';
 export { assertNormalizedNewsEvent, validateProvider } from './newsProvider.js';
@@ -10,3 +10,4 @@ export { createMockProvider } from './mockProvider.js';
 export { createAlpacaNewsProvider } from './alpacaNewsProvider.js';
 export { createBenzingaNewsProvider } from './benzingaNewsProvider.js';
 export { createAlphaVantageNewsProvider } from './alphaVantageNewsProvider.js';
+export { createPolygonNewsProvider } from './polygonNewsProvider.js';

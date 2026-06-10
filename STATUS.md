@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (72/72).
+- Stable. All tests passing (78/78).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `d85e07e` — feat(providers): add Alpha Vantage News adapter skeleton with fixture tests
-- This commit: feat(providers): add Polygon News adapter skeleton with fixture tests
+- Previous: `176e4bc` — feat(providers): add Polygon News adapter skeleton with fixture tests
+- This commit: test(providers): add registry tests for exports, names, and contracts
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -52,6 +52,12 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   dedup remains scoped by provider name.
 - All four planned provider adapter skeletons are now complete:
   Alpaca, Benzinga, Alpha Vantage, Polygon/Massive.
+- Provider registry hardening (tests/providerRegistry.test.js + shared
+  registry helper in tests/helpers/providerTestHelpers.js): verifies all
+  four planned provider factories are exported, provider names are stable
+  and unique, all adapters pass contract validation, fixture transports
+  yield normalized events, and no-transport defaults reject without
+  network access.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -72,6 +78,8 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   events. Adapters are non-network until real transports/clients are
   explicitly added later. No API keys anywhere, no sentiment/model calls,
   no writes to sentiment_scores, no trading logic.
+- Provider exports are covered by registry tests; contract drift or a
+  missing export is caught by the test suite.
 - Tests: Node built-in test runner (`npm test`).
 - No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
 
@@ -100,9 +108,10 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Phase 2 hardening (no real API clients yet): consolidate shared provider
-adapter test helpers and/or add provider registry tests verifying all
-adapters are exported and contract-valid.
+Phase 2 completion: add a short provider adapter README/docs section
+explaining the injected-transport pattern and fixture-only safety, then
+decide whether Phase 2 is complete enough to move to Phase 3
+sentiment/classification planning. No real API clients yet.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

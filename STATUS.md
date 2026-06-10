@@ -9,12 +9,14 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `176e4bc` — feat(providers): add Polygon News adapter skeleton with fixture tests
-- This commit: test(providers): add registry tests for exports, names, and contracts
+- Previous: `0af9a9c` — test(providers): add registry tests for exports, names, and contracts
+- This commit: docs(providers): document adapter pattern and Phase 2 readiness
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
-Phase 2 — News Provider Abstraction (skeleton done; real adapters not started).
+Phase 2 — News Provider Abstraction. The Phase 2 skeleton is functionally
+complete (contract, normalization, four adapter skeletons, ingestion,
+persistence, registry tests, docs) pending ChatGPT/user decision to move on.
 
 ## Completed Work
 - Initial setup (repo, docs, .gitignore, .env.example).
@@ -58,6 +60,10 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   and unique, all adapters pass contract validation, fixture transports
   yield normalized events, and no-transport defaults reject without
   network access.
+- Provider adapter documentation (docs/providers.md, linked from README):
+  abstraction purpose, canonical event path, injected-transport pattern,
+  fixture-only safety, provider table, limitations, how to add a provider.
+  Phase 2 readiness checkpoint recorded.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -108,10 +114,9 @@ Phase 2 — News Provider Abstraction (skeleton done; real adapters not started)
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Phase 2 completion: add a short provider adapter README/docs section
-explaining the injected-transport pattern and fixture-only safety, then
-decide whether Phase 2 is complete enough to move to Phase 3
-sentiment/classification planning. No real API clients yet.
+Planning prompt for Phase 3 sentiment/classification design (prompt
+versioning, news type taxonomy, model response storage, malformed-output
+fallback). Planning only — no immediate coding, no real API clients.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

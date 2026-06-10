@@ -25,3 +25,7 @@ ExaltedFable is a clean V2 of an older AI news trading bot. The purpose is not t
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis
+
+## Documentation
+
+- [News provider adapters](docs/providers.md) — provider abstraction, canonical event path, injected-transport pattern, and fixture-only safety.

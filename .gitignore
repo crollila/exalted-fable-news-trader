@@ -8,3 +8,7 @@ data/*.db
 data/*.sqlite
 .DS_Store
 coverage/
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+data/*.sqlite-*

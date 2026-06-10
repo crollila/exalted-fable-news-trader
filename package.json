@@ -3,9 +3,13 @@
   "version": "0.1.0",
   "description": "AI news event-study and Alpaca paper-trading research system.",
   "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test"
+    "test": "node --test tests/database.test.js",
+    "migrate": "node src/database/migrations.js"
   },
   "keywords": [
     "trading",

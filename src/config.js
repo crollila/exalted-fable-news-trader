@@ -62,6 +62,14 @@ export function loadConfig(env = process.env) {
     // order routing — it exists solely so the risk engine can assert it is false.
     liveTradingEnabled: liveTradingRequested && liveTradingConfirmed,
     paperTrading: true, // paper-only system; not configurable
+    // Alpaca credentials for the news HTTP transport. Read ONLY here; held
+    // in memory only; never logged, printed, persisted, or normalized.
+    // Both null by default — real transports must throw "not configured"
+    // rather than auto-enabling when keys happen to exist.
+    alpacaNews: Object.freeze({
+      keyId: env.ALPACA_API_KEY_ID || null,
+      secretKey: env.ALPACA_API_SECRET_KEY || null,
+    }),
     risk: Object.freeze({
       maxDailyLossUsd: Number(env.MAX_DAILY_LOSS_USD ?? 100),
       maxPositionSizeUsd: Number(env.MAX_POSITION_SIZE_USD ?? 500),

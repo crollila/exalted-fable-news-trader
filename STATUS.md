@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (132/132).
+- Stable. All tests passing (141/141).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `534fa41` — test(pipeline): add fixture-only end-to-end research loop proof
-- This commit: docs(real-data): plan first real-data tier step
+- Previous: `597921e` — docs(real-data): plan first real-data tier step
+- This commit: feat(providers): add Alpaca News HTTP transport
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -143,6 +143,15 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   measure nothing); defines the API-key/.env safety plan, no-secret
   logging rules, fake-HTTP test strategy, and disabled-by-default rule.
   Implementation deferred until separately approved.
+- First real-data tier implementation: Alpaca News HTTP transport
+  (src/providers/alpacaNewsHttpTransport.js), explicit one-shot transport
+  behind the existing fetchRawNews injection point. The Alpaca provider
+  remains transport-injection based and disabled by default; credentials
+  read only through config.alpacaNews (no process.env reads outside
+  config); fake-HTTP tests only, no live-network tests in npm test;
+  sanitized/key-redacted errors tested; no polling, scheduling,
+  dependencies, model calls, market-data client, schema changes, or
+  trading logic. 9 tests.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -198,6 +207,8 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   real session calendars and the market_closed policy arrive with the
   real market-data client. No real market-data clients, no model calls,
   no trading logic.
+- Alpaca News transport is single-page only; pagination/backfill is
+  deferred and must precede any bulk historical fetch.
 - Ingestion is mock/local only until real provider adapters are added.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
@@ -207,12 +218,12 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-If the real-data plan is approved: implement
-createAlpacaNewsHttpTransport(config) per docs/real-data-tier-plan.md §8
-— one-shot fetch, injected HTTP layer, key from config only,
-not-configured throw, fake-HTTP tests, key-redaction test, no polling,
-no scheduling, no dependencies. Requires separate explicit approval
-before any implementation begins.
+If separately approved: a manual live smoke-check script for the Alpaca
+News transport. Manual only, never part of npm test; uses local .env
+only; prints sanitized counts/sample metadata only — never keys, auth
+headers, raw request URLs with secrets, or full raw payloads; no
+database writes unless separately approved; no polling, scheduling,
+trading, model, or market-data calls.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

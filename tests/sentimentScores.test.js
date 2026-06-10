@@ -48,7 +48,10 @@ function seedEvent(db) {
 test('migration 002 applies cleanly and is idempotent with the runner', () => {
   const db = openMemoryDatabase();
   const first = runMigrations(db);
-  assert.deepEqual(first.applied, ['001_initial', '002_sentiment_scores_phase3']);
+  // assert presence/order rather than the exact list, so adding later
+  // migrations does not break this test
+  assert.ok(first.applied.includes('002_sentiment_scores_phase3'));
+  assert.ok(first.applied.indexOf('001_initial') < first.applied.indexOf('002_sentiment_scores_phase3'));
   const second = runMigrations(db);
   assert.equal(second.applied.length, 0);
   assert.ok(second.skipped.includes('002_sentiment_scores_phase3'));

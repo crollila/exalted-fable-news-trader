@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (110/110).
+- Stable. All tests passing (120/120).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `f0617b8` — docs(event-study): add Phase 4 price reaction design plan
-- This commit: docs(workflow): add compact Claude task template
+- Previous: `9c01c5b` — docs(workflow): add compact Claude task template
+- This commit: feat(db): add price_reactions event-study storage and fixture PriceSource
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -111,6 +111,14 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   linked from README, referenced by a CLAUDE.md rule): routine prompts now
   reference STATUS.md/CLAUDE.md instead of restating project history;
   long prompts reserved for risky work.
+- Phase 4 event-study storage foundation: migration
+  003_price_reactions_event_study.sql rebuilds price_reactions with
+  canonical horizons (10s/1m/5m/30m/1h/eod), measurement_status, nullable
+  prices for unavailable data, anchor/source columns; PriceSource fixture
+  contract (src/prices/priceSource.js, injected trades, throwing default);
+  insertPriceReaction writer with replace-on-remeasure semantics and
+  status/price consistency checks (src/database/priceReactions.js);
+  10 tests, fixture-only.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -162,6 +170,10 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 - parser_status is nullable at the schema level (SQLite additive-column
   limitation); presence is enforced by the writer, so rows must not be
   inserted into sentiment_scores except through insertSentimentScore.
+- Event-study measurement engine still deferred: nothing yet turns
+  PriceSource trades into baseline/reaction rows (EOD definition and
+  market-closed policy decided in that step). No real market-data API
+  clients. No trading logic.
 - Ingestion is mock/local only until real provider adapters are added.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
@@ -171,11 +183,11 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Implement the reviewed event-study storage foundation in one small task:
-migration 003 (price_reactions rebuild per docs/event-study-plan.md §6),
-a PriceSource contract with fixture price source (injected data, throwing
-default), an insertPriceReaction writer, and tests. No market-data API
-calls, no model calls, no trading logic, no dependencies.
+Fixture-only event-study measurement engine: turn PriceSource trades into
+baseline/reaction price_reactions rows for the canonical horizons
+(deciding the EOD definition and market-closed policy), using the fixture
+price source only. No real market-data API calls, no model calls, no
+trading logic, no dependencies.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

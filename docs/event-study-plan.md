@@ -37,6 +37,13 @@ day's session (defined precisely when the price source lands; the schema
 just reserves the label). The horizon set is versioned with the analysis,
 not silently extended.
 
+> TEMPORARY FIXTURE EOD POLICY (implemented in
+> src/eventStudy/measureReactions.js): until a real market-data client and
+> session calendar exist, the eod target is the same UTC calendar day at
+> 21:00:00.000Z. This is a fixture convenience only; real session handling
+> (calendars, half-days, DST, market_closed) replaces it with the real
+> price source.
+
 ## 4. Measurement flow design
 
 **Anchor.** Every window anchors at `received_at` (when WE could first have

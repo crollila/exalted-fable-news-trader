@@ -95,3 +95,50 @@ After coding:
 2. Explain what changed.
 3. Explain how to test.
 4. Explain risks/limitations.
+
+## Commit, Status, and GitHub Push Workflow
+
+Default behavior after coding: report changes and wait for ChatGPT/user review before committing or pushing, unless explicitly told to commit/push in the current prompt.
+
+After every approved code/documentation change:
+
+1. Run safety checks before committing:
+
+   * `npm test`
+   * `git status`
+   * confirm no `.env` file is staged
+   * confirm no API keys, secrets, tokens, database files, logs, `node_modules/`, or SQLite sidecar files are staged
+
+2. Commit only after tests pass and the user/ChatGPT approves.
+
+3. Update `STATUS.md` after each approved commit with:
+
+   * latest commit hash
+   * latest commit message
+   * current phase
+   * completed work
+   * current architecture notes
+   * known warnings or technical debt
+   * next recommended task
+
+4. Push to GitHub only after:
+
+   * tests pass
+   * working tree is clean except intended changes
+   * `STATUS.md` is current
+   * user/ChatGPT approves the push
+
+5. Never push:
+
+   * `.env`
+   * API keys or tokens
+   * generated database files
+   * logs
+   * `node_modules/`
+   * SQLite `-wal`, `-shm`, or `-journal` files
+
+GitHub repo target:
+
+* `https://github.com/crollila/exalted-fable-news-trader`
+
+Do not touch, rename, overwrite, or push to the old V1 repository.

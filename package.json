@@ -1,0 +1,19 @@
+{
+  "name": "exalted-fable-news-trader",
+  "version": "0.1.0",
+  "description": "AI news event-study and Alpaca paper-trading research system.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "trading",
+    "alpaca",
+    "news",
+    "sentiment",
+    "event-study",
+    "paper-trading"
+  ],
+  "license": "MIT"
+}

@@ -36,6 +36,26 @@ Requires `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY` in your local,
 uncommitted `.env` (see `.env.example`). The script fails clearly when they
 are missing.
 
+## Manual one-shot ingest
+
+Once the smoke check passes, a second manual-only script persists a tiny
+capped sample (limit hard-capped at 10) of real Alpaca news into the
+`news_events` table, through the existing provider → ingestion →
+persistence path (same dedup, same normalization — no separate code path):
+
+```
+node --env-file=.env scripts/ingestAlpacaNewsOnce.js --symbols AAPL --limit 5
+```
+
+It writes to the SQLite file configured by `DATABASE_URL` (default
+`data/exalted_fable.sqlite`, git-ignored), running migrations first if
+needed. One fetch, one batch of inserts, then exit: never part of
+`npm test`, no polling, no scheduling, no sentiment/model calls, no
+market-data calls, no trading. Output is a sanitized summary only
+(provider, counts, inserted row ids, truncated per-event errors) — never
+keys, headers, request objects, or raw payloads. Same credential
+requirements as the smoke check; fails clearly when unconfigured.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

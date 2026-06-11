@@ -9,8 +9,8 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `3c91ebe` — feat(scripts): add manual Alpaca News live smoke check
-- This commit: docs(status): record manual Alpaca News smoke check passed
+- Previous: `bbddefb` — docs(status): record manual Alpaca News smoke check passed
+- This commit: feat(scripts): add manual one-shot live Alpaca News ingest
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -170,6 +170,20 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   model calls, market-data calls, polling, scheduling, trading, or paper
   orders occurred. The transport's field mapping is confirmed against the
   live v1beta1 feed; no mapping adjustment needed.
+- Manual one-shot live ingest script (scripts/ingestAlpacaNewsOnce.js,
+  documented in README): manual-only, never part of npm test or startup;
+  explicitly constructs createAlpacaNewsHttpTransport(config) and the
+  existing Alpaca provider, then persists through the EXISTING
+  ingestNews -> insertNewsEvent path into news_events (no separate
+  persistence path; provider-scoped dedup applies); uses existing
+  openDatabase/runMigrations utilities against config.databasePath;
+  credentials via config only; limit hard-capped at 10 via the shared
+  parseArgs; sanitized summary output only (provider, counts, inserted
+  ids, db path, truncated per-event errors — never keys, headers, request
+  objects, raw transport errors, or raw payloads); import-safe CLI guard;
+  no polling/scheduling/background jobs, no sentiment/classification, no
+  sentiment_scores or price_reactions writes, no trading/paper orders;
+  7 network-free formatter/cap tests (tests/ingestScriptFormat.test.js).
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -192,9 +206,12 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   no writes to sentiment_scores, no trading logic.
 - Provider exports are covered by registry tests; contract drift or a
   missing export is caught by the test suite.
-- The real Alpaca News transport now has a manual smoke-check entry point
-  (scripts/smokeAlpacaNews.js); there is still NO automatic live data path
-  anywhere — real transports activate only by explicit construction.
+- The real Alpaca News transport now has two manual entry points: the
+  smoke check (scripts/smokeAlpacaNews.js, no DB writes) and the one-shot
+  ingest (scripts/ingestAlpacaNewsOnce.js, writes news_events only via the
+  existing pipeline). There is still NO automatic live data path anywhere —
+  real transports activate only by explicit construction in these
+  manually-run scripts.
 - src/sentiment is pure/local: no model, API, or network calls anywhere in
   the module. Provider-supplied sentiment remains in raw_payload only.
 - The parser/classifier remains fixture-only. sentiment_scores rows are
@@ -233,7 +250,11 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 - The smoke check proves reachability/shape compatibility only, not feed
   completeness; it has passed once locally (2026-06-10) but each run
   depends on local .env credentials.
-- Ingestion is mock/local only until real provider adapters are added.
+- Real-event ingestion exists only as the manual one-shot script; rows it
+  inserts carry receivedAt stamped at normalization time, which for live
+  manual runs is fetch time (close to, but not exactly, wire receipt).
+- The configured SQLite file (data/exalted_fable.sqlite by default) is
+  git-ignored and must never be committed; manual ingest runs grow it.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
 - Alpha Vantage article IDs are derived (from URL) because the provider
@@ -242,14 +263,13 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-The smoke check passed, so the transport's field mapping needs no
-adjustment. Next (separate approval required): plan/implement a
-manually-invoked one-shot REAL ingestion run — real Alpaca transport
-explicitly constructed and passed through the existing ingestNews path
-to write real events into news_events. Manual one-shot only: no polling,
-no scheduling, no model calls, no market-data client, no trading logic.
-Pagination/backfill remains deferred and must precede any bulk
-historical fetch.
+Run the manual one-shot ingest locally with real keys
+(node --env-file=.env scripts/ingestAlpacaNewsOnce.js --symbols AAPL
+--limit 5), report the sanitized summary, and verify the inserted
+news_events rows look correct (and that a second run reports them as
+duplicates) BEFORE any polling, scheduling, pagination/backfill, model
+calls, market-data client, or trading logic. Each of those remains its
+own separately approved step.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

@@ -9,8 +9,8 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `d1ef2b9` — feat(providers): add Alpaca News HTTP transport
-- This commit: feat(scripts): add manual Alpaca News live smoke check
+- Previous: `3c91ebe` — feat(scripts): add manual Alpaca News live smoke check
+- This commit: docs(status): record manual Alpaca News smoke check passed
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -160,6 +160,16 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   headers, request URLs, or raw payloads); tiny capped sample; no
   database writes, no polling/scheduling, no trading/model/market-data
   calls; 7 network-free formatter tests.
+- Manual Alpaca News smoke check RUN LOCALLY and PASSED (real .env
+  credentials, command: node --env-file=.env scripts/smokeAlpacaNews.js
+  --symbols AAPL --limit 5): fetched 5 event(s) via provider "alpaca",
+  transport reachable, payload normalized. Sanitized output only
+  (timestamps, symbols, headlines, provider ids, public URLs) — no keys,
+  auth headers, .env values, or raw payloads printed. git status clean
+  after the run; .env remained ignored/untracked. No database writes,
+  model calls, market-data calls, polling, scheduling, trading, or paper
+  orders occurred. The transport's field mapping is confirmed against the
+  live v1beta1 feed; no mapping adjustment needed.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -221,7 +231,8 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 - Alpaca News transport is single-page only; pagination/backfill is
   deferred and must precede any bulk historical fetch.
 - The smoke check proves reachability/shape compatibility only, not feed
-  completeness; a manual live run depends on local .env credentials.
+  completeness; it has passed once locally (2026-06-10) but each run
+  depends on local .env credentials.
 - Ingestion is mock/local only until real provider adapters are added.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
@@ -231,11 +242,14 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Run the manual smoke check locally with real keys
-(node --env-file=.env scripts/smokeAlpacaNews.js --symbols AAPL --limit 5)
-and report the sanitized output BEFORE adding any database writes,
-polling, model calls, market-data client, or trading logic. The smoke
-result decides whether the transport's field mapping needs adjustment.
+The smoke check passed, so the transport's field mapping needs no
+adjustment. Next (separate approval required): plan/implement a
+manually-invoked one-shot REAL ingestion run — real Alpaca transport
+explicitly constructed and passed through the existing ingestNews path
+to write real events into news_events. Manual one-shot only: no polling,
+no scheduling, no model calls, no market-data client, no trading logic.
+Pagination/backfill remains deferred and must precede any bulk
+historical fetch.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

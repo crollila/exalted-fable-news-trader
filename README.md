@@ -22,6 +22,20 @@ ExaltedFable is a clean V2 of an older AI news trading bot. The purpose is not t
 - Never commit API keys.
 - All important actions should be logged.
 
+## Manual smoke checks
+
+The only live-network touchpoint is a manual diagnostic script. It is never
+part of `npm test`, never scheduled, and prints sanitized metadata only
+(never keys, headers, request URLs, or raw payloads):
+
+```
+node --env-file=.env scripts/smokeAlpacaNews.js --symbols AAPL --limit 5
+```
+
+Requires `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY` in your local,
+uncommitted `.env` (see `.env.example`). The script fails clearly when they
+are missing.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

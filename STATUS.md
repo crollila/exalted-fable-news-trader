@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (141/141).
+- Stable. All tests passing (148/148).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `597921e` — docs(real-data): plan first real-data tier step
-- This commit: feat(providers): add Alpaca News HTTP transport
+- Previous: `d1ef2b9` — feat(providers): add Alpaca News HTTP transport
+- This commit: feat(scripts): add manual Alpaca News live smoke check
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -152,6 +152,14 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   sanitized/key-redacted errors tested; no polling, scheduling,
   dependencies, model calls, market-data client, schema changes, or
   trading logic. 9 tests.
+- Manual Alpaca News smoke-check script (scripts/smokeAlpacaNews.js,
+  documented in README): manual-only, never part of npm test or startup;
+  credentials via config only (.env loaded with node --env-file);
+  sanitized whitelist output only (count, headline, ticker/symbols,
+  published timestamp, event id, public article URL — never keys,
+  headers, request URLs, or raw payloads); tiny capped sample; no
+  database writes, no polling/scheduling, no trading/model/market-data
+  calls; 7 network-free formatter tests.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -174,6 +182,9 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   no writes to sentiment_scores, no trading logic.
 - Provider exports are covered by registry tests; contract drift or a
   missing export is caught by the test suite.
+- The real Alpaca News transport now has a manual smoke-check entry point
+  (scripts/smokeAlpacaNews.js); there is still NO automatic live data path
+  anywhere — real transports activate only by explicit construction.
 - src/sentiment is pure/local: no model, API, or network calls anywhere in
   the module. Provider-supplied sentiment remains in raw_payload only.
 - The parser/classifier remains fixture-only. sentiment_scores rows are
@@ -209,6 +220,8 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   no trading logic.
 - Alpaca News transport is single-page only; pagination/backfill is
   deferred and must precede any bulk historical fetch.
+- The smoke check proves reachability/shape compatibility only, not feed
+  completeness; a manual live run depends on local .env credentials.
 - Ingestion is mock/local only until real provider adapters are added.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
@@ -218,12 +231,11 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-If separately approved: a manual live smoke-check script for the Alpaca
-News transport. Manual only, never part of npm test; uses local .env
-only; prints sanitized counts/sample metadata only — never keys, auth
-headers, raw request URLs with secrets, or full raw payloads; no
-database writes unless separately approved; no polling, scheduling,
-trading, model, or market-data calls.
+Run the manual smoke check locally with real keys
+(node --env-file=.env scripts/smokeAlpacaNews.js --symbols AAPL --limit 5)
+and report the sanitized output BEFORE adding any database writes,
+polling, model calls, market-data client, or trading logic. The smoke
+result decides whether the transport's field mapping needs adjustment.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

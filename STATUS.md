@@ -4,13 +4,13 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (148/148).
+- Stable. All tests passing (155/155).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `bbddefb` — docs(status): record manual Alpaca News smoke check passed
-- This commit: feat(scripts): add manual one-shot live Alpaca News ingest
+- Previous: `d974881` — feat(scripts): add manual one-shot live Alpaca News ingest
+- This commit: docs(status): record live one-shot ingest passed with dedup proof
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -184,6 +184,20 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   no polling/scheduling/background jobs, no sentiment/classification, no
   sentiment_scores or price_reactions writes, no trading/paper orders;
   7 network-free formatter/cap tests (tests/ingestScriptFormat.test.js).
+- Manual one-shot live ingest RUN LOCALLY and PASSED with dedup proof
+  (real .env credentials, command: node --env-file=.env
+  scripts/ingestAlpacaNewsOnce.js --symbols AAPL --limit 5).
+  First run: fetched 5, inserted 5, duplicates 0, failed 0, inserted ids
+  1–5; database path shown as data/exalted_fable.sqlite under the project
+  folder. Second identical run: fetched 5, inserted 0, duplicates 5,
+  failed 0, no inserted ids. Real events persisted through the existing
+  provider -> ingestNews -> insertNewsEvent path, and (provider,
+  provider_event_id) dedup is proven against live data on the repeat run.
+  git status clean after both runs; the database file and .env remained
+  ignored/untracked. No model calls, sentiment/classification writes,
+  market-data calls, price_reactions writes, polling, scheduling, trading,
+  or paper orders occurred. The local research database now contains its
+  first real news_events rows.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -197,8 +211,8 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   (`src/database/newsEvents.js`); duplicates return the existing row id.
 - Ingestion (`src/ingestion/ingestNews.js`) connects the provider
   abstraction to persistence; the mock provider supports end-to-end local
-  ingestion tests. Still no real provider API calls, no sentiment/model
-  calls, no trading logic.
+  ingestion tests, and the same unchanged path has now carried real
+  Alpaca events in manual runs. No sentiment/model calls, no trading logic.
 - All planned provider adapters (Alpaca, Benzinga, Alpha Vantage,
   Polygon/Massive) map provider-shaped raw items into canonical normalized
   events. Adapters are non-network until real transports/clients are
@@ -209,9 +223,9 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 - The real Alpaca News transport now has two manual entry points: the
   smoke check (scripts/smokeAlpacaNews.js, no DB writes) and the one-shot
   ingest (scripts/ingestAlpacaNewsOnce.js, writes news_events only via the
-  existing pipeline). There is still NO automatic live data path anywhere —
-  real transports activate only by explicit construction in these
-  manually-run scripts.
+  existing pipeline). Both are proven against the live feed. There is
+  still NO automatic live data path anywhere — real transports activate
+  only by explicit construction in these manually-run scripts.
 - src/sentiment is pure/local: no model, API, or network calls anywhere in
   the module. Provider-supplied sentiment remains in raw_payload only.
 - The parser/classifier remains fixture-only. sentiment_scores rows are
@@ -220,7 +234,9 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   trading logic. Classification is a separate optional stage that can never
   block or delete news_events rows.
 - Tests: Node built-in test runner (`npm test`).
-- No real provider API calls, no sentiment/model calls, no execution/trading calls yet.
+- No automatic/scheduled provider calls; the only live touchpoints are
+  the two manual scripts. No sentiment/model calls, no market-data calls,
+  no execution/trading calls yet.
 
 ## Hard Safety Rules
 - Do not overwrite or depend on the V1 repo.
@@ -254,7 +270,10 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   inserts carry receivedAt stamped at normalization time, which for live
   manual runs is fetch time (close to, but not exactly, wire receipt).
 - The configured SQLite file (data/exalted_fable.sqlite by default) is
-  git-ignored and must never be committed; manual ingest runs grow it.
+  git-ignored and must never be committed; it now contains a first small
+  sample of real AAPL news_events rows, and manual ingest runs grow it.
+- The live sample is tiny (5 events, one symbol); nothing downstream
+  should draw research conclusions from it yet.
 - Provider adapters (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive)
   are fixture/transport-injection only; no real API clients yet.
 - Alpha Vantage article IDs are derived (from URL) because the provider
@@ -263,13 +282,16 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   timestamps arrive with the real transport).
 
 ## Next Recommended Task
-Run the manual one-shot ingest locally with real keys
-(node --env-file=.env scripts/ingestAlpacaNewsOnce.js --symbols AAPL
---limit 5), report the sanitized summary, and verify the inserted
-news_events rows look correct (and that a second run reports them as
-duplicates) BEFORE any polling, scheduling, pagination/backfill, model
-calls, market-data client, or trading logic. Each of those remains its
-own separately approved step.
+With real news_events rows now existing locally, the real-data tier's
+Option B precondition is met (docs/real-data-tier-plan.md §2/§8): the
+next recommended step is a DESIGN DOC ONLY for the first real market-data
+client behind the existing PriceSource contract (getTradesAround), so
+real reactions can be measured for real events — covering session
+calendar/EOD/market_closed policy, key handling, sanitized errors, and a
+fake-HTTP test plan. Alternative next steps, each separately approved:
+pagination/backfill design for bulk news collection, or more manual
+ingest runs to grow the event sample. No implementation without a
+separate approved task.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

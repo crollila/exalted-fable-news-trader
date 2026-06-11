@@ -9,8 +9,8 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `d974881` — feat(scripts): add manual one-shot live Alpaca News ingest
-- This commit: docs(status): record live one-shot ingest passed with dedup proof
+- Previous: `9dd5f8b` — docs(status): record live one-shot ingest passed with dedup proof
+- This commit: docs(prices): add market-data client plan for first real PriceSource
   (hash cannot self-reference — verify with `git log -1 --oneline`)
 
 ## Current Phase
@@ -198,6 +198,22 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   market-data calls, price_reactions writes, polling, scheduling, trading,
   or paper orders occurred. The local research database now contains its
   first real news_events rows.
+- Market-data client plan (docs/market-data-client-plan.md, linked from
+  README): design doc only for the first real PriceSource. Recommends
+  Alpaca historical trades (IEX free feed) because the existing key pair
+  works, it returns actual trades (the contract's unit), and the
+  sanitization pattern is already proven; documents the frozen
+  getTradesAround contract plus the engine's lexicographic-ISO timestamp
+  assumption, the trades-endpoint field mapping with ns→ms normalization,
+  bounded pagination with throw-on-cap (truncated windows must never
+  masquerade as measured), the client-throws/engine-stores-status split
+  preserving all measurement_status semantics, market_closed and real EOD
+  explicitly deferred to a later session-calendar task, look-ahead
+  guarantees (anchor stays received_at; window never widened), no-secret
+  logging rules, free-tier/rate-limit notes (no retries in v1; 429 is a
+  visible source_error), fake-HTTP test plan, and future manual
+  smoke-check and capped manual measurement scripts. Implementation,
+  scripts, and tests all deferred to separately approved tasks.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -280,18 +296,22 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   feed lacks a dedicated event ID.
 - receivedAt is stamped at normalization time for now (true wire-receipt
   timestamps arrive with the real transport).
+- The planned market-data client will use the free IEX feed (subset of
+  consolidated tape); thin coverage shows up as no_baseline/no_reaction
+  rows — visible bias, not silent absence (docs/market-data-client-plan.md
+  §4/§12). Exact Alpaca rate limits/entitlements must be re-verified at
+  implementation time.
 
 ## Next Recommended Task
-With real news_events rows now existing locally, the real-data tier's
-Option B precondition is met (docs/real-data-tier-plan.md §2/§8): the
-next recommended step is a DESIGN DOC ONLY for the first real market-data
-client behind the existing PriceSource contract (getTradesAround), so
-real reactions can be measured for real events — covering session
-calendar/EOD/market_closed policy, key handling, sanitized errors, and a
-fake-HTTP test plan. Alternative next steps, each separately approved:
-pagination/backfill design for bulk news collection, or more manual
-ingest runs to grow the event sample. No implementation without a
-separate approved task.
+Implement step 2 of docs/market-data-client-plan.md §16 (separate
+approval required): the real Alpaca trades client behind the existing
+PriceSource contract (e.g. src/prices/alpacaTradesHttpClient.js) with
+injected fake-HTTP tests per the plan's §13 — explicit construction only,
+not-configured throw, sanitized/redacted errors, bounded pagination with
+throw-on-cap, ns→ms timestamp normalization, no scripts yet, no live
+calls in npm test, no schema changes, no session-calendar/market_closed/
+EOD changes. The manual smoke-check and capped measurement scripts are
+later separately approved steps (§16 items 3–4).
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

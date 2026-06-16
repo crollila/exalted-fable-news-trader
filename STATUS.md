@@ -9,13 +9,14 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `9163b82` — docs(status): record Alpaca trades smoke result.
-- UNCOMMITTED (this task, awaiting review): Phase A MVP step — manual capped
-  measurement script (scripts/measureReactionsOnce.js) + manual research
-  summary script (scripts/reportEventStudySummary.js) + network-free tests
-  (tests/measureReactionsOnce.test.js, tests/reportEventStudySummary.test.js)
-  + package.json test enumeration + README manual-usage sections + this
-  STATUS update. Not staged, not committed, not pushed.
+- Latest committed: `a79b062` — feat(scripts): add manual capped measurement
+  and research summary (scripts/measureReactionsOnce.js +
+  scripts/reportEventStudySummary.js + tests/measureReactionsOnce.test.js +
+  tests/reportEventStudySummary.test.js + package.json test enumeration +
+  README manual-usage sections). 20 new network-free tests; 200/200 passing.
+- Previous: `9163b82` — docs(status): record Alpaca trades smoke result.
+- This STATUS update is committed separately as
+  `docs(status): record Phase A measurement/report commit`.
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -415,10 +416,11 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 
 ## Next Recommended Task
 Step 4 of docs/market-data-client-plan.md §16 / §15 (the capped manual
-measurement script, scripts/measureReactionsOnce.js) is now IMPLEMENTED but
-UNCOMMITTED and NOT YET RUN against the live feed. A read-only research
-summary script (scripts/reportEventStudySummary.js) was added alongside it as
-the first reporting surface. Both have network-free tests (200/200 passing).
+measurement script, scripts/measureReactionsOnce.js) is now IMPLEMENTED and
+COMMITTED as `a79b062`, but NOT YET RUN against the live feed. A read-only
+research summary script (scripts/reportEventStudySummary.js) was added
+alongside it as the first reporting surface. Both have network-free tests
+(200/200 passing).
 
 Recommended next step: review and commit this task, then RUN the capped
 measurement once locally during/after US market hours

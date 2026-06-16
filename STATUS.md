@@ -9,11 +9,10 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed & pushed: `7384237` — docs(status): record Alpaca trades PriceSource commit
-- Previous: `d3b1984` — feat(prices): add Alpaca trades PriceSource
-- PENDING (uncommitted, awaiting review): manual Alpaca Trades smoke-check
-  script (scripts/smokeAlpacaTrades.js + tests/smokeTradesFormat.test.js +
-  package.json enumeration + README section). Not yet staged/committed/pushed.
+- Latest committed: `99e83f4` — feat(scripts): add manual Alpaca Trades smoke check
+  (scripts/smokeAlpacaTrades.js + tests/smokeTradesFormat.test.js +
+  package.json enumeration + README section). Committed locally, not yet pushed.
+- Previous: `7384237` — docs(status): record Alpaca trades PriceSource commit
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -365,8 +364,8 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 ## Next Recommended Task
 Step 2 of docs/market-data-client-plan.md §16 (the real Alpaca trades
 PriceSource) is committed as `d3b1984`. Step 3 (the manual smoke-check
-script, scripts/smokeAlpacaTrades.js) is implemented with network-free tests
-and is PENDING review/commit; it has NOT yet been run against the live feed.
+script, scripts/smokeAlpacaTrades.js) is committed as `99e83f4`; it has NOT
+yet been run against the live feed.
 
 Recommended next steps, in order:
 1. Run scripts/smokeAlpacaTrades.js against the live feed once (manual, real

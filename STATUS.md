@@ -4,14 +4,16 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (155/155).
+- Stable. All tests passing (171/171).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Previous: `9dd5f8b` — docs(status): record live one-shot ingest passed with dedup proof
-- This commit: docs(prices): add market-data client plan for first real PriceSource
-  (hash cannot self-reference — verify with `git log -1 --oneline`)
+- Latest committed: `7b67f7a` — docs(prices): add market-data client plan for first real PriceSource
+- PENDING (uncommitted, awaiting review): first real Alpaca trades PriceSource
+  implementation (src/prices/alpacaTradesPriceSource.js + tests + package.json
+  enumeration). Not yet staged/committed/pushed.
+  (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
 Phase 2 functionally complete (contract, normalization, four adapter
@@ -214,6 +216,24 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   visible source_error), fake-HTTP test plan, and future manual
   smoke-check and capped manual measurement scripts. Implementation,
   scripts, and tests all deferred to separately approved tasks.
+- First real market-data client (src/prices/alpacaTradesPriceSource.js):
+  createAlpacaTradesPriceSource(config, options) behind the existing
+  PriceSource contract, implementing step 2 of the market-data client plan.
+  Explicit construction only (no import-time/startup network path); throws
+  "not configured" without keys; credentials read only from config.alpacaNews
+  (the shared ALPACA_API_KEY_ID/SECRET pair — see naming debt below) and sent
+  in headers only, never logged/returned/thrown. Injectable httpFetch (defaults
+  to globalThis.fetch) keeps npm test fully offline; default feed 'iex'.
+  Validates ticker/fromIso/toIso; requests only the requested UTC window with
+  whole-second floor(start)/ceil(end) bounds, then post-filters trades to the
+  exact ms-precision [fromIso, toIso] window (look-ahead guarantee preserved).
+  Maps t/p/s -> {at, price, size} with ns->ms-normalized UTC ISO; returns
+  trades sorted ascending; [] for empty windows. Bounded pagination
+  (next_page_token) with a hard page cap that THROWS rather than silently
+  truncating. Sanitized/redacted errors for HTTP 401/403/429/5xx, malformed
+  payloads, and all-malformed trade items. All measurement_status semantics
+  stay in measureReactions (client returns trades or throws). 16 fake-HTTP
+  tests, no credentials, no live network, no DB writes.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -301,17 +321,34 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   rows — visible bias, not silent absence (docs/market-data-client-plan.md
   §4/§12). Exact Alpaca rate limits/entitlements must be re-verified at
   implementation time.
+- NAMING DEBT: the Alpaca trades PriceSource reads credentials from
+  config.alpacaNews, the same ALPACA_API_KEY_ID/SECRET pair the news
+  transport uses. The keys are account-level (not news-specific), so this is
+  correct functionally but the config key name "alpacaNews" is now misleading
+  for a market-data client. Consider renaming the config key to a shared
+  `alpaca` credentials path in a later reviewed task and updating both
+  consumers together.
+- The Alpaca trades client is single-window with a hard page cap that throws
+  (DEFAULT_MAX_PAGES = 10); very large windows are refused rather than
+  truncated. Higher-throughput backfill (raising the cap or windowing) is
+  deferred. No retries on 429/5xx in v1 — a rate-limited or failed request
+  surfaces as a sanitized source error (the engine stores source_error).
+- No manual smoke-check or capped measurement script exists yet for the
+  trades client; the implementation has only been exercised by fake-HTTP
+  tests (no live market-data call has been made).
 
 ## Next Recommended Task
-Implement step 2 of docs/market-data-client-plan.md §16 (separate
-approval required): the real Alpaca trades client behind the existing
-PriceSource contract (e.g. src/prices/alpacaTradesHttpClient.js) with
-injected fake-HTTP tests per the plan's §13 — explicit construction only,
-not-configured throw, sanitized/redacted errors, bounded pagination with
-throw-on-cap, ns→ms timestamp normalization, no scripts yet, no live
-calls in npm test, no schema changes, no session-calendar/market_closed/
-EOD changes. The manual smoke-check and capped measurement scripts are
-later separately approved steps (§16 items 3–4).
+Step 2 of docs/market-data-client-plan.md §16 (the real Alpaca trades
+PriceSource) is implemented as src/prices/alpacaTradesPriceSource.js
+(fake-HTTP tests only) and is PENDING review/commit.
+
+Next (separately approved, §16 items 3–4): a manual smoke-check script for
+the trades client (manual-only, never in npm test or startup; credentials
+via config only; sanitized whitelist output; tiny capped sample; no DB
+writes, no polling/scheduling, no trading/model calls), followed by a capped
+manual measurement script that drives measureReactions against the real
+client. Both must stay off the npm test path. Real session-calendar /
+market_closed / true-EOD policy remain deferred to their own task.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

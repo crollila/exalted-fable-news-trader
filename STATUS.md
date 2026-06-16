@@ -4,15 +4,16 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (171/171).
+- Stable. All tests passing (180/180).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `d3b1984` — feat(prices): add Alpaca trades PriceSource
-  (first real Alpaca trades PriceSource: src/prices/alpacaTradesPriceSource.js
-  + tests + package.json enumeration). Committed locally, not yet pushed.
-- Previous: `7b67f7a` — docs(prices): add market-data client plan for first real PriceSource
+- Latest committed & pushed: `7384237` — docs(status): record Alpaca trades PriceSource commit
+- Previous: `d3b1984` — feat(prices): add Alpaca trades PriceSource
+- PENDING (uncommitted, awaiting review): manual Alpaca Trades smoke-check
+  script (scripts/smokeAlpacaTrades.js + tests/smokeTradesFormat.test.js +
+  package.json enumeration + README section). Not yet staged/committed/pushed.
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -234,6 +235,21 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   payloads, and all-malformed trade items. All measurement_status semantics
   stay in measureReactions (client returns trades or throws). 16 fake-HTTP
   tests, no credentials, no live network, no DB writes.
+- Manual Alpaca Trades smoke-check script (scripts/smokeAlpacaTrades.js,
+  documented in README), implementing step 3 of the market-data client plan
+  §16: manual-only, never part of npm test or startup; CLI-guarded (import is
+  side-effect free); credentials via config only (.env loaded with
+  --env-file); explicitly constructs createAlpacaTradesPriceSource(config) —
+  the only place a real market-data path is enabled — and fetches one tiny
+  recent window for one ticker. The window ends --lag minutes in the past
+  (default 20, floored at 16) to stay outside the free-feed too-recent
+  restriction and spans --minutes (default 5, capped 60). Sanitized whitelist
+  output only (symbol, window, source name, count, first/last timestamps,
+  min/max price — all public market data; never keys, headers, request URLs,
+  or raw payloads); zero trades is still a PASS (reachability/normalization,
+  not feed completeness). No DB writes, no polling/scheduling, no
+  trading/model calls. 9 network-free formatter/arg/window tests
+  (tests/smokeTradesFormat.test.js). NOT YET RUN against the live feed.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -259,9 +275,13 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 - The real Alpaca News transport now has two manual entry points: the
   smoke check (scripts/smokeAlpacaNews.js, no DB writes) and the one-shot
   ingest (scripts/ingestAlpacaNewsOnce.js, writes news_events only via the
-  existing pipeline). Both are proven against the live feed. There is
-  still NO automatic live data path anywhere — real transports activate
-  only by explicit construction in these manually-run scripts.
+  existing pipeline). Both are proven against the live feed.
+- The real Alpaca Trades PriceSource has one manual entry point so far: the
+  trades smoke check (scripts/smokeAlpacaTrades.js, no DB writes), which
+  explicitly constructs createAlpacaTradesPriceSource(config). It has NOT
+  yet been run against the live feed. There is still NO automatic live data
+  path anywhere — real transports/clients activate only by explicit
+  construction in these manually-run scripts.
 - src/sentiment is pure/local: no model, API, or network calls anywhere in
   the module. Provider-supplied sentiment remains in raw_payload only.
 - The parser/classifier remains fixture-only. sentiment_scores rows are
@@ -270,9 +290,11 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   trading logic. Classification is a separate optional stage that can never
   block or delete news_events rows.
 - Tests: Node built-in test runner (`npm test`).
-- No automatic/scheduled provider calls; the only live touchpoints are
-  the two manual scripts. No sentiment/model calls, no market-data calls,
-  no execution/trading calls yet.
+- No automatic/scheduled provider or market-data calls; the only live
+  touchpoints are the three manual scripts (two news, one trades). The
+  trades smoke check can make a market-data call when a human runs it, but
+  has not been run yet. No sentiment/model calls, no execution/trading
+  calls yet.
 
 ## Hard Safety Rules
 - Do not overwrite or depend on the V1 repo.
@@ -333,21 +355,28 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   truncated. Higher-throughput backfill (raising the cap or windowing) is
   deferred. No retries on 429/5xx in v1 — a rate-limited or failed request
   surfaces as a sanitized source error (the engine stores source_error).
-- No manual smoke-check or capped measurement script exists yet for the
-  trades client; the implementation has only been exercised by fake-HTTP
-  tests (no live market-data call has been made).
+- The trades client now has a manual smoke-check script
+  (scripts/smokeAlpacaTrades.js) but it has NOT YET been run against the live
+  feed; the implementation has only been exercised by fake-HTTP tests (no
+  live market-data call has been made). The capped manual MEASUREMENT script
+  (market-data client plan §16 item 4, driving measureReactions against the
+  real client) does not exist yet.
 
 ## Next Recommended Task
 Step 2 of docs/market-data-client-plan.md §16 (the real Alpaca trades
-PriceSource) is implemented as src/prices/alpacaTradesPriceSource.js
-(fake-HTTP tests only) and committed as `d3b1984` (not yet pushed).
+PriceSource) is committed as `d3b1984`. Step 3 (the manual smoke-check
+script, scripts/smokeAlpacaTrades.js) is implemented with network-free tests
+and is PENDING review/commit; it has NOT yet been run against the live feed.
 
-Next (separately approved, §16 items 3–4): a manual smoke-check script for
-the trades client (manual-only, never in npm test or startup; credentials
-via config only; sanitized whitelist output; tiny capped sample; no DB
-writes, no polling/scheduling, no trading/model calls), followed by a capped
-manual measurement script that drives measureReactions against the real
-client. Both must stay off the npm test path. Real session-calendar /
+Recommended next steps, in order:
+1. Run scripts/smokeAlpacaTrades.js against the live feed once (manual, real
+   .env) to confirm reachability/normalization, then record the result here.
+2. Step 4 (separately approved): a capped manual measurement script
+   (scripts/measureReactionsOnce.js per §15) that selects a tiny capped set
+   of EXISTING news_events rows, constructs the real client explicitly, runs
+   the existing measureEvents batch helper, and writes ONLY through
+   insertPriceReaction (idempotent replace) with sanitized summary output.
+Both scripts stay off the npm test path. Real session-calendar /
 market_closed / true-EOD policy remain deferred to their own task.
 
 ## Maintenance Rule

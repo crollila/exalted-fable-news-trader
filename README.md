@@ -56,6 +56,29 @@ market-data calls, no trading. Output is a sanitized summary only
 keys, headers, request objects, or raw payloads. Same credential
 requirements as the smoke check; fails clearly when unconfigured.
 
+## Manual trades smoke check
+
+A third manual-only script confirms the real Alpaca Trades PriceSource can
+reach the market-data API and normalize trades for one ticker over one tiny
+recent window. It uses the same Alpaca key pair (account-level) read via
+config only:
+
+```
+node --env-file=.env scripts/smokeAlpacaTrades.js --symbol AAPL --minutes 5 --lag 20
+```
+
+The window ends `--lag` minutes in the past (default 20, minimum 16) to stay
+outside Alpaca's too-recent-data restriction on the free IEX feed, and spans
+`--minutes` (default 5, capped at 60). Output is sanitized metadata only —
+symbol, requested window, source name, trade count, first/last trade
+timestamps, and min/max price (public market data) — never keys, headers,
+request URLs, or raw payloads. Zero trades is still a PASS: outside market
+hours or on the thin IEX feed an empty window is expected, and the check
+proves reachability and normalization, not feed completeness. Never part of
+`npm test`, no polling, no scheduling, no database writes, no trading, no
+model calls. Same credential requirements as the news scripts; fails clearly
+when unconfigured.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

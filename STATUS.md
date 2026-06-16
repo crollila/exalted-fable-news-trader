@@ -4,15 +4,18 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (180/180).
+- Stable. All tests passing (200/200).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `99e83f4` — feat(scripts): add manual Alpaca Trades smoke check
-  (scripts/smokeAlpacaTrades.js + tests/smokeTradesFormat.test.js +
-  package.json enumeration + README section). Committed locally, not yet pushed.
-- Previous: `7384237` — docs(status): record Alpaca trades PriceSource commit
+- Latest committed: `9163b82` — docs(status): record Alpaca trades smoke result.
+- UNCOMMITTED (this task, awaiting review): Phase A MVP step — manual capped
+  measurement script (scripts/measureReactionsOnce.js) + manual research
+  summary script (scripts/reportEventStudySummary.js) + network-free tests
+  (tests/measureReactionsOnce.test.js, tests/reportEventStudySummary.test.js)
+  + package.json test enumeration + README manual-usage sections + this
+  STATUS update. Not staged, not committed, not pushed.
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -262,6 +265,42 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   confirmed against the live feed; a non-empty-window run during market hours
   is still worth doing later to exercise the price/timestamp mapping on real
   ticks.
+- Manual capped measurement script (scripts/measureReactionsOnce.js,
+  documented in README), implementing step 4 of the market-data client plan
+  §16 / §15: manual-only, never part of npm test or startup; CLI-guarded
+  (import is side-effect free); credentials via config only (.env loaded with
+  --env-file). Selects a TINY capped set of EXISTING news_events rows
+  (default 1, hard max 5 via --limit; or specific --ids, also capped at 5);
+  only rows with both ticker and received_at are eligible. Explicitly
+  constructs createAlpacaTradesPriceSource(config) — the only place a real
+  market-data path is enabled — and runs the EXISTING measureEvents batch
+  helper, so all rows are written ONLY through insertPriceReaction
+  (idempotent replace-on-remeasure; no new write path, no engine change).
+  Sanitized summary output only (selected/measured/failed event counts,
+  measurement_status counts, horizons attempted, source name, and a compact
+  per-event id/ticker/per-horizon-status line) — never keys, headers, request
+  URLs, raw trade payloads, or raw news payloads. no_baseline/no_reaction on
+  out-of-hours events is the expected, correct failures-as-data outcome. No
+  sentiment/model calls, no trading, no paper orders. 12 network-free tests
+  (tests/measureReactionsOnce.test.js) using an in-memory DB and a fixture
+  PriceSource — arg parsing/cap enforcement, selection ordering/cap,
+  no-event behavior, status aggregation, summary formatting, output
+  redaction, and the real writer path offline. NOT YET RUN against the live
+  feed.
+- Manual research summary script (scripts/reportEventStudySummary.js,
+  documented in README): manual-only, READ-ONLY (SELECTs only — no writes, no
+  migrations, no network, no credentials needed); CLI-guarded. Opens the
+  configured SQLite file (errors clearly if the file or event-study tables are
+  absent) and prints a sanitized, paste-safe snapshot: total news_events,
+  sentiment_scores, and price_reactions rows; measurement_status counts;
+  horizon counts; measured-return averages by horizon; and a small capped list
+  (--limit, default 10, max 50) of recent measured rows (event id, ticker,
+  horizon, return, timestamp). Output is a strict whitelist of ids, tickers,
+  horizons, statuses, timestamps, and numeric returns — never headlines,
+  bodies, raw_payload, raw model responses, keys, or any free-text content. 8
+  network-free tests (tests/reportEventStudySummary.test.js) using an
+  in-memory DB — arg parsing/cap, aggregation, empty-database behavior,
+  recent-rows cap, formatting, and redaction/paste-safety.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -375,23 +414,28 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   driving measureReactions against the real client) does not exist yet.
 
 ## Next Recommended Task
-Step 2 of docs/market-data-client-plan.md §16 (the real Alpaca trades
-PriceSource) is committed as `d3b1984`. Step 3 (the manual smoke-check
-script, scripts/smokeAlpacaTrades.js, committed as `99e83f4`) has now been
-run once against the live feed (2026-06-16, PASSED over a zero-trade window).
+Step 4 of docs/market-data-client-plan.md §16 / §15 (the capped manual
+measurement script, scripts/measureReactionsOnce.js) is now IMPLEMENTED but
+UNCOMMITTED and NOT YET RUN against the live feed. A read-only research
+summary script (scripts/reportEventStudySummary.js) was added alongside it as
+the first reporting surface. Both have network-free tests (200/200 passing).
 
-Recommended next step: Step 4 (separately approved): a capped manual
-measurement script (scripts/measureReactionsOnce.js per §15) that selects a
-tiny capped set of EXISTING news_events rows, constructs the real client
-explicitly, runs the existing measureEvents batch helper, and writes ONLY
-through insertPriceReaction (idempotent replace) with sanitized summary
-output. It stays off the npm test path.
+Recommended next step: review and commit this task, then RUN the capped
+measurement once locally during/after US market hours
+(node --env-file=.env scripts/measureReactionsOnce.js --limit 1) to exercise
+the real trades client on stored events, and RUN the research summary
+(node --env-file=.env scripts/reportEventStudySummary.js) to confirm the
+measured/return picture. Record both runs in STATUS as the prior smoke/ingest
+runs were recorded. Expect several horizons to land on
+no_baseline/no_reaction for events ingested outside market hours — that is
+the correct failures-as-data outcome, not a bug.
 
 Optional, low priority: re-run the trades smoke check during US market hours
 to confirm the price/timestamp mapping on a non-empty window of real ticks.
 
-Real session-calendar / market_closed / true-EOD policy remain deferred to
-their own task.
+Then (later, semantics-changing, bigger review): step 5 — real
+session-calendar / market_closed / true-EOD policy — remains deferred to its
+own task.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

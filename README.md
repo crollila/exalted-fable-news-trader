@@ -79,6 +79,49 @@ proves reachability and normalization, not feed completeness. Never part of
 model calls. Same credential requirements as the news scripts; fails clearly
 when unconfigured.
 
+## Manual capped measurement
+
+A fourth manual-only script measures real price reactions for a tiny capped
+set of **existing** `news_events` rows. It explicitly constructs the real
+Alpaca Trades PriceSource and runs the existing measurement engine, writing
+`price_reactions` rows only through the existing `insertPriceReaction` path
+(re-measurement replaces, never duplicates):
+
+```
+node --env-file=.env scripts/measureReactionsOnce.js --limit 1
+node --env-file=.env scripts/measureReactionsOnce.js --ids 1,2,3
+```
+
+`--limit` defaults to 1 and is hard-capped at 5 events; `--ids` selects
+specific event ids (also capped at 5). Only events that have both a ticker
+and a `received_at` are eligible. Output is a sanitized summary only —
+selected/measured/failed event counts, `measurement_status` counts, horizons
+attempted, the source name, and a compact per-event line (id, ticker,
+per-horizon status). Never keys, headers, request URLs, raw trade payloads, or
+raw news payloads. Some horizons landing on `no_baseline`/`no_reaction` is the
+expected, correct outcome for events received outside market hours — failures
+are stored as data. Never part of `npm test`, no polling, no scheduling, no
+trading, no model calls. Same credential requirements as the news scripts;
+fails clearly when unconfigured.
+
+## Manual research summary
+
+A fifth manual-only script prints a sanitized, paste-safe snapshot of the
+local research database. It is **read-only** — SELECTs only, no writes, no
+migrations, and no network or credentials:
+
+```
+node --env-file=.env scripts/reportEventStudySummary.js --limit 10
+```
+
+It reports total `news_events`, `sentiment_scores`, and `price_reactions`
+rows, `measurement_status` counts, horizon counts, measured-return averages by
+horizon, and a small capped list of recent measured rows (event id, ticker,
+horizon, return, timestamp). It never prints headlines, bodies, raw payloads,
+raw model responses, keys, or any free-text content — output is safe to paste
+into ChatGPT. The `--env-file` is only used to resolve `DATABASE_URL`; no API
+keys are needed. Never part of `npm test`, no polling, no scheduling.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

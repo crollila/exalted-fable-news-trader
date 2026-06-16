@@ -248,7 +248,20 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   or raw payloads); zero trades is still a PASS (reachability/normalization,
   not feed completeness). No DB writes, no polling/scheduling, no
   trading/model calls. 9 network-free formatter/arg/window tests
-  (tests/smokeTradesFormat.test.js). NOT YET RUN against the live feed.
+  (tests/smokeTradesFormat.test.js).
+- Manual Alpaca Trades smoke check RUN LOCALLY and PASSED (real .env
+  credentials, command: node --env-file=.env scripts/smokeAlpacaTrades.js
+  --symbol AAPL --minutes 5 --lag 20). Window
+  2026-06-16T22:34:26.007Z → 2026-06-16T22:39:26.007Z via source
+  "alpaca_iex"; trades 0; result PASSED (source reachable, trades
+  normalized). Zero trades is acceptable/expected outside market hours or on
+  the thin IEX feed — the check proves reachability and normalization, not
+  feed completeness. Sanitized output only (symbol, window, source name,
+  count) — no keys, auth headers, request URLs, or raw payloads. The trades
+  client's reachability and PriceSource-compatible normalization are now
+  confirmed against the live feed; a non-empty-window run during market hours
+  is still worth doing later to exercise the price/timestamp mapping on real
+  ticks.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -277,10 +290,11 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   existing pipeline). Both are proven against the live feed.
 - The real Alpaca Trades PriceSource has one manual entry point so far: the
   trades smoke check (scripts/smokeAlpacaTrades.js, no DB writes), which
-  explicitly constructs createAlpacaTradesPriceSource(config). It has NOT
-  yet been run against the live feed. There is still NO automatic live data
-  path anywhere — real transports/clients activate only by explicit
-  construction in these manually-run scripts.
+  explicitly constructs createAlpacaTradesPriceSource(config). It has been
+  run once against the live feed (2026-06-16, PASSED, zero-trade window).
+  There is still NO automatic live data path anywhere — real
+  transports/clients activate only by explicit construction in these
+  manually-run scripts.
 - src/sentiment is pure/local: no model, API, or network calls anywhere in
   the module. Provider-supplied sentiment remains in raw_payload only.
 - The parser/classifier remains fixture-only. sentiment_scores rows are
@@ -290,10 +304,9 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   block or delete news_events rows.
 - Tests: Node built-in test runner (`npm test`).
 - No automatic/scheduled provider or market-data calls; the only live
-  touchpoints are the three manual scripts (two news, one trades). The
-  trades smoke check can make a market-data call when a human runs it, but
-  has not been run yet. No sentiment/model calls, no execution/trading
-  calls yet.
+  touchpoints are the three manual scripts (two news, one trades), all of
+  which have now been run successfully against the live feed at least once.
+  No sentiment/model calls, no execution/trading calls yet.
 
 ## Hard Safety Rules
 - Do not overwrite or depend on the V1 repo.
@@ -354,29 +367,31 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   truncated. Higher-throughput backfill (raising the cap or windowing) is
   deferred. No retries on 429/5xx in v1 — a rate-limited or failed request
   surfaces as a sanitized source error (the engine stores source_error).
-- The trades client now has a manual smoke-check script
-  (scripts/smokeAlpacaTrades.js) but it has NOT YET been run against the live
-  feed; the implementation has only been exercised by fake-HTTP tests (no
-  live market-data call has been made). The capped manual MEASUREMENT script
-  (market-data client plan §16 item 4, driving measureReactions against the
-  real client) does not exist yet.
+- The trades client smoke check has been run once against the live feed
+  (2026-06-16, PASSED) but only over a ZERO-TRADE window (run outside market
+  hours), so the price/timestamp mapping has not yet been exercised on real
+  ticks; a non-empty-window run during market hours is still worth doing.
+  The capped manual MEASUREMENT script (market-data client plan §16 item 4,
+  driving measureReactions against the real client) does not exist yet.
 
 ## Next Recommended Task
 Step 2 of docs/market-data-client-plan.md §16 (the real Alpaca trades
 PriceSource) is committed as `d3b1984`. Step 3 (the manual smoke-check
-script, scripts/smokeAlpacaTrades.js) is committed as `99e83f4`; it has NOT
-yet been run against the live feed.
+script, scripts/smokeAlpacaTrades.js, committed as `99e83f4`) has now been
+run once against the live feed (2026-06-16, PASSED over a zero-trade window).
 
-Recommended next steps, in order:
-1. Run scripts/smokeAlpacaTrades.js against the live feed once (manual, real
-   .env) to confirm reachability/normalization, then record the result here.
-2. Step 4 (separately approved): a capped manual measurement script
-   (scripts/measureReactionsOnce.js per §15) that selects a tiny capped set
-   of EXISTING news_events rows, constructs the real client explicitly, runs
-   the existing measureEvents batch helper, and writes ONLY through
-   insertPriceReaction (idempotent replace) with sanitized summary output.
-Both scripts stay off the npm test path. Real session-calendar /
-market_closed / true-EOD policy remain deferred to their own task.
+Recommended next step: Step 4 (separately approved): a capped manual
+measurement script (scripts/measureReactionsOnce.js per §15) that selects a
+tiny capped set of EXISTING news_events rows, constructs the real client
+explicitly, runs the existing measureEvents batch helper, and writes ONLY
+through insertPriceReaction (idempotent replace) with sanitized summary
+output. It stays off the npm test path.
+
+Optional, low priority: re-run the trades smoke check during US market hours
+to confirm the price/timestamp mapping on a non-empty window of real ticks.
+
+Real session-calendar / market_closed / true-EOD policy remain deferred to
+their own task.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

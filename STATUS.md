@@ -9,10 +9,10 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `7b67f7a` — docs(prices): add market-data client plan for first real PriceSource
-- PENDING (uncommitted, awaiting review): first real Alpaca trades PriceSource
-  implementation (src/prices/alpacaTradesPriceSource.js + tests + package.json
-  enumeration). Not yet staged/committed/pushed.
+- Latest committed: `d3b1984` — feat(prices): add Alpaca trades PriceSource
+  (first real Alpaca trades PriceSource: src/prices/alpacaTradesPriceSource.js
+  + tests + package.json enumeration). Committed locally, not yet pushed.
+- Previous: `7b67f7a` — docs(prices): add market-data client plan for first real PriceSource
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -340,7 +340,7 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 ## Next Recommended Task
 Step 2 of docs/market-data-client-plan.md §16 (the real Alpaca trades
 PriceSource) is implemented as src/prices/alpacaTradesPriceSource.js
-(fake-HTTP tests only) and is PENDING review/commit.
+(fake-HTTP tests only) and committed as `d3b1984` (not yet pushed).
 
 Next (separately approved, §16 items 3–4): a manual smoke-check script for
 the trades client (manual-only, never in npm test or startup; credentials

@@ -9,8 +9,8 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `547479a` — docs(status): record Phase C model classifier
-  commit (STATUS.md only).
+- Latest committed: `d54340a` — docs(status): record real model classifier
+  smoke result (STATUS.md only).
 - Previous: `691900b` — feat(sentiment): add real model-backed classifier
   (src/sentiment/modelClassifier.js + src/sentiment/index.js + src/config.js +
   scripts/classifyNewsOnce.js + scripts/runMvpPipelineOnce.js +
@@ -18,7 +18,7 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   tests/runMvpPipelineOnce.test.js + package.json + .env.example + README).
   22 new network-free fake-HTTP tests; 246/246 passing.
 - This STATUS update is committed separately as
-  `docs(status): record real model classifier smoke result` (STATUS.md only).
+  `docs(status): record real-model MVP pipeline run` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -37,10 +37,16 @@ Phase C (real model-backed classifier) — IMPLEMENTED and COMMITTED
 contract and reuses the existing parseModelResponse + insertSentimentScore
 path. Explicit/opt-in via `--classifier real_model`; default stays
 manual_baseline. Config-only credentials, sanitized errors, never throws on
-bad calls, and never exercised by npm test (fake HTTP only). NOW RUN ONCE
-locally against the live model API (model claude-opus-4-8, prompt model_v1):
-one event classified and stored through insertSentimentScore (parsed=1),
-sanitized output only. Proves wiring, not signal quality.
+bad calls, and never exercised by npm test (fake HTTP only). RUN ONCE
+standalone against the live model API (model claude-opus-4-8, prompt
+model_v1): one event classified and stored through insertSentimentScore
+(parsed=1), sanitized output only. The FULL MVP PIPELINE has NOW ALSO been
+run locally with `--classifier real_model`: real Alpaca news ingest -> real
+model-backed scoring -> real Alpaca Trades measurement path -> read-only
+research summary, all through existing insert paths, with sanitized output
+and no orders/trading. Measurement still produced no_baseline=6 (no usable
+baseline trade, likely outside market hours), so this proves the real
+end-to-end research WIRING, not signal quality or measured returns.
 
 ## Completed Work
 - Initial setup (repo, docs, .gitignore, .env.example).
@@ -456,6 +462,33 @@ sanitized output only. Proves wiring, not signal quality.
   payload, or raw model response was printed. This proves real model classifier
   WIRING, NOT signal quality; manual_baseline remains the default. No trading,
   no paper orders.
+- Full MVP pipeline RUN LOCALLY with the REAL model classifier (real .env
+  credentials, command: node --env-file=.env scripts/runMvpPipelineOnce.js
+  --classifier real_model --symbols AAPL --ingest-limit 5 --classify-limit 1
+  --measure-limit 1). Stage 1 ingest via provider "alpaca" fetched 5,
+  inserted 0, duplicates 5, failed 0, no inserted ids (the small AAPL sample
+  was already in the DB — provider-scoped dedup held). Stage 2 classify/score
+  with model claude-opus-4-8 / prompt model_v1 selected 1, classified 1,
+  stored 1, skipped 0, failed 0, parser statuses parsed=1 — a real
+  model-backed sentiment_scores row written through insertSentimentScore.
+  Stage 3 measure via source alpaca_iex selected 1, measured 1, failed 0
+  across horizons 10s/1m/5m/30m/1h/eod, statuses no_baseline=6, 6 rows
+  written / 6 replaced (event 1 AAPL no_baseline for all six horizons).
+  Stage 4 research summary: news_events 10, sentiment_scores 4,
+  price_reactions 6, measurement_status no_baseline=6, horizon counts
+  10s=1/1m=1/5m=1/30m=1/1h=1/eod=1, no measured rows yet (no measured-return
+  averages, no recent measured rows). This proves the full MVP research loop
+  end-to-end with real Alpaca news ingest, real model-backed classification,
+  the real Alpaca Trades measurement path, and read-only reporting — all
+  through existing insert paths. No orders were placed and no trading
+  occurred. Output stayed sanitized — no API key, auth header, request URL,
+  raw news payload, raw trade payload, or raw model response was printed.
+  This proves the real end-to-end research WIRING, NOT signal quality or
+  profitability. The no_baseline=6 outcome means measured returns are still
+  unavailable (no usable baseline trade, likely outside market hours); a
+  market-hours measurable-event run is required before event-study expectancy
+  can be evaluated. git status clean after the run; the database file and .env
+  remained ignored/untracked.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -605,12 +638,15 @@ sanitized output only. Proves wiring, not signal quality.
   price_reactions 6). The run still produced no measured returns
   (no_baseline=6), so signal quality remains unproven — manual_baseline is a
   neutral placeholder and a market-hours measured run is still outstanding.
-- Phase C (real model classifier) is committed, fully tested offline, AND now
-  RUN ONCE against a live model (standalone classification only: parsed=1, one
-  sentiment_scores row, sanitized output). Still outstanding: a full pipeline
-  run with `--classifier real_model` (real score + measurement) and a
-  market-hours measured readout. Each real run needs ANTHROPIC_API_KEY and
-  bills the Anthropic API. Signal quality remains unproven.
+- Phase C (real model classifier) is committed, fully tested offline, RUN ONCE
+  standalone against a live model (parsed=1, one sentiment_scores row,
+  sanitized output), AND now RUN through the FULL MVP pipeline with
+  `--classifier real_model` (real model score stored + real measurement path
+  exercised; sentiment_scores 4, price_reactions 6). The pipeline run still
+  produced no measured returns (no_baseline=6), so the only outstanding item is
+  a MARKET-HOURS measured readout where real scores and real measured returns
+  coexist. Each real run needs ANTHROPIC_API_KEY and bills the Anthropic API.
+  Signal quality remains unproven.
 - The model classifier relies on the model returning a BARE JSON object
   (enforced by a strict system prompt). If a model wraps output in prose or
   markdown fences, the existing parser records malformed_json (failure-as-data)
@@ -629,27 +665,30 @@ sanitized output only. Proves wiring, not signal quality.
 
 ## Next Recommended Task
 Phase C (real model-backed classifier) is now IMPLEMENTED, COMMITTED
-(`691900b`), and RUN ONCE locally against the live model (standalone
-classification: model claude-opus-4-8 / prompt model_v1, parsed=1, one
-sentiment_scores row, sanitized output). That proves wiring, not edge.
+(`691900b`), RUN ONCE standalone against the live model, AND RUN through the
+FULL MVP pipeline with `--classifier real_model` (real model score stored in
+sentiment_scores; real Alpaca Trades measurement path exercised). That proves
+the full real end-to-end wiring, not edge — the pipeline run produced
+no_baseline=6, so there are still no measured returns.
 
-Recommended next step: RUN the full MVP pipeline once with the real classifier
-and record the result in STATUS, ideally during US market hours so measurement
-can produce measured rows:
+Recommended next step: get MARKET-HOURS measured rows so real scores and real
+measured returns finally coexist. Either re-run the full pipeline during US
+market hours on a fresh, measurable event:
   node --env-file=.env scripts/runMvpPipelineOnce.js --classifier real_model \
     --symbols AAPL --ingest-limit 5 --classify-limit 1 --measure-limit 1
-Expect a real model score stored in sentiment_scores plus price_reactions from
-the measurement stage; outside market hours several horizons will land on
-no_baseline/no_reaction (correct failures-as-data).
+or run the capped measurement alone against a recent market-hours event:
+  node --env-file=.env scripts/measureReactionsOnce.js --limit 1
+A small helper to SELECT recent market-hours events for measurement (still
+manual-only and capped) would make this repeatable. Outside market hours,
+horizons will keep landing on no_baseline/no_reaction (correct
+failures-as-data).
 
 Only after real scores AND market-hours measured returns coexist can edge be
 measured — that is the first genuine event-study readout (expectancy sliced by
 news_type / direction / score bucket, grouped by prompt_version).
 
-Optional, low priority: re-run the capped measurement on MARKET-HOURS events
-(node --env-file=.env scripts/measureReactionsOnce.js --limit 1) to get
-measured rows with actual returns, and re-run the trades smoke check during
-market hours to confirm the price/timestamp mapping on a non-empty window.
+Optional, low priority: re-run the trades smoke check during market hours to
+confirm the price/timestamp mapping on a non-empty window.
 
 Then (later, semantics-changing, bigger review): step 5 of
 docs/market-data-client-plan.md — real session-calendar / market_closed /

@@ -9,14 +9,15 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `a79b062` — feat(scripts): add manual capped measurement
-  and research summary (scripts/measureReactionsOnce.js +
+- Latest committed: `635d729` — docs(status): record Phase A measurement/report
+  commit (STATUS.md only).
+- Previous: `a79b062` — feat(scripts): add manual capped measurement and
+  research summary (scripts/measureReactionsOnce.js +
   scripts/reportEventStudySummary.js + tests/measureReactionsOnce.test.js +
   tests/reportEventStudySummary.test.js + package.json test enumeration +
   README manual-usage sections). 20 new network-free tests; 200/200 passing.
-- Previous: `9163b82` — docs(status): record Alpaca trades smoke result.
 - This STATUS update is committed separately as
-  `docs(status): record Phase A measurement/report commit`.
+  `docs(status): record Phase A manual MVP loop result` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -302,6 +303,24 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   network-free tests (tests/reportEventStudySummary.test.js) using an
   in-memory DB — arg parsing/cap, aggregation, empty-database behavior,
   recent-rows cap, formatting, and redaction/paste-safety.
+- Phase A manual MVP loop RUN LOCALLY end-to-end (real .env credentials).
+  Measurement (node --env-file=.env scripts/measureReactionsOnce.js --limit 1):
+  source alpaca_iex; selected 1 event, measured 1, failed 0; horizons
+  10s/1m/5m/30m/1h/eod; statuses no_baseline=6; 6 rows written, 0 replaced;
+  event 1 AAPL returned no_baseline for all six horizons; measurement
+  COMPLETE — rows written through insertPriceReaction. Report
+  (node --env-file=.env scripts/reportEventStudySummary.js --limit 10):
+  news_events 5, sentiment_scores 0, price_reactions 6; measurement_status
+  no_baseline=6; horizon counts 10s=1/1m=1/5m=1/30m=1/1h=1/eod=1; no measured
+  rows yet (no measured-return averages, no recent measured rows). This proves
+  the manual MVP loop at the database level: existing news_events -> real
+  Alpaca Trades PriceSource path -> measureReactions -> price_reactions rows ->
+  read-only research report. The all-no_baseline outcome is the expected,
+  correct failures-as-data result (the selected event/window had no usable
+  baseline trade, likely outside market hours). This proves write/read
+  pipeline behavior, NOT profitable signal or real measured returns yet. git
+  status clean after the run; the database file and .env remained
+  ignored/untracked. No sentiment/model calls, no trading, no paper orders.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -411,33 +430,37 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
   (2026-06-16, PASSED) but only over a ZERO-TRADE window (run outside market
   hours), so the price/timestamp mapping has not yet been exercised on real
   ticks; a non-empty-window run during market hours is still worth doing.
-  The capped manual MEASUREMENT script (market-data client plan §16 item 4,
-  driving measureReactions against the real client) does not exist yet.
+  The capped manual MEASUREMENT script has now been run once (Phase A MVP
+  loop), but it produced all-no_baseline rows (no usable baseline trade,
+  likely outside market hours), so the price/timestamp/return mapping has
+  STILL not been exercised on real measured ticks. A market-hours rerun that
+  yields measured rows with actual returns remains an open low-priority
+  follow-up.
 
 ## Next Recommended Task
-Step 4 of docs/market-data-client-plan.md §16 / §15 (the capped manual
-measurement script, scripts/measureReactionsOnce.js) is now IMPLEMENTED and
-COMMITTED as `a79b062`, but NOT YET RUN against the live feed. A read-only
-research summary script (scripts/reportEventStudySummary.js) was added
-alongside it as the first reporting surface. Both have network-free tests
-(200/200 passing).
+Phase A (manual MVP loop) is now COMPLETE and proven end-to-end at the
+database level: existing news_events -> real Alpaca Trades PriceSource ->
+measureReactions -> price_reactions rows -> read-only research report
+(measurement + report RUN LOCALLY, recorded above). The loop produced
+all-no_baseline rows, which proves write/read pipeline behavior, not
+profitable signal or real measured returns yet.
 
-Recommended next step: review and commit this task, then RUN the capped
-measurement once locally during/after US market hours
-(node --env-file=.env scripts/measureReactionsOnce.js --limit 1) to exercise
-the real trades client on stored events, and RUN the research summary
-(node --env-file=.env scripts/reportEventStudySummary.js) to confirm the
-measured/return picture. Record both runs in STATUS as the prior smoke/ingest
-runs were recorded. Expect several horizons to land on
-no_baseline/no_reaction for events ingested outside market hours — that is
-the correct failures-as-data outcome, not a bug.
+Recommended next step — Phase B: real classifier / manual scoring plus an
+end-to-end manual pipeline command (a single manual entry point that drives
+ingest -> classify/score -> measure -> report on a tiny capped set), so the
+loop carries a sentiment/score alongside the price reaction instead of
+price_reactions only. Keep it manual, capped, fixture-safe by default, and
+write only through the existing insert paths.
 
-Optional, low priority: re-run the trades smoke check during US market hours
-to confirm the price/timestamp mapping on a non-empty window of real ticks.
+Optional, low priority: re-run the capped measurement on MARKET-HOURS events
+(node --env-file=.env scripts/measureReactionsOnce.js --limit 1) to get
+measured rows with actual returns (exercising the real price/timestamp/return
+mapping), and re-run the trades smoke check during market hours to confirm the
+mapping on a non-empty window of real ticks.
 
-Then (later, semantics-changing, bigger review): step 5 — real
-session-calendar / market_closed / true-EOD policy — remains deferred to its
-own task.
+Then (later, semantics-changing, bigger review): step 5 of
+docs/market-data-client-plan.md — real session-calendar / market_closed /
+true-EOD policy — remains deferred to its own task.
 
 ## Maintenance Rule
 After every approved commit, Claude should update STATUS.md with:

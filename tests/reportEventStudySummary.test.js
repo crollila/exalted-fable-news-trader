@@ -123,6 +123,9 @@ test('collectSummary on an empty (migrated) database returns zeros, not an error
   const summary = collectSummary(db);
   assert.equal(summary.totalNewsEvents, 0);
   assert.equal(summary.totalPriceReactions, 0);
+  assert.equal(summary.measuredRowCount, 0);
+  assert.equal(summary.modelV1ScoreCount, 0);
+  assert.equal(summary.readyEventCount, 0);
   assert.deepEqual(summary.measurementStatusCounts, {});
   assert.deepEqual(summary.avgReturnByHorizon, {});
   assert.deepEqual(summary.recentMeasuredEvents, []);
@@ -140,6 +143,74 @@ test('collectSummary honors the recent-rows cap', () => {
   const summary = collectSummary(db, { recentLimit: 1 });
   assert.equal(summary.recentMeasuredEvents.length, 1);
   closeDatabase(db);
+});
+
+// --- event-study readiness counts ------------------------------------------
+
+function insertScoreWith(db, newsEventId, { model, promptVersion }) {
+  db.prepare(INSERT_SCORE_SQL).run({
+    news_event_id: newsEventId,
+    model,
+    prompt_version: promptVersion,
+    raw_response: 'RAW-MODEL-RESPONSE-MUST-NOT-PRINT',
+    parser_status: 'parsed',
+  });
+}
+
+test('collectSummary counts model_v1 scores, measured rows, and ready events', () => {
+  const db = openMemoryDatabase();
+  runMigrations(db);
+  insertEvent(db, { id: 1, ticker: 'AAPL', receivedAt: '2026-06-12T14:30:00.000Z' });
+  insertEvent(db, { id: 2, ticker: 'MSFT', receivedAt: '2026-06-12T15:30:00.000Z' });
+  insertEvent(db, { id: 3, ticker: 'NVDA', receivedAt: '2026-06-12T16:30:00.000Z' });
+
+  // Event 1: real-model score + a measured reaction → event-study ready.
+  insertScoreWith(db, 1, { model: 'claude-opus-4-8', promptVersion: 'model_v1' });
+  measured(db, 1, '10s', { baseline: 200, reaction: 201, at: '2026-06-12T14:30:10.000Z' });
+  // Event 2: real-model score but NO measured reaction → not ready.
+  insertScoreWith(db, 2, { model: 'claude-opus-4-8', promptVersion: 'model_v1' });
+  unmeasured(db, 2, '10s', MEASUREMENT_STATUS.NO_BASELINE, '2026-06-12T15:30:10.000Z');
+  // Event 3: measured reaction but only a manual (non-model_v1) score → not ready.
+  insertScoreWith(db, 3, { model: 'manual_baseline', promptVersion: 'manual_v1' });
+  measured(db, 3, '10s', { baseline: 100, reaction: 99, at: '2026-06-12T16:30:10.000Z' });
+
+  const summary = collectSummary(db);
+  assert.equal(summary.modelV1ScoreCount, 2); // events 1 and 2
+  assert.equal(summary.measuredRowCount, 2); // events 1 and 3
+  assert.equal(summary.readyEventCount, 1); // only event 1 has both
+  closeDatabase(db);
+});
+
+test('buildSummaryReport renders readiness lines and tolerates missing fields', () => {
+  // A summary missing the new fields (e.g. hand-built upstream) defaults to 0.
+  const text = buildSummaryReport({
+    totalNewsEvents: 1,
+    totalSentimentScores: 1,
+    totalPriceReactions: 1,
+    measurementStatusCounts: {},
+    horizonCounts: {},
+    avgReturnByHorizon: {},
+    recentMeasuredEvents: [],
+  }).join('\n');
+  assert.match(text, /measured rows: {4}0/);
+  assert.match(text, /model_v1 scores: {2}0/);
+  assert.match(text, /event-study ready \(model_v1 score \+ measured reaction\): 0/);
+
+  const populated = buildSummaryReport({
+    totalNewsEvents: 3,
+    totalSentimentScores: 3,
+    totalPriceReactions: 2,
+    measuredRowCount: 2,
+    modelV1ScoreCount: 2,
+    readyEventCount: 1,
+    measurementStatusCounts: { measured: 2 },
+    horizonCounts: { '10s': 2 },
+    avgReturnByHorizon: {},
+    recentMeasuredEvents: [],
+  }).join('\n');
+  assert.match(populated, /measured rows: {4}2/);
+  assert.match(populated, /model_v1 scores: {2}2/);
+  assert.match(populated, /event-study ready \(model_v1 score \+ measured reaction\): 1/);
 });
 
 // --- formatting & redaction (paste-safety) ---------------------------------

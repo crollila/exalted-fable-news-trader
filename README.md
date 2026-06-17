@@ -104,9 +104,40 @@ are stored as data. Never part of `npm test`, no polling, no scheduling, no
 trading, no model calls. Same credential requirements as the news scripts;
 fails clearly when unconfigured.
 
+## Manual measurement candidate finder
+
+Measured returns only appear when an event's window overlaps real trading, so
+picking events blindly tends to produce all-`no_baseline` rows. This read-only
+helper ranks **existing** `news_events` by how likely a measurement is to yield
+a measured return and prints a ready-to-paste measure command:
+
+```
+node --env-file=.env scripts/listMeasurementCandidates.js --limit 10
+node --env-file=.env scripts/listMeasurementCandidates.js --ticker AAPL --all
+```
+
+It lists only events that have both a ticker and a `received_at`. By default it
+keeps **market-hours, not-yet-measured** candidates, ranked best-first; `--all`
+lists every eligible event (still ranked best-first), `--ticker` filters to one
+symbol, and `--limit` defaults to 10 (hard-capped at 50). Per candidate it
+prints event id, ticker, provider, `received_at`, an Eastern-time label, a
+market-hours flag, whether a real-model (`model_v1`) score exists, whether it is
+already measured, and its `price_reactions` status counts — then the exact
+`measureReactionsOnce.js --ids <id>` command, plus a combined command for the
+top candidates (capped at 5, the measure script's `--ids` limit).
+
+The market-hours test is an **approximation** (Mon–Fri 09:30–16:00
+America/New_York, DST handled automatically); it does **not** model market
+holidays or half-days — a real session calendar is deferred to the market-data
+client's later session step. It is **read-only** (SELECTs only, no writes, no
+migrations), makes no network call, runs no measurement, and needs no
+credentials (the `--env-file` only resolves `DATABASE_URL`). Output never prints
+headlines, bodies, raw payloads, raw model responses, or keys — safe to paste
+into ChatGPT. Never part of `npm test`, no polling, no scheduling, no trading.
+
 ## Manual research summary
 
-A fifth manual-only script prints a sanitized, paste-safe snapshot of the
+A manual-only script prints a sanitized, paste-safe snapshot of the
 local research database. It is **read-only** — SELECTs only, no writes, no
 migrations, and no network or credentials:
 
@@ -115,7 +146,10 @@ node --env-file=.env scripts/reportEventStudySummary.js --limit 10
 ```
 
 It reports total `news_events`, `sentiment_scores`, and `price_reactions`
-rows, `measurement_status` counts, horizon counts, measured-return averages by
+rows; **event-study readiness counts** (measured rows, real-model `model_v1`
+score count, and the number of events that have *both* a `model_v1` score and a
+measured reaction — the headline "ready for an expectancy readout" number);
+`measurement_status` counts, horizon counts, measured-return averages by
 horizon, and a small capped list of recent measured rows (event id, ticker,
 horizon, return, timestamp). It never prints headlines, bodies, raw payloads,
 raw model responses, keys, or any free-text content — output is safe to paste

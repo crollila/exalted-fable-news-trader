@@ -26,6 +26,7 @@ import {
   HORIZONS,
   MEASUREMENT_STATUS,
 } from '../src/database/priceReactions.js';
+import { MODEL_PROMPT_VERSION } from '../src/sentiment/modelClassifier.js';
 
 /** Recent-measured-rows list is a small sample, never a full dump. */
 export const DEFAULT_RECENT_LIMIT = 10;
@@ -63,6 +64,30 @@ export function collectSummary(db, { recentLimit = DEFAULT_RECENT_LIMIT } = {}) 
   const totalPriceReactions = countRows(db, 'price_reactions');
 
   const measurementStatusCounts = countPriceReactionsByStatus(db);
+  const measuredRowCount = measurementStatusCounts[MEASUREMENT_STATUS.MEASURED] ?? 0;
+
+  // Real-model score count (the model classifier's signature prompt_version)
+  // and the headline readiness number: events that have BOTH a real-model score
+  // AND at least one measured price reaction — the rows an event-study readout
+  // can actually use. While this is 0, no expectancy can be computed yet.
+  const modelV1ScoreCount = Number(
+    db
+      .prepare('SELECT COUNT(*) AS n FROM sentiment_scores WHERE prompt_version = ?')
+      .get(MODEL_PROMPT_VERSION).n
+  );
+  const readyEventCount = Number(
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM (
+           SELECT n.id FROM news_events n
+            WHERE EXISTS (SELECT 1 FROM sentiment_scores s
+                           WHERE s.news_event_id = n.id AND s.prompt_version = ?)
+              AND EXISTS (SELECT 1 FROM price_reactions p
+                           WHERE p.news_event_id = n.id AND p.measurement_status = ?)
+         )`
+      )
+      .get(MODEL_PROMPT_VERSION, MEASUREMENT_STATUS.MEASURED).n
+  );
 
   const horizonCounts = Object.fromEntries(
     db
@@ -106,6 +131,9 @@ export function collectSummary(db, { recentLimit = DEFAULT_RECENT_LIMIT } = {}) 
     totalNewsEvents,
     totalSentimentScores,
     totalPriceReactions,
+    measuredRowCount,
+    modelV1ScoreCount,
+    readyEventCount,
     measurementStatusCounts,
     horizonCounts,
     avgReturnByHorizon,
@@ -138,6 +166,9 @@ export function buildSummaryReport(summary) {
     `  news_events:      ${summary.totalNewsEvents}`,
     `  sentiment_scores: ${summary.totalSentimentScores}`,
     `  price_reactions:  ${summary.totalPriceReactions}`,
+    `  measured rows:    ${summary.measuredRowCount ?? 0}`,
+    `  model_v1 scores:  ${summary.modelV1ScoreCount ?? 0}`,
+    `  event-study ready (model_v1 score + measured reaction): ${summary.readyEventCount ?? 0}`,
     `  measurement_status: ${renderCounts(summary.measurementStatusCounts, Object.values(MEASUREMENT_STATUS))}`,
     `  horizon counts:     ${renderCounts(summary.horizonCounts, HORIZONS)}`,
   ];

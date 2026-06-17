@@ -19,6 +19,7 @@ import {
   buildPipelineReport,
   DEFAULT_INGEST_LIMIT,
   MAX_INGEST_LIMIT,
+  DEFAULT_CLASSIFIER,
   DEFAULT_CLASSIFY_LIMIT,
   MAX_CLASSIFY_LIMIT,
   DEFAULT_MEASURE_LIMIT,
@@ -74,8 +75,14 @@ test('parseArgs defaults are tiny and safe', () => {
     classifyLimit: DEFAULT_CLASSIFY_LIMIT,
     measureLimit: DEFAULT_MEASURE_LIMIT,
     skipIngest: false,
+    classifier: DEFAULT_CLASSIFIER,
   });
   assert.equal(DEFAULT_INGEST_LIMIT, 5);
+  assert.equal(DEFAULT_CLASSIFIER, 'manual_baseline');
+});
+
+test('parseArgs reads --classifier', () => {
+  assert.equal(parseArgs(['--classifier', 'real_model']).classifier, 'real_model');
 });
 
 test('parseArgs clamps every limit to its hard cap and rejects junk', () => {

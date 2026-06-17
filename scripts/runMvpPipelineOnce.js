@@ -8,13 +8,16 @@
 //
 //   Run:  node --env-file=.env scripts/runMvpPipelineOnce.js \
 //           [--symbols AAPL] [--ingest-limit 5] [--classify-limit 1] \
-//           [--measure-limit 1] [--skip-ingest]
+//           [--measure-limit 1] [--skip-ingest] \
+//           [--classifier manual_baseline|real_model]
 //
 // - MANUAL ONLY: never part of npm test, app startup, schedulers, or CI.
 //   One run, then exit. No polling, no scheduling, no background jobs.
 // - RESEARCH/MEASUREMENT ONLY. It NEVER trades, submits orders, or calls any
-//   trading API. The classifier is the deterministic manual baseline (no
-//   model, no network, no keys — see scripts/classifyNewsOnce.js).
+//   trading API. The classifier defaults to the deterministic manual baseline
+//   (no model, no network, no keys); --classifier real_model opts in to the
+//   real model-backed classifier (needs ANTHROPIC_API_KEY, fails clearly
+//   without it — see scripts/classifyNewsOnce.js).
 // - REUSES EXISTING PATHS ONLY: ingestNews, the manual classifier +
 //   classifyAndStore, the measurement engine via measureEvents +
 //   insertPriceReaction, and the read-only report's collectSummary. No new
@@ -43,8 +46,10 @@ import { collectSummary, buildSummaryReport } from './reportEventStudySummary.js
 import { buildIngestReport } from './ingestAlpacaNewsOnce.js';
 import {
   buildClassifyReport,
-  buildManualClassifier,
+  buildClassifier,
   selectUnscoredEvents,
+  CLASSIFIERS,
+  DEFAULT_CLASSIFIER,
   DEFAULT_CLASSIFY_LIMIT,
   MAX_CLASSIFY_LIMIT,
 } from './classifyNewsOnce.js';
@@ -59,6 +64,8 @@ import {
 export const DEFAULT_INGEST_LIMIT = 5;
 export const MAX_INGEST_LIMIT = 20;
 export {
+  CLASSIFIERS,
+  DEFAULT_CLASSIFIER,
   DEFAULT_CLASSIFY_LIMIT,
   MAX_CLASSIFY_LIMIT,
   DEFAULT_MEASURE_LIMIT,
@@ -87,6 +94,7 @@ export function parseArgs(argv) {
     classifyLimit: DEFAULT_CLASSIFY_LIMIT,
     measureLimit: DEFAULT_MEASURE_LIMIT,
     skipIngest: false,
+    classifier: DEFAULT_CLASSIFIER,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -101,6 +109,9 @@ export function parseArgs(argv) {
       i += 1;
     } else if (flag === '--measure-limit' && argv[i + 1]) {
       args.measureLimit = clampInt(argv[i + 1], DEFAULT_MEASURE_LIMIT, 1, MAX_MEASURE_LIMIT);
+      i += 1;
+    } else if (flag === '--classifier' && argv[i + 1]) {
+      args.classifier = argv[i + 1].trim();
       i += 1;
     } else if (flag === '--skip-ingest') {
       args.skipIngest = true;
@@ -216,9 +227,8 @@ export function buildPipelineReport(result) {
 }
 
 async function main() {
-  const { symbols, ingestLimit, classifyLimit, measureLimit, skipIngest } = parseArgs(
-    process.argv.slice(2)
-  );
+  const { symbols, ingestLimit, classifyLimit, measureLimit, skipIngest, classifier: classifierName } =
+    parseArgs(process.argv.slice(2));
   const config = loadConfig();
   const hasCreds = Boolean(config.alpacaNews.keyId && config.alpacaNews.secretKey);
 
@@ -251,7 +261,9 @@ async function main() {
       priceSource = createAlpacaTradesPriceSource(config);
     }
 
-    const classifier = buildManualClassifier();
+    // Default is the model-free baseline; --classifier real_model is explicit
+    // opt-in and fails clearly if ANTHROPIC_API_KEY is absent (config-only).
+    const classifier = buildClassifier(classifierName, config);
     const result = await runPipeline(
       db,
       { provider, providerSkipReason, classifier, priceSource, priceSkipReason },

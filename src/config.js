@@ -70,6 +70,16 @@ export function loadConfig(env = process.env) {
       keyId: env.ALPACA_API_KEY_ID || null,
       secretKey: env.ALPACA_API_SECRET_KEY || null,
     }),
+    // Model-backed classifier credentials/config. Read ONLY here; held in
+    // memory only; never logged, printed, persisted, or normalized.
+    // anthropicApiKey is null by default — the real model classifier must
+    // throw "not configured" rather than auto-enabling when a key exists.
+    // classifierModel is just an identifier (not a secret); it defaults to the
+    // latest Opus and can be overridden to trade cost/quality.
+    model: Object.freeze({
+      anthropicApiKey: env.ANTHROPIC_API_KEY || null,
+      classifierModel: env.MODEL_CLASSIFIER_MODEL || 'claude-opus-4-8',
+    }),
     risk: Object.freeze({
       maxDailyLossUsd: Number(env.MAX_DAILY_LOSS_USD ?? 100),
       maxPositionSizeUsd: Number(env.MAX_POSITION_SIZE_USD ?? 500),

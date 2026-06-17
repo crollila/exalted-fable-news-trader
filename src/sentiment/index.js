@@ -13,3 +13,9 @@ export {
 } from './classifierContract.js';
 export { parseModelResponse } from './parseModelResponse.js';
 export { createFixtureClassifier } from './fixtureClassifier.js';
+export {
+  createModelClassifier,
+  buildSystemPrompt,
+  buildUserPrompt,
+  MODEL_PROMPT_VERSION,
+} from './modelClassifier.js';

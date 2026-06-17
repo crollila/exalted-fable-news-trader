@@ -2,22 +2,28 @@
 // over EXISTING news_events, using a DETERMINISTIC local manual classifier
 // (NO model, NO network, NO keys). Phase B step.
 //
-//   Run:  node --env-file=.env scripts/classifyNewsOnce.js [--limit 1] [--ids 1,2,3]
-//   (the .env is only used to resolve DATABASE_URL; NO credentials needed.)
+//   Run:  node --env-file=.env scripts/classifyNewsOnce.js [--limit 1] \
+//           [--ids 1,2,3] [--classifier manual_baseline|real_model]
+//   (with the default classifier the .env is only used to resolve
+//   DATABASE_URL; NO credentials needed. --classifier real_model additionally
+//   needs ANTHROPIC_API_KEY in .env.)
 //
 // - MANUAL ONLY: never part of npm test, app startup, schedulers, or CI.
 //   One human-invoked selection + classification, then exit. No polling, no
 //   scheduling, no background jobs.
-// - Reuses the EXISTING path end to end: createFixtureClassifier (with an
-//   injected DETERMINISTIC local responder) → classifyAndStore() →
+// - Reuses the EXISTING path end to end: a Classifier → classifyAndStore() →
 //   insertSentimentScore(). No separate write path, no schema change, no
 //   parser/storage semantics change. Reruns are idempotent: an event already
 //   scored by this (model, prompt_version) is skipped.
-// - DEFAULT CLASSIFIER IS NOT A MODEL. It is a neutral, deterministic baseline
-//   that emits a structurally-valid score (sentiment/impact/confidence = 0,
-//   direction = "unclear"). It exists to prove the loop carries a score
-//   alongside the price reaction — it is a placeholder, NOT trading signal.
-//   A real model client remains a later, separately-approved phase.
+// - DEFAULT CLASSIFIER (manual_baseline) IS NOT A MODEL. It is a neutral,
+//   deterministic baseline that emits a structurally-valid score
+//   (sentiment/impact/confidence = 0, direction = "unclear"). It exists to
+//   prove the loop carries a score alongside the price reaction — it is a
+//   placeholder, NOT trading signal.
+// - --classifier real_model is the EXPLICIT, opt-in real model-backed
+//   classifier (Anthropic Messages API via createModelClassifier). It is
+//   constructed only when requested, reads its key from config only, and is
+//   NEVER exercised by npm test. Without ANTHROPIC_API_KEY it fails clearly.
 // - SANITIZED OUTPUT ONLY: selected/classified/stored/skipped/failed counts,
 //   parser_status counts, model, and prompt_version. Never raw news payloads,
 //   raw model responses, keys, headers, or request objects.
@@ -27,6 +33,7 @@ import { loadConfig } from '../src/config.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { createFixtureClassifier } from '../src/sentiment/fixtureClassifier.js';
+import { createModelClassifier } from '../src/sentiment/modelClassifier.js';
 import { NEWS_TYPES } from '../src/sentiment/classifierContract.js';
 import { classifyAndStore } from '../src/ingestion/classifyNews.js';
 
@@ -37,6 +44,10 @@ export const MAX_CLASSIFY_LIMIT = 5;
 /** Identity of the deterministic manual scorer. Distinct from a future model. */
 export const MANUAL_MODEL_NAME = 'manual_baseline';
 export const MANUAL_PROMPT_VERSION = 'manual_v1';
+
+/** Explicit classifier selection. Default stays the safe, model-free baseline. */
+export const CLASSIFIERS = Object.freeze(['manual_baseline', 'real_model']);
+export const DEFAULT_CLASSIFIER = 'manual_baseline';
 
 /**
  * Deterministic, model-free responder for one news_events row. Returns raw
@@ -79,12 +90,30 @@ export function buildManualClassifier({
 }
 
 /**
+ * Build the requested classifier. The default (manual_baseline) needs no
+ * credentials or network. real_model explicitly constructs the real
+ * model-backed classifier, which throws a clear "not configured" error if the
+ * API key is absent (config-only credentials). Both go through the identical
+ * contract/parser/storage path; the only difference is where the score comes
+ * from. Exported and reused by the MVP pipeline script.
+ *
+ * @param {string} name   one of CLASSIFIERS
+ * @param {object} config result of loadConfig() (needed for real_model)
+ * @returns {import('../src/sentiment/classifierContract.js').Classifier}
+ */
+export function buildClassifier(name = DEFAULT_CLASSIFIER, config) {
+  if (name === 'manual_baseline') return buildManualClassifier();
+  if (name === 'real_model') return createModelClassifier(config);
+  throw new Error(`unknown classifier "${name}" (choose: ${CLASSIFIERS.join(', ')})`);
+}
+
+/**
  * Parse minimal CLI args: --limit N --ids 1,2,3. Exported for tests. The limit
  * is always clamped to [1, MAX_CLASSIFY_LIMIT]; explicit ids are deduped, kept
  * in order, and truncated to the same hard cap. The cap can never be exceeded.
  */
 export function parseArgs(argv) {
-  const args = { limit: DEFAULT_CLASSIFY_LIMIT, ids: null };
+  const args = { limit: DEFAULT_CLASSIFY_LIMIT, ids: null, classifier: DEFAULT_CLASSIFIER };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--limit' && argv[i + 1]) {
       const n = Number.parseInt(argv[i + 1], 10);
@@ -97,6 +126,9 @@ export function parseArgs(argv) {
         if (Number.isInteger(n) && n > 0 && !ids.includes(n)) ids.push(n);
       }
       args.ids = ids;
+      i += 1;
+    } else if (argv[i] === '--classifier' && argv[i + 1]) {
+      args.classifier = argv[i + 1].trim();
       i += 1;
     }
   }
@@ -189,7 +221,7 @@ export function buildClassifyReport(summary, { selectedCount, model, promptVersi
 }
 
 async function main() {
-  const { limit, ids } = parseArgs(process.argv.slice(2));
+  const { limit, ids, classifier: classifierName } = parseArgs(process.argv.slice(2));
   const config = loadConfig();
 
   let db;
@@ -197,7 +229,9 @@ async function main() {
     db = openDatabase(config.databasePath);
     runMigrations(db); // idempotent; ensures news_events + sentiment_scores exist
 
-    const classifier = buildManualClassifier();
+    // Default is the model-free baseline; real_model is explicit + opt-in and
+    // throws a clear "not configured" error when ANTHROPIC_API_KEY is absent.
+    const classifier = buildClassifier(classifierName, config);
     const events = selectUnscoredEvents(db, {
       limit,
       ids,

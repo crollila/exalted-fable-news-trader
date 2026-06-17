@@ -13,10 +13,12 @@ import {
   parseArgs,
   manualBaselineResponse,
   buildManualClassifier,
+  buildClassifier,
   selectUnscoredEvents,
   buildClassifyReport,
   DEFAULT_CLASSIFY_LIMIT,
   MAX_CLASSIFY_LIMIT,
+  DEFAULT_CLASSIFIER,
   MANUAL_MODEL_NAME,
   MANUAL_PROMPT_VERSION,
 } from '../scripts/classifyNewsOnce.js';
@@ -49,9 +51,19 @@ function freshDb() {
 
 // --- argument parsing & cap enforcement -----------------------------------
 
-test('parseArgs defaults to a single event', () => {
-  assert.deepEqual(parseArgs([]), { limit: DEFAULT_CLASSIFY_LIMIT, ids: null });
+test('parseArgs defaults to a single event and the safe manual classifier', () => {
+  assert.deepEqual(parseArgs([]), {
+    limit: DEFAULT_CLASSIFY_LIMIT,
+    ids: null,
+    classifier: DEFAULT_CLASSIFIER,
+  });
   assert.equal(DEFAULT_CLASSIFY_LIMIT, 1);
+  assert.equal(DEFAULT_CLASSIFIER, 'manual_baseline');
+});
+
+test('parseArgs reads --classifier', () => {
+  assert.equal(parseArgs(['--classifier', 'real_model']).classifier, 'real_model');
+  assert.equal(parseArgs(['--classifier', 'manual_baseline']).classifier, 'manual_baseline');
 });
 
 test('parseArgs clamps --limit to the hard max and rejects junk', () => {
@@ -98,6 +110,34 @@ test('the manual classifier carries the manual identity and never calls a model'
   const result = await classifier.classifyEvent({ ticker: 'AAPL', news_type: 'earnings' });
   assert.equal(result.parserStatus, 'parsed');
   assert.equal(result.output.sentimentScore, 0);
+});
+
+// --- classifier selection --------------------------------------------------
+
+test('buildClassifier returns the manual baseline by default and for manual_baseline', () => {
+  assert.equal(buildClassifier().modelName, MANUAL_MODEL_NAME);
+  assert.equal(buildClassifier('manual_baseline').modelName, MANUAL_MODEL_NAME);
+});
+
+test('buildClassifier rejects an unknown classifier name clearly', () => {
+  assert.throws(() => buildClassifier('nope'), /unknown classifier/i);
+});
+
+test('buildClassifier real_model fails clearly when the API key is not configured', () => {
+  // No key in config → the real model classifier must refuse to construct.
+  assert.throws(
+    () => buildClassifier('real_model', { model: { anthropicApiKey: null } }),
+    /not configured/i
+  );
+});
+
+test('buildClassifier real_model constructs with a configured key (no network at build)', () => {
+  const classifier = buildClassifier('real_model', {
+    model: { anthropicApiKey: 'TEST-KEY', classifierModel: 'claude-opus-4-8' },
+  });
+  assert.equal(classifier.name, 'model');
+  assert.equal(classifier.modelName, 'claude-opus-4-8');
+  assert.equal(classifier.promptVersion, 'model_v1');
 });
 
 // --- selection -------------------------------------------------------------

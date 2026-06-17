@@ -141,12 +141,34 @@ default classifier is **not a model**: it emits a neutral, deterministic
 baseline (`sentiment/impact/confidence = 0`, `direction = "unclear"`,
 `model = "manual_baseline"`, `prompt_version = "manual_v1"`). It exists to
 prove the loop carries a score alongside the price reaction — it is a
-placeholder, **not trading signal**. A real model client remains a later,
-separately-approved phase. No credentials or network are needed. Output is a
-sanitized summary only (selected/classified/stored/skipped/failed counts,
-`parser_status` counts, model, prompt version) — never raw news payloads, raw
-model responses, keys, or headers. Never part of `npm test`, no polling, no
-scheduling, no trading.
+placeholder, **not trading signal**. No credentials or network are needed.
+Output is a sanitized summary only (selected/classified/stored/skipped/failed
+counts, `parser_status` counts, model, prompt version) — never raw news
+payloads, raw model responses, keys, or headers. Never part of `npm test`, no
+polling, no scheduling, no trading.
+
+### Real model-backed classifier (explicit, opt-in)
+
+The same script can score with a **real model** behind the identical classifier
+contract, parser, and storage path. It is explicit and opt-in:
+
+```
+node --env-file=.env scripts/classifyNewsOnce.js --classifier real_model --limit 1
+```
+
+`--classifier` defaults to `manual_baseline`; `real_model` constructs the
+Anthropic Messages API classifier (`src/sentiment/modelClassifier.js`, raw HTTP,
+zero dependencies). It reads `ANTHROPIC_API_KEY` **from config only** and fails
+with a clear "not configured" error if the key is absent. The model id defaults
+to `claude-opus-4-8` and can be overridden with `MODEL_CLASSIFIER_MODEL`. Real
+scores are stored as `model = <model id>`, `prompt_version = "model_v1"`. The
+key is sent in a request header only — never logged, returned, or persisted; all
+errors are sanitized/redacted. The raw model response is preserved byte-for-byte
+through the existing `insertSentimentScore` path; malformed / out-of-range /
+missing-field / model-error outcomes are stored as data, never silently dropped.
+This path is **never exercised by `npm test`** (all tests inject a fake HTTP
+client); it makes a live model call only when you run it manually with a real
+key. The MVP pipeline accepts the same `--classifier real_model` flag.
 
 ## Manual MVP pipeline (end-to-end)
 
@@ -166,7 +188,8 @@ only:
    (default 5, hard-capped at 20; skipped via `--skip-ingest` or when
    credentials are absent),
 2. **classify/score** a tiny unscored set with the deterministic manual
-   classifier above → `sentiment_scores` (default 1, capped at 5),
+   classifier above (or the real model classifier via `--classifier
+   real_model`) → `sentiment_scores` (default 1, capped at 5),
 3. **measure** price reactions for a tiny set via the real Alpaca Trades
    PriceSource → `price_reactions` (default 1, capped at 5; skipped when
    credentials are absent),

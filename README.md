@@ -122,6 +122,65 @@ raw model responses, keys, or any free-text content — output is safe to paste
 into ChatGPT. The `--env-file` is only used to resolve `DATABASE_URL`; no API
 keys are needed. Never part of `npm test`, no polling, no scheduling.
 
+## Manual classification / scoring
+
+A sixth manual-only script scores a tiny capped set of **existing**
+`news_events` rows using a **deterministic, model-free manual classifier** and
+writes `sentiment_scores` through the existing `classifyAndStore` →
+`insertSentimentScore` path (no schema change, idempotent reruns):
+
+```
+node --env-file=.env scripts/classifyNewsOnce.js --limit 1
+node --env-file=.env scripts/classifyNewsOnce.js --ids 1,2,3
+```
+
+`--limit` defaults to 1 and is hard-capped at 5; `--ids` selects specific
+event ids (also capped at 5). Without `--ids`, only rows not yet scored by this
+`(model, prompt_version)` are selected, so reruns pick up fresh events. The
+default classifier is **not a model**: it emits a neutral, deterministic
+baseline (`sentiment/impact/confidence = 0`, `direction = "unclear"`,
+`model = "manual_baseline"`, `prompt_version = "manual_v1"`). It exists to
+prove the loop carries a score alongside the price reaction — it is a
+placeholder, **not trading signal**. A real model client remains a later,
+separately-approved phase. No credentials or network are needed. Output is a
+sanitized summary only (selected/classified/stored/skipped/failed counts,
+`parser_status` counts, model, prompt version) — never raw news payloads, raw
+model responses, keys, or headers. Never part of `npm test`, no polling, no
+scheduling, no trading.
+
+## Manual MVP pipeline (end-to-end)
+
+A seventh manual-only script runs the whole capped research loop in one
+command:
+
+```
+node --env-file=.env scripts/runMvpPipelineOnce.js --symbols AAPL \
+  --ingest-limit 5 --classify-limit 1 --measure-limit 1
+node --env-file=.env scripts/runMvpPipelineOnce.js --skip-ingest
+```
+
+It performs four clearly-reported stages, each through the **existing** paths
+only:
+
+1. **ingest** a tiny sample of real Alpaca news → `news_events`
+   (default 5, hard-capped at 20; skipped via `--skip-ingest` or when
+   credentials are absent),
+2. **classify/score** a tiny unscored set with the deterministic manual
+   classifier above → `sentiment_scores` (default 1, capped at 5),
+3. **measure** price reactions for a tiny set via the real Alpaca Trades
+   PriceSource → `price_reactions` (default 1, capped at 5; skipped when
+   credentials are absent),
+4. **report** a read-only research summary of the local database.
+
+It is **research/measurement only — it never trades, submits orders, or calls
+any trading API.** Stages 1 and 3 need Alpaca credentials; when they are
+missing (or ingest is skipped) those stages are reported as `SKIPPED` and the
+loop still classifies existing events and prints the summary. `no_baseline` /
+`no_reaction` outcomes are reported as data, never hidden. Output composes the
+existing per-stage sanitized reports — never keys, headers, request URLs, raw
+trade payloads, raw news payloads, or raw model responses. Never part of
+`npm test`, no polling, no scheduling.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

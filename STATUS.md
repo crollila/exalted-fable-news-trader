@@ -4,20 +4,23 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (224/224).
+- Stable. All tests passing (246/246).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `dc38684` — docs(status): record Phase B MVP pipeline
-  commit (STATUS.md only).
-- Previous: `5c26e57` — feat(scripts): add manual scoring and MVP
-  pipeline (scripts/classifyNewsOnce.js + scripts/runMvpPipelineOnce.js +
-  tests/classifyNewsOnce.test.js + tests/runMvpPipelineOnce.test.js +
-  package.json test enumeration + README manual-usage sections). 24
-  network-free tests; 224/224 passing.
+- Latest committed: `691900b` — feat(sentiment): add real model-backed
+  classifier (src/sentiment/modelClassifier.js + src/sentiment/index.js +
+  src/config.js + scripts/classifyNewsOnce.js + scripts/runMvpPipelineOnce.js +
+  tests/modelClassifier.test.js + tests/classifyNewsOnce.test.js +
+  tests/runMvpPipelineOnce.test.js + package.json + .env.example + README).
+  22 new network-free fake-HTTP tests; 246/246 passing.
+- Previous: `5566e40` — docs(status): correct current test count (STATUS.md
+  only); `f911b67` — docs(status): record Phase B manual MVP run result
+  (STATUS.md only); `5c26e57` — feat(scripts): add manual scoring and MVP
+  pipeline.
 - This STATUS update is committed separately as
-  `docs(status): record Phase B manual MVP run result` (STATUS.md only).
+  `docs(status): record Phase C model classifier commit` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -27,10 +30,17 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 (contract/parser/fixture classifier only; no model calls, no storage writer).
 Phase B (manual MVP loop) — manual scoring + single end-to-end pipeline
 command IMPLEMENTED and COMMITTED (`5c26e57`); default scoring is a
-deterministic model-free baseline (no model calls). NOW RUN LOCALLY
-end-to-end against the live Alpaca feed with real .env credentials: the
-loop produced news_events, sentiment_scores, and price_reactions rows
-through the existing insert paths. No orders placed, no trading occurred.
+deterministic model-free baseline (no model calls). RUN LOCALLY end-to-end
+against the live Alpaca feed with real .env credentials: the loop produced
+news_events, sentiment_scores, and price_reactions rows through the existing
+insert paths. No orders placed, no trading occurred.
+Phase C (real model-backed classifier) — IMPLEMENTED and COMMITTED
+(`691900b`): createModelClassifier sits behind the existing Classifier
+contract and reuses the existing parseModelResponse + insertSentimentScore
+path. Explicit/opt-in via `--classifier real_model`; default stays
+manual_baseline. Config-only credentials, sanitized errors, never throws on
+bad calls, and never exercised by npm test (fake HTTP only). NOT YET RUN
+against a live model.
 
 ## Completed Work
 - Initial setup (repo, docs, .gitignore, .env.example).
@@ -402,6 +412,37 @@ through the existing insert paths. No orders placed, no trading occurred.
   market-hours or otherwise measurable trade windows. git status clean after
   the run; the database file and .env remained ignored/untracked. No
   trading, no paper orders.
+- First REAL model-backed classifier (src/sentiment/modelClassifier.js),
+  Phase C: createModelClassifier(config, options) sits behind the EXISTING
+  Classifier contract — a sibling to the fixture classifier with the same
+  contract, the same parseModelResponse, and the same insertSentimentScore
+  storage path; the only difference is the responder is a real Anthropic
+  Messages API call (raw HTTP via injectable fetch — the project stays
+  zero-dependency, no SDK). Safety mirrors the real Alpaca transports:
+  DISABLED BY DEFAULT / explicit construction only (throws "not configured"
+  without ANTHROPIC_API_KEY; no import-time/startup/scheduler/npm-test path);
+  credentials read ONLY from config.model.anthropicApiKey and sent in an
+  x-api-key header only (never logged/returned/thrown/persisted); errors are
+  sanitized/redacted; the HTTP function is injectable so npm test is fully
+  offline. classifyEvent NEVER throws — transport/HTTP failures become
+  parserStatus 'model_error', and usable model text flows through the
+  existing parser UNCHANGED so malformed/missing-field/out-of-range outcomes
+  are stored as data exactly as before (raw_response preserved byte-for-byte).
+  Identity: model = the configured model id (default claude-opus-4-8, override
+  via MODEL_CLASSIFIER_MODEL), prompt_version = "model_v1". Exposed as an
+  explicit, opt-in CLI choice on both manual scripts via
+  `--classifier manual_baseline|real_model` (default stays manual_baseline);
+  buildClassifier() builds the chosen one and real_model fails clearly without
+  a key. New config block config.model (anthropicApiKey + classifierModel),
+  read only in src/config.js. 22 new network-free fake-HTTP tests
+  (tests/modelClassifier.test.js plus selection tests on the two script test
+  files): not-configured throws, key-in-header-only (never in body),
+  success->parsed mapping, malformed/missing-field/out-of-range->their
+  statuses, HTTP-error and transport-throw->sanitized model_error (key
+  redacted), non-JSON/empty->model_error, classifyEvent never throws,
+  prompt-builder whitelist (no raw_payload, no secrets), and import safety.
+  No live model call in npm test; no trading, schema, dependency, or
+  parser/storage semantic changes. NOT YET RUN against a live model.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -435,29 +476,36 @@ through the existing insert paths. No orders placed, no trading occurred.
   There is still NO automatic live data path anywhere — real
   transports/clients activate only by explicit construction in these
   manually-run scripts.
-- src/sentiment is pure/local: no model, API, or network calls anywhere in
-  the module. Provider-supplied sentiment remains in raw_payload only.
-- The parser/classifier remains model-free. sentiment_scores rows are
-  written ONLY via insertSentimentScore (directly or through the optional
-  classifyAndStore/ingestAndClassify stage); no model calls anywhere. No
-  trading logic. Classification is a separate optional stage that can never
-  block or delete news_events rows. The new manual scorer
-  (scripts/classifyNewsOnce.js) is just createFixtureClassifier wrapped with a
-  deterministic local responder — it is a neutral PLACEHOLDER baseline
-  (model="manual_baseline", prompt_version="manual_v1"), not signal, and still
-  needs no model/keys/network.
+- src/sentiment is local-by-default: the contract, parser, fixture classifier,
+  and manual baseline make no model/API/network calls. The one real model path
+  is src/sentiment/modelClassifier.js, which is DISABLED BY DEFAULT and only
+  reaches the network when explicitly constructed with a configured key.
+  Provider-supplied sentiment remains in raw_payload only.
+- sentiment_scores rows are written ONLY via insertSentimentScore (directly or
+  through the optional classifyAndStore/ingestAndClassify stage). Classification
+  is a separate optional stage that can never block or delete news_events rows.
+  Two classifiers share that path: the manual baseline
+  (scripts/classifyNewsOnce.js → createFixtureClassifier wrapped with a
+  deterministic local responder; neutral PLACEHOLDER, model="manual_baseline",
+  prompt_version="manual_v1", no model/keys/network) and the real model
+  classifier (createModelClassifier; opt-in via --classifier real_model;
+  model=<configured id>, prompt_version="model_v1"; key via config only;
+  sanitized errors; never throws; never called in npm test). No trading logic
+  in either.
 - The whole manual research loop now also has a single end-to-end entry point
   (scripts/runMvpPipelineOnce.js): optional ingest -> manual scoring -> capped
   measurement -> read-only summary, composed entirely from existing paths and
   report builders. It is RESEARCH-ONLY (no trading/order calls), CLI-guarded,
   and reports SKIPPED stages plus no_baseline/no_reaction outcomes as data.
-- Tests: Node built-in test runner (`npm test`), 224/224 passing.
-- No automatic/scheduled provider or market-data calls. Live touchpoints are
-  manual scripts only: news smoke check, news one-shot ingest, trades smoke
-  check (each run against the live feed at least once), plus the capped
-  measurement and the end-to-end pipeline (whose ingest/measure stages reuse
-  those same transports). No sentiment/model calls, no execution/trading calls
-  anywhere.
+- Tests: Node built-in test runner (`npm test`), 246/246 passing.
+- No automatic/scheduled provider, market-data, or model calls. Live
+  touchpoints are manual scripts only: news smoke check, news one-shot ingest,
+  trades smoke check (each run against the live feed at least once), the capped
+  measurement, and the end-to-end pipeline (whose ingest/measure stages reuse
+  those same transports). A real MODEL call is now also possible, but only via
+  the explicit, opt-in `--classifier real_model` on the classification and
+  pipeline scripts — never automatically and never in npm test. No
+  execution/trading calls anywhere.
 
 ## Hard Safety Rules
 - Do not overwrite or depend on the V1 repo.
@@ -528,11 +576,12 @@ through the existing insert paths. No orders placed, no trading occurred.
   STILL not been exercised on real measured ticks. A market-hours rerun that
   yields measured rows with actual returns remains an open low-priority
   follow-up.
-- The default scorer is a NEUTRAL placeholder (all-zero sentiment/impact/
-  confidence, direction "unclear"). It proves the loop carries a score, but
-  carries NO predictive content — nothing downstream should treat
-  manual_baseline scores as signal. A real model classifier (its own
-  separately-approved phase) is required before any edge claim.
+- The DEFAULT scorer is still the NEUTRAL placeholder (all-zero sentiment/
+  impact/confidence, direction "unclear"). It proves the loop carries a score
+  but carries NO predictive content — nothing downstream should treat
+  manual_baseline scores as signal. A real model classifier now exists
+  (`--classifier real_model`, Phase C) but is opt-in and unproven, so the same
+  caution applies until real scores + market-hours measured returns exist.
 - The pipeline's ingest hard cap is 20 (vs. 10 for the standalone one-shot
   ingest script); the Alpaca News transport is still single-page only, so even
   at 20 a run fetches one page and does no pagination/backfill.
@@ -543,20 +592,44 @@ through the existing insert paths. No orders placed, no trading occurred.
   price_reactions 6). The run still produced no measured returns
   (no_baseline=6), so signal quality remains unproven — manual_baseline is a
   neutral placeholder and a market-hours measured run is still outstanding.
+- Phase C (real model classifier) is committed and fully tested OFFLINE but
+  NOT YET RUN against a live model. The live path has only been validated with
+  fake HTTP; a real run needs ANTHROPIC_API_KEY and bills the Anthropic API.
+- The model classifier relies on the model returning a BARE JSON object
+  (enforced by a strict system prompt). If a model wraps output in prose or
+  markdown fences, the existing parser records malformed_json (failure-as-data)
+  and raw_response is kept byte-for-byte rather than mangled — correct, but it
+  means parse rates depend on the model honoring the "JSON only" instruction.
+  Structured outputs (output_config.format) are a possible future hardening,
+  deliberately omitted to keep the change small and model-agnostic.
+- The model classifier default model is claude-opus-4-8 (per Anthropic
+  guidance) — higher cost than Haiku for bulk scoring; override with
+  MODEL_CLASSIFIER_MODEL. v1 has no thinking, no retries, and no rate-limit
+  backoff: one POST, max_tokens 1024, non-streaming; a 429/5xx surfaces as a
+  sanitized model_error (stored as data).
+- NAMING NOTE: config now has both config.alpacaNews (Alpaca key pair) and
+  config.model (anthropicApiKey + classifierModel). The earlier alpacaNews
+  naming debt still stands; the new config.model block is cleanly named.
 
 ## Next Recommended Task
-Phase B (manual scoring + single end-to-end MVP pipeline command) is now
-IMPLEMENTED, COMMITTED (`5c26e57`), and RUN LOCALLY end-to-end against the
-live feed (recorded above): the loop produced news_events, sentiment_scores,
-and price_reactions through the existing insert paths with no trading. The
-manual_baseline scorer is a neutral placeholder; it proves wiring, not edge.
+Phase C (real model-backed classifier) is now IMPLEMENTED and COMMITTED
+(`691900b`): createModelClassifier behind the existing contract, opt-in via
+`--classifier real_model`, fully tested offline (246/246), NOT YET RUN against
+a live model.
 
-Recommended next step (the real edge work, its own separately-approved
-phase): replace the neutral manual_baseline scorer with a REAL model-backed
-classifier behind the same classifier contract (explicit, manual-only,
-key-via-config, sanitized output, no live calls in npm test) so scores carry
-actual content. Only after real scores + market-hours measured returns exist
-can any edge be measured.
+Recommended next step: RUN the real classifier once locally and record the
+result in STATUS, as the prior smoke/ingest/measurement runs were recorded:
+  node --env-file=.env scripts/classifyNewsOnce.js --classifier real_model --limit 1
+Confirm it writes a parsed (or honestly failure-statused) sentiment_scores row
+with model=<configured id> / prompt_version="model_v1", and that CLI output
+stays sanitized (no raw model response, no keys). Then, for an end-to-end real
+score + measurement during US market hours:
+  node --env-file=.env scripts/runMvpPipelineOnce.js --classifier real_model \
+    --symbols AAPL --ingest-limit 5 --classify-limit 1 --measure-limit 1
+
+Only after real scores AND market-hours measured returns coexist can edge be
+measured — that is the first genuine event-study readout (expectancy sliced by
+news_type / direction / score bucket, grouped by prompt_version).
 
 Optional, low priority: re-run the capped measurement on MARKET-HOURS events
 (node --env-file=.env scripts/measureReactionsOnce.js --limit 1) to get

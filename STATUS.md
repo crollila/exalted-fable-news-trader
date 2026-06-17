@@ -4,20 +4,23 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (261/261).
+- Stable. All tests passing (269/269).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `a152a66` — feat(eventstudy): add measurement-candidate
-  finder (scripts/listMeasurementCandidates.js +
-  tests/listMeasurementCandidates.test.js + scripts/reportEventStudySummary.js +
-  tests/reportEventStudySummary.test.js + package.json + README.md).
-  15 new network-free tests; 261/261 passing.
-- Previous: `a256190` — docs(status): record real-model MVP pipeline run
+- Latest committed: `5afd67f` — feat(mvp-pipeline): target fresh events for
+  measurement (scripts/runMvpPipelineOnce.js + tests/runMvpPipelineOnce.test.js +
+  README.md). The MVP pipeline's measurement stage now targets fresh/current-run
+  events (explicit --measure-ids > inserted ids > classified ids > fallback)
+  instead of repeatedly re-measuring the oldest event; selection source is
+  printed in the report. 8 new network-free tests; 269/269 passing.
+- Previous: `1c64794` — docs(status): record measurement-candidate finder commit
   (STATUS.md only).
+- Previous: `a152a66` — feat(eventstudy): add measurement-candidate finder
+  (15 network-free tests).
 - This STATUS update is committed separately as
-  `docs(status): record measurement-candidate finder commit` (STATUS.md only).
+  `docs(status): record MVP pipeline targeting fix` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -524,6 +527,30 @@ end-to-end research WIRING, not signal quality or measured returns.
   fields (defaults to 0), so the MVP pipeline's composed report keeps working.
   2 new tests plus readiness assertions on the empty-database test; still
   read-only and paste-safe. NOT YET RUN against the live database.
+- MVP pipeline measurement targeting fix (scripts/runMvpPipelineOnce.js),
+  committed as `5afd67f`: the measure stage previously called
+  selectEvents(limit) which orders by received_at ASC and so kept re-measuring
+  the OLDEST event (event 1 -> repeated no_baseline), even after a run had just
+  ingested/scored fresh events. New exported selectMeasurementEvents() chooses
+  measurement targets in a fixed priority order — (1) explicit --measure-ids,
+  (2) event ids the ingest stage inserted THIS run, (3) event ids the classify
+  stage scored THIS run, (4) oldest-eligible fallback ONLY when no current-run
+  ids are available. A higher-priority current-run set that yields no eligible
+  rows falls through to the next source, so a duplicate-only ingest measures a
+  sensible current candidate (classified) rather than blindly event 1. Every
+  candidate set still flows through the EXISTING capped selectEvents helper, so
+  eligibility (ticker + received_at) and the hard measure cap (default 1, max 5)
+  are unchanged; writes still go ONLY through measureEvents -> insertPriceReaction;
+  no measurement_status / event-study engine / schema change. New CLI flag
+  --measure-ids 6,7,8 (deduped, positive ints, truncated to the hard cap). The
+  stage-3 report prints why the target was chosen
+  (`measurement target — source: explicit ids|inserted ids|classified ids|fallback selection`).
+  8 new network-free tests (in-memory DB, mock provider, manual classifier,
+  fixture PriceSource): --measure-ids parse/dedup/cap, selectMeasurementEvents
+  priority + cap, inserted-preferred-over-event-1, classified fallback when
+  ingest is skipped, explicit-ids-win, duplicate-only-ingest avoids event 1,
+  report shows selection source, and headline redaction. No model/live calls in
+  npm test. NOT YET RUN against the live feed.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -577,7 +604,11 @@ end-to-end research WIRING, not signal quality or measured returns.
   (scripts/runMvpPipelineOnce.js): optional ingest -> manual scoring -> capped
   measurement -> read-only summary, composed entirely from existing paths and
   report builders. It is RESEARCH-ONLY (no trading/order calls), CLI-guarded,
-  and reports SKIPPED stages plus no_baseline/no_reaction outcomes as data.
+  and reports SKIPPED stages plus no_baseline/no_reaction outcomes as data. Its
+  measurement stage now TARGETS FRESH/CURRENT-RUN events (selectMeasurementEvents:
+  explicit --measure-ids > inserted-this-run > classified-this-run > oldest
+  fallback) so a market-hours run measures what it just ingested/scored instead
+  of always event 1; the chosen source is printed in the stage-3 report.
 - Read-only research tooling over the local database: the research summary
   (scripts/reportEventStudySummary.js) now also reports event-study readiness
   (measured rows, model_v1 score count, and events ready with both a model_v1
@@ -586,7 +617,7 @@ end-to-end research WIRING, not signal quality or measured returns.
   paste-safe measure suggestions. Both are SELECT-only, need no credentials or
   network, never write, and reuse the existing measure command rather than
   measuring themselves.
-- Tests: Node built-in test runner (`npm test`), 261/261 passing.
+- Tests: Node built-in test runner (`npm test`), 269/269 passing.
 - No automatic/scheduled provider, market-data, or model calls. Live
   touchpoints are manual scripts only: news smoke check, news one-shot ingest,
   trades smoke check (each run against the live feed at least once), the capped
@@ -715,15 +746,24 @@ end-to-end research WIRING, not signal quality or measured returns.
   future second model prompt version would need this widened.
 
 ## Next Recommended Task
-The measurement-candidate finder (scripts/listMeasurementCandidates.js) and the
-research-summary readiness counts are now IMPLEMENTED and COMMITTED (`a152a66`),
-so picking measurable market-hours events and verifying measured-return
-readiness are repeatable. They are READ-ONLY tooling — NOT YET RUN against the
-live database.
+The MVP pipeline now TARGETS FRESH events for measurement (`5afd67f`), so a
+market-hours pipeline run measures the event it just ingested/scored instead of
+defaulting back to event 1. Combined with the measurement-candidate finder
+(`a152a66`) and the research-summary readiness counts, the path to the first
+measured rows is now repeatable. All of this is still NOT YET RUN against the
+live feed during market hours.
 
-Recommended next step: actually USE them to land the first MARKET-HOURS measured
-rows, so real model scores and real measured returns finally coexist. During US
-market hours:
+Recommended next step: during US market hours, RUN the fixed pipeline to land
+the first MARKET-HOURS measured rows so real model scores and real measured
+returns finally coexist. Either run the full pipeline (it now measures the fresh
+ingested event automatically):
+  node --env-file=.env scripts/runMvpPipelineOnce.js --classifier real_model \
+    --symbols AAPL --ingest-limit 5 --classify-limit 1 --measure-limit 1
+  (look for `measurement target — source: inserted ids` and a non-no_baseline
+  status), or target a finder-suggested candidate explicitly:
+  node --env-file=.env scripts/runMvpPipelineOnce.js --skip-ingest --measure-ids <id>
+
+Alternatively, use the standalone tools directly. During US market hours:
   1) list good candidates:
      node --env-file=.env scripts/listMeasurementCandidates.js --limit 10
   2) measure a suggested candidate (the finder prints the exact command):

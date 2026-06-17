@@ -213,6 +213,7 @@ command:
 node --env-file=.env scripts/runMvpPipelineOnce.js --symbols AAPL \
   --ingest-limit 5 --classify-limit 1 --measure-limit 1
 node --env-file=.env scripts/runMvpPipelineOnce.js --skip-ingest
+node --env-file=.env scripts/runMvpPipelineOnce.js --measure-ids 6,7,8
 ```
 
 It performs four clearly-reported stages, each through the **existing** paths
@@ -228,6 +229,17 @@ only:
    PriceSource → `price_reactions` (default 1, capped at 5; skipped when
    credentials are absent),
 4. **report** a read-only research summary of the local database.
+
+The measure stage targets **fresh/current-run events first** so a market-hours
+run measures what it just ingested/scored instead of repeatedly re-measuring the
+oldest event. It chooses event ids in priority order: (1) explicit
+`--measure-ids 6,7,8` (deduped, capped at 5), (2) events the ingest stage just
+inserted this run, (3) events the classify stage just scored this run, (4) an
+oldest-eligible fallback only when no current-run ids are available. The report
+prints which source was used (`measurement target — source: …`). Selection still
+flows through the existing capped `selectEvents` helper, so eligibility and the
+hard cap are unchanged, and writes still go only through the existing
+`measureEvents` → `insertPriceReaction` path.
 
 It is **research/measurement only — it never trades, submits orders, or calls
 any trading API.** Stages 1 and 3 need Alpaca credentials; when they are

@@ -12,11 +12,13 @@ import { countNewsEvents } from '../src/database/newsEvents.js';
 import { listPriceReactionsForEvent } from '../src/database/priceReactions.js';
 import { createMockProvider } from '../src/providers/mockProvider.js';
 import { createFixturePriceSource } from '../src/prices/priceSource.js';
+import { classifyAndStore } from '../src/ingestion/classifyNews.js';
 import { buildManualClassifier } from '../scripts/classifyNewsOnce.js';
 import {
   parseArgs,
   runPipeline,
   buildPipelineReport,
+  selectMeasurementEvents,
   DEFAULT_INGEST_LIMIT,
   MAX_INGEST_LIMIT,
   DEFAULT_CLASSIFIER,
@@ -58,6 +60,36 @@ function freshDb() {
   return db;
 }
 
+const INSERT_EVENT_SQL = `
+  INSERT INTO news_events (provider, provider_event_id, ticker, headline,
+    published_at, received_at, news_type)
+  VALUES (@provider, @provider_event_id, @ticker, @headline,
+    @published_at, @received_at, @news_type)
+`;
+
+// Insert an EXISTING news_events row directly (as if previously ingested), so
+// tests can stage an "oldest event 1" trap alongside fresh/current candidates.
+function insertEvent(db, { ticker = 'AAPL', receivedAt, provider = 'seed', providerEventId } = {}) {
+  const info = db.prepare(INSERT_EVENT_SQL).run({
+    provider,
+    provider_event_id: providerEventId ?? `evt-${receivedAt}`,
+    ticker,
+    headline: 'SECRET-HEADLINE-MUST-NOT-PRINT',
+    published_at: receivedAt,
+    received_at: receivedAt,
+    news_type: 'other',
+  });
+  return Number(info.lastInsertRowid);
+}
+
+// Mark an existing event as already scored by the manual baseline, so the
+// classify stage's unscored-selection skips it (mirrors a prior-run score).
+async function scoreManual(db, eventId) {
+  await classifyAndStore(db, buildManualClassifier(), { eventIds: [eventId] });
+}
+
+const OLDER = '2026-06-01T14:30:00.000Z'; // older than ANCHOR; no fixture trades
+
 const baseOpts = {
   symbols: ['AAPL'],
   ingestLimit: 5,
@@ -74,11 +106,21 @@ test('parseArgs defaults are tiny and safe', () => {
     ingestLimit: DEFAULT_INGEST_LIMIT,
     classifyLimit: DEFAULT_CLASSIFY_LIMIT,
     measureLimit: DEFAULT_MEASURE_LIMIT,
+    measureIds: null,
     skipIngest: false,
     classifier: DEFAULT_CLASSIFIER,
   });
   assert.equal(DEFAULT_INGEST_LIMIT, 5);
   assert.equal(DEFAULT_CLASSIFIER, 'manual_baseline');
+});
+
+test('parseArgs reads --measure-ids, dedups, and truncates to the hard cap', () => {
+  assert.deepEqual(parseArgs(['--measure-ids', '6,7,8']).measureIds, [6, 7, 8]);
+  assert.deepEqual(parseArgs(['--measure-ids', '3,3,1']).measureIds, [3, 1]); // deduped
+  // More ids than the measure cap are truncated, so the cap can never be exceeded.
+  assert.deepEqual(parseArgs(['--measure-ids', '1,2,3,4,5,6,7']).measureIds, [1, 2, 3, 4, 5]);
+  assert.deepEqual(parseArgs(['--measure-ids', 'a,-1,0']).measureIds, []); // all invalid
+  assert.equal(parseArgs([]).measureIds, null); // absent → null (use fresh-event priority)
 });
 
 test('parseArgs reads --classifier', () => {
@@ -259,7 +301,165 @@ test('buildPipelineReport renders SKIPPED markers for skipped stages', () => {
   assert.match(text, /SKIPPED: Alpaca credentials not configured/);
 });
 
+// --- measurement targeting: prefer fresh/current-run events ---------------
+
+test('selectMeasurementEvents honors priority: explicit > inserted > classified > fallback', () => {
+  const db = freshDb();
+  const id1 = insertEvent(db, { receivedAt: OLDER, providerEventId: 'e1' }); // oldest = fallback trap
+  const id2 = insertEvent(db, { receivedAt: '2026-06-02T14:30:00.000Z', providerEventId: 'e2' });
+  const id3 = insertEvent(db, { receivedAt: '2026-06-03T14:30:00.000Z', providerEventId: 'e3' });
+  const id4 = insertEvent(db, { receivedAt: '2026-06-04T14:30:00.000Z', providerEventId: 'e4' });
+
+  // 1) explicit ids win outright.
+  const explicit = selectMeasurementEvents(db, {
+    measureIds: [id4], insertedIds: [id3], classifiedIds: [id2], limit: 1,
+  });
+  assert.equal(explicit.source, 'explicit ids');
+  assert.deepEqual(explicit.events.map((r) => r.id), [id4]);
+
+  // 2) inserted ids beat classified + fallback.
+  const inserted = selectMeasurementEvents(db, { insertedIds: [id3], classifiedIds: [id2], limit: 1 });
+  assert.equal(inserted.source, 'inserted ids');
+  assert.deepEqual(inserted.events.map((r) => r.id), [id3]);
+
+  // 3) classified ids beat fallback when nothing was inserted this run.
+  const classified = selectMeasurementEvents(db, { classifiedIds: [id2], limit: 1 });
+  assert.equal(classified.source, 'classified ids');
+  assert.deepEqual(classified.events.map((r) => r.id), [id2]);
+
+  // 4) fallback only when no current-run ids exist — and it is the oldest row.
+  const fallback = selectMeasurementEvents(db, { limit: 1 });
+  assert.equal(fallback.source, 'fallback selection');
+  assert.deepEqual(fallback.events.map((r) => r.id), [id1]);
+  closeDatabase(db);
+});
+
+test('selectMeasurementEvents enforces the measure cap regardless of source', () => {
+  const db = freshDb();
+  const ids = [1, 2, 3, 4, 5].map((n) =>
+    insertEvent(db, { receivedAt: `2026-06-0${n}T14:30:00.000Z`, providerEventId: `c${n}` })
+  );
+  // Five inserted ids, cap 1 → at most one event selected.
+  assert.equal(selectMeasurementEvents(db, { insertedIds: ids, limit: 1 }).events.length, 1);
+  // Cap 3 → at most three; never more than the requested cap.
+  assert.equal(selectMeasurementEvents(db, { insertedIds: ids, limit: 3 }).events.length, 3);
+  closeDatabase(db);
+});
+
+test('runPipeline measures INSERTED current-run events, not the oldest event 1', async () => {
+  const db = freshDb();
+  const oldId = insertEvent(db, { receivedAt: OLDER, providerEventId: 'old' }); // the event-1 trap
+  // Mock provider ingests a fresh event at the anchor → it becomes the inserted id.
+  const result = await runPipeline(
+    db,
+    {
+      provider: createMockProvider(RAW_NEWS),
+      classifier: buildManualClassifier(),
+      priceSource: createFixturePriceSource({ tradesByTicker: { AAPL: AAPL_TRADES } }),
+    },
+    baseOpts
+  );
+  const freshId = result.ingest.summary.insertedIds[0];
+  assert.notEqual(freshId, oldId);
+  assert.equal(result.measure.selectionSource, 'inserted ids');
+  assert.deepEqual(result.measure.batch.summaries.map((s) => s.newsEventId), [freshId]);
+  // The fresh event measured cleanly; the old trap was never selected.
+  assert.ok(result.measure.batch.summaries[0].results.every((r) => r.status === 'measured'));
+  closeDatabase(db);
+});
+
+test('runPipeline falls back to CLASSIFIED ids when ingest is skipped (no inserted ids)', async () => {
+  const db = freshDb();
+  const oldId = insertEvent(db, { receivedAt: OLDER, providerEventId: 'old' });
+  await scoreManual(db, oldId); // already scored → excluded from classify selection
+  const freshId = insertEvent(db, { receivedAt: ANCHOR, providerEventId: 'fresh' }); // unscored candidate
+
+  const result = await runPipeline(
+    db,
+    {
+      provider: null,
+      providerSkipReason: 'ingest disabled via --skip-ingest',
+      classifier: buildManualClassifier(),
+      priceSource: createFixturePriceSource({ tradesByTicker: { AAPL: AAPL_TRADES } }),
+    },
+    baseOpts
+  );
+  // Classify picked the fresh unscored event; measurement targets that, not event 1.
+  assert.equal(result.classify.selectedCount, 1);
+  assert.equal(result.measure.selectionSource, 'classified ids');
+  assert.deepEqual(result.measure.batch.summaries.map((s) => s.newsEventId), [freshId]);
+  assert.notEqual(freshId, oldId);
+  closeDatabase(db);
+});
+
+test('runPipeline with explicit --measure-ids measures exactly those events', async () => {
+  const db = freshDb();
+  insertEvent(db, { receivedAt: OLDER, providerEventId: 'old' }); // event 1 trap
+  const targetId = insertEvent(db, { receivedAt: ANCHOR, providerEventId: 'target' });
+
+  const result = await runPipeline(
+    db,
+    {
+      provider: createMockProvider(RAW_NEWS), // also inserts a fresh event
+      classifier: buildManualClassifier(),
+      priceSource: createFixturePriceSource({ tradesByTicker: { AAPL: AAPL_TRADES } }),
+    },
+    { ...baseOpts, measureIds: [targetId] }
+  );
+  // Explicit ids win over the just-inserted event and over the fallback.
+  assert.equal(result.measure.selectionSource, 'explicit ids');
+  assert.deepEqual(result.measure.batch.summaries.map((s) => s.newsEventId), [targetId]);
+  closeDatabase(db);
+});
+
+test('duplicate-only ingest does not blindly force event 1 when a current candidate exists', async () => {
+  const db = freshDb();
+  // Event 1 is a 'mock'/'mvp-1' row that the provider will re-emit as a dup.
+  const oldId = insertEvent(db, {
+    receivedAt: OLDER, provider: 'mock', providerEventId: 'mvp-1',
+  });
+  await scoreManual(db, oldId); // already scored
+  const freshId = insertEvent(db, { receivedAt: ANCHOR, providerEventId: 'fresh' }); // unscored
+
+  const result = await runPipeline(
+    db,
+    {
+      provider: createMockProvider(RAW_NEWS), // RAW_NEWS id 'mvp-1' → duplicate of event 1
+      classifier: buildManualClassifier(),
+      priceSource: createFixturePriceSource({ tradesByTicker: { AAPL: AAPL_TRADES } }),
+    },
+    baseOpts
+  );
+  // Ingest produced a duplicate, no inserted ids.
+  assert.equal(result.ingest.summary.duplicates, 1);
+  assert.deepEqual(result.ingest.summary.insertedIds, []);
+  // So measurement targets the classified current candidate, never event 1.
+  assert.equal(result.measure.selectionSource, 'classified ids');
+  assert.deepEqual(result.measure.batch.summaries.map((s) => s.newsEventId), [freshId]);
+  assert.notEqual(freshId, oldId);
+  closeDatabase(db);
+});
+
+test('buildPipelineReport shows the measurement selection source and stays sanitized', async () => {
+  const db = freshDb();
+  insertEvent(db, { receivedAt: OLDER, providerEventId: 'old' });
+  const result = await runPipeline(
+    db,
+    {
+      provider: createMockProvider(RAW_NEWS),
+      classifier: buildManualClassifier(),
+      priceSource: createFixturePriceSource({ tradesByTicker: { AAPL: AAPL_TRADES } }),
+    },
+    baseOpts
+  );
+  const text = buildPipelineReport(result).join('\n');
+  assert.match(text, /measurement target — source: inserted ids/);
+  assert.ok(!text.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
+  closeDatabase(db);
+});
+
 test('importing the script performs no network and requires no credentials', () => {
   assert.equal(typeof runPipeline, 'function');
   assert.equal(typeof buildPipelineReport, 'function');
+  assert.equal(typeof selectMeasurementEvents, 'function');
 });

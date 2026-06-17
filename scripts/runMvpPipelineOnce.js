@@ -8,8 +8,14 @@
 //
 //   Run:  node --env-file=.env scripts/runMvpPipelineOnce.js \
 //           [--symbols AAPL] [--ingest-limit 5] [--classify-limit 1] \
-//           [--measure-limit 1] [--skip-ingest] \
+//           [--measure-limit 1] [--measure-ids 6,7,8] [--skip-ingest] \
 //           [--classifier manual_baseline|real_model]
+//
+// MEASUREMENT TARGETING: the measure stage prefers FRESH/current-run events so
+// a market-hours run actually measures what it just ingested/scored instead of
+// repeatedly re-measuring the oldest event. Priority (see selectMeasurementEvents):
+//   1. explicit --measure-ids   2. events inserted this run (ingest)
+//   3. events classified this run   4. oldest-eligible fallback (only if none above).
 //
 // - MANUAL ONLY: never part of npm test, app startup, schedulers, or CI.
 //   One run, then exit. No polling, no scheduling, no background jobs.
@@ -93,6 +99,7 @@ export function parseArgs(argv) {
     ingestLimit: DEFAULT_INGEST_LIMIT,
     classifyLimit: DEFAULT_CLASSIFY_LIMIT,
     measureLimit: DEFAULT_MEASURE_LIMIT,
+    measureIds: null,
     skipIngest: false,
     classifier: DEFAULT_CLASSIFIER,
   };
@@ -110,6 +117,16 @@ export function parseArgs(argv) {
     } else if (flag === '--measure-limit' && argv[i + 1]) {
       args.measureLimit = clampInt(argv[i + 1], DEFAULT_MEASURE_LIMIT, 1, MAX_MEASURE_LIMIT);
       i += 1;
+    } else if (flag === '--measure-ids' && argv[i + 1]) {
+      // Explicit measurement targets: deduped, positive ints, kept in order,
+      // truncated to the same hard cap as the measure script (never exceeded).
+      const ids = [];
+      for (const token of argv[i + 1].split(',')) {
+        const n = Number.parseInt(token.trim(), 10);
+        if (Number.isInteger(n) && n > 0 && !ids.includes(n)) ids.push(n);
+      }
+      args.measureIds = ids.slice(0, MAX_MEASURE_LIMIT);
+      i += 1;
     } else if (flag === '--classifier' && argv[i + 1]) {
       args.classifier = argv[i + 1].trim();
       i += 1;
@@ -119,6 +136,51 @@ export function parseArgs(argv) {
   }
   if (args.symbols.length === 0) args.symbols = ['AAPL'];
   return args;
+}
+
+/**
+ * Choose which EXISTING news_events rows the measurement stage targets, in a
+ * fixed priority order. This is the fix for the "always re-measures event 1"
+ * problem: a market-hours run should measure the FRESH events it just touched,
+ * not blindly fall back to the oldest row.
+ *
+ *   1. explicit ids        (--measure-ids) — the operator's explicit choice
+ *   2. inserted ids        — events the ingest stage just created this run
+ *   3. classified ids      — events the classify stage just scored this run
+ *   4. fallback selection  — oldest-eligible events, ONLY when no current-run
+ *                            ids are available
+ *
+ * Every candidate set is funneled through the existing selectEvents() helper,
+ * so eligibility (ticker + received_at) and the hard measure cap are enforced
+ * identically regardless of source — no new selection/measurement semantics.
+ * A higher-priority current-run set that yields no eligible rows falls through
+ * to the next source (e.g. duplicate-only ingest → try classified, not event 1).
+ *
+ * @param {object} db
+ * @param {object} opts
+ * @param {number[]|null} [opts.measureIds]   explicit --measure-ids
+ * @param {number[]} [opts.insertedIds]       ids inserted by the ingest stage
+ * @param {number[]} [opts.classifiedIds]     ids selected by the classify stage
+ * @param {number} [opts.limit]               measure cap (clamped by selectEvents)
+ * @returns {{ source: string, events: object[] }}
+ */
+export function selectMeasurementEvents(
+  db,
+  { measureIds = null, insertedIds = [], classifiedIds = [], limit = DEFAULT_MEASURE_LIMIT } = {}
+) {
+  if (measureIds && measureIds.length > 0) {
+    // Explicit choice wins outright — honored even if some ids are ineligible.
+    return { source: 'explicit ids', events: selectEvents(db, { limit, ids: measureIds }) };
+  }
+  if (insertedIds && insertedIds.length > 0) {
+    const events = selectEvents(db, { limit, ids: insertedIds });
+    if (events.length > 0) return { source: 'inserted ids', events };
+  }
+  if (classifiedIds && classifiedIds.length > 0) {
+    const events = selectEvents(db, { limit, ids: classifiedIds });
+    if (events.length > 0) return { source: 'classified ids', events };
+  }
+  return { source: 'fallback selection', events: selectEvents(db, { limit }) };
 }
 
 /**
@@ -140,7 +202,7 @@ export function parseArgs(argv) {
 export async function runPipeline(
   db,
   { provider = null, providerSkipReason = 'skipped', classifier, priceSource = null, priceSkipReason = 'skipped' },
-  { symbols = ['AAPL'], ingestLimit = DEFAULT_INGEST_LIMIT, classifyLimit = DEFAULT_CLASSIFY_LIMIT, measureLimit = DEFAULT_MEASURE_LIMIT, reportLimit = REPORT_RECENT_LIMIT } = {}
+  { symbols = ['AAPL'], ingestLimit = DEFAULT_INGEST_LIMIT, classifyLimit = DEFAULT_CLASSIFY_LIMIT, measureLimit = DEFAULT_MEASURE_LIMIT, measureIds = null, reportLimit = REPORT_RECENT_LIMIT } = {}
 ) {
   const result = { ingest: null, classify: null, measure: null, summary: null };
 
@@ -170,10 +232,23 @@ export async function runPipeline(
   };
 
   // Stage 3 — optional capped price-reaction measurement (existing engine).
+  // Target fresh/current-run events first (see selectMeasurementEvents) so a
+  // market-hours run measures what it just ingested/scored, not always event 1.
   if (priceSource) {
-    const toMeasure = selectEvents(db, { limit: measureLimit });
-    const batch = await measureEvents(db, toMeasure, priceSource);
-    result.measure = { ran: true, selectedCount: toMeasure.length, sourceName: priceSource.name, batch };
+    const selection = selectMeasurementEvents(db, {
+      measureIds,
+      insertedIds: result.ingest?.summary?.insertedIds ?? [],
+      classifiedIds: toClassify.map((r) => r.id),
+      limit: measureLimit,
+    });
+    const batch = await measureEvents(db, selection.events, priceSource);
+    result.measure = {
+      ran: true,
+      selectedCount: selection.events.length,
+      selectionSource: selection.source,
+      sourceName: priceSource.name,
+      batch,
+    };
   } else {
     result.measure = { ran: false, reason: priceSkipReason };
   }
@@ -211,6 +286,8 @@ export function buildPipelineReport(result) {
 
   lines.push('', '— stage 3: measure reactions —');
   if (result.measure?.ran) {
+    // Show WHY these events were measured (fresh-event targeting, not event 1).
+    lines.push(`  measurement target — source: ${result.measure.selectionSource ?? 'fallback selection'}`);
     lines.push(
       ...buildMeasureReport(result.measure.batch, {
         selectedCount: result.measure.selectedCount,
@@ -227,7 +304,7 @@ export function buildPipelineReport(result) {
 }
 
 async function main() {
-  const { symbols, ingestLimit, classifyLimit, measureLimit, skipIngest, classifier: classifierName } =
+  const { symbols, ingestLimit, classifyLimit, measureLimit, measureIds, skipIngest, classifier: classifierName } =
     parseArgs(process.argv.slice(2));
   const config = loadConfig();
   const hasCreds = Boolean(config.alpacaNews.keyId && config.alpacaNews.secretKey);
@@ -267,7 +344,7 @@ async function main() {
     const result = await runPipeline(
       db,
       { provider, providerSkipReason, classifier, priceSource, priceSkipReason },
-      { symbols, ingestLimit, classifyLimit, measureLimit, reportLimit: REPORT_RECENT_LIMIT }
+      { symbols, ingestLimit, classifyLimit, measureLimit, measureIds, reportLimit: REPORT_RECENT_LIMIT }
     );
 
     for (const line of buildPipelineReport(result)) console.log(line);

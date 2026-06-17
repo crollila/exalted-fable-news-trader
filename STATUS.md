@@ -9,15 +9,15 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `5c26e57` — feat(scripts): add manual scoring and MVP
+- Latest committed: `dc38684` — docs(status): record Phase B MVP pipeline
+  commit (STATUS.md only).
+- Previous: `5c26e57` — feat(scripts): add manual scoring and MVP
   pipeline (scripts/classifyNewsOnce.js + scripts/runMvpPipelineOnce.js +
   tests/classifyNewsOnce.test.js + tests/runMvpPipelineOnce.test.js +
-  package.json test enumeration + README manual-usage sections). 24 new
+  package.json test enumeration + README manual-usage sections). 24
   network-free tests; 224/224 passing.
-- Previous: `2b4b131` — docs(status): record Phase A manual MVP loop result
-  (STATUS.md only).
 - This STATUS update is committed separately as
-  `docs(status): record Phase B MVP pipeline commit` (STATUS.md only).
+  `docs(status): record Phase B manual MVP run result` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -27,8 +27,10 @@ Phase 3 — Sentiment & Classification: fixture-only implementation started
 (contract/parser/fixture classifier only; no model calls, no storage writer).
 Phase B (manual MVP loop) — manual scoring + single end-to-end pipeline
 command IMPLEMENTED and COMMITTED (`5c26e57`); default scoring is a
-deterministic model-free baseline (no model calls). NOT YET RUN against the
-live feed.
+deterministic model-free baseline (no model calls). NOW RUN LOCALLY
+end-to-end against the live Alpaca feed with real .env credentials: the
+loop produced news_events, sentiment_scores, and price_reactions rows
+through the existing insert paths. No orders placed, no trading occurred.
 
 ## Completed Work
 - Initial setup (repo, docs, .gitignore, .env.example).
@@ -370,6 +372,36 @@ live feed.
   parsing/cap enforcement, full offline sequence with a zero-network assertion,
   skip behavior, no_baseline-as-data, report composition, SKIPPED markers, and
   import safety. NOT YET RUN against the live feed.
+- Phase B manual MVP loop RUN LOCALLY end-to-end (real .env credentials),
+  proving the full research loop with real ingest, deterministic manual
+  scoring, the real Alpaca Trades measurement path, and the read-only
+  research summary. No orders were placed and no trading occurred.
+  Standalone classification (node --env-file=.env
+  scripts/classifyNewsOnce.js --limit 1): model manual_baseline / prompt
+  manual_v1; selected 1, classified 1, stored 1, skipped 0, failed 0;
+  parser statuses parsed=1; classification COMPLETE — rows written through
+  insertSentimentScore. Full pipeline (node --env-file=.env
+  scripts/runMvpPipelineOnce.js --symbols AAPL --ingest-limit 5
+  --classify-limit 1 --measure-limit 1): Stage 1 ingest via provider
+  "alpaca" fetched 5, inserted 5, duplicates 0, failed 0, inserted ids
+  6–10; Stage 2 classify/score with manual_baseline / manual_v1 selected 1,
+  classified 1, stored 1, skipped 0, failed 0, parser statuses parsed=1;
+  Stage 3 measure via source alpaca_iex selected 1, measured 1, failed 0
+  across horizons 10s/1m/5m/30m/1h/eod, statuses no_baseline=6, 6 rows
+  written / 6 replaced (event 1 AAPL no_baseline for all six horizons);
+  Stage 4 research summary news_events 10, sentiment_scores 2,
+  price_reactions 6, measurement_status no_baseline=6, horizon counts
+  10s=1/1m=1/5m=1/30m=1/1h=1/eod=1, no measured rows yet (no measured-return
+  averages, no recent measured rows). This proves the loop end-to-end at the
+  database level: real Alpaca news ingest -> deterministic manual scoring ->
+  real Alpaca Trades measurement path -> read-only research summary, all
+  through existing insert paths. manual_baseline is a NEUTRAL placeholder; it
+  proves pipeline wiring, NOT signal quality. The no_baseline=6 outcome is
+  the expected, correct failures-as-data result (no usable baseline trade,
+  likely outside market hours); real measured returns still require
+  market-hours or otherwise measurable trade windows. git status clean after
+  the run; the database file and .env remained ignored/untracked. No
+  trading, no paper orders.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -504,32 +536,27 @@ live feed.
 - The pipeline's ingest hard cap is 20 (vs. 10 for the standalone one-shot
   ingest script); the Alpaca News transport is still single-page only, so even
   at 20 a run fetches one page and does no pagination/backfill.
-- Phase B (manual scoring + end-to-end pipeline) is committed and fully tested
-  offline but NOT YET RUN against the live feed; the manual_baseline path has
-  not yet scored real ingested events, and the pipeline has not yet been
-  exercised end-to-end with real credentials.
+- Phase B (manual scoring + end-to-end pipeline) is committed, fully tested
+  offline, AND now RUN LOCALLY end-to-end against the live feed: the
+  manual_baseline path has scored real ingested events and the pipeline has
+  been exercised end-to-end with real credentials (sentiment_scores 2,
+  price_reactions 6). The run still produced no measured returns
+  (no_baseline=6), so signal quality remains unproven — manual_baseline is a
+  neutral placeholder and a market-hours measured run is still outstanding.
 
 ## Next Recommended Task
 Phase B (manual scoring + single end-to-end MVP pipeline command) is now
-IMPLEMENTED and COMMITTED as `5c26e57` (scripts/classifyNewsOnce.js +
-scripts/runMvpPipelineOnce.js, 24 network-free tests, 224/224 passing), but
-NOT YET RUN against the live feed.
+IMPLEMENTED, COMMITTED (`5c26e57`), and RUN LOCALLY end-to-end against the
+live feed (recorded above): the loop produced news_events, sentiment_scores,
+and price_reactions through the existing insert paths with no trading. The
+manual_baseline scorer is a neutral placeholder; it proves wiring, not edge.
 
-Recommended next step: RUN the new manual loop once locally during/after US
-market hours and record the result in STATUS, as the prior smoke/ingest/
-measurement runs were recorded:
-  node --env-file=.env scripts/classifyNewsOnce.js --limit 1
-  node --env-file=.env scripts/runMvpPipelineOnce.js --symbols AAPL \
-    --ingest-limit 5 --classify-limit 1 --measure-limit 1
-Expect the manual_baseline scorer to write parsed (all-zero) sentiment_scores
-rows, and expect several horizons to land on no_baseline/no_reaction for
-events received outside market hours — both are correct, not bugs.
-
-Then (the real edge work, its own separately-approved phase): replace the
-neutral manual_baseline scorer with a REAL model-backed classifier behind the
-same classifier contract (explicit, manual-only, key-via-config, sanitized
-output, no live calls in npm test) so scores carry actual content. Only after
-real scores + market-hours measured returns exist can any edge be measured.
+Recommended next step (the real edge work, its own separately-approved
+phase): replace the neutral manual_baseline scorer with a REAL model-backed
+classifier behind the same classifier contract (explicit, manual-only,
+key-via-config, sanitized output, no live calls in npm test) so scores carry
+actual content. Only after real scores + market-hours measured returns exist
+can any edge be measured.
 
 Optional, low priority: re-run the capped measurement on MARKET-HOURS events
 (node --env-file=.env scripts/measureReactionsOnce.js --limit 1) to get

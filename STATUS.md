@@ -4,21 +4,20 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (246/246).
+- Stable. All tests passing (261/261).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `d54340a` — docs(status): record real model classifier
-  smoke result (STATUS.md only).
-- Previous: `691900b` — feat(sentiment): add real model-backed classifier
-  (src/sentiment/modelClassifier.js + src/sentiment/index.js + src/config.js +
-  scripts/classifyNewsOnce.js + scripts/runMvpPipelineOnce.js +
-  tests/modelClassifier.test.js + tests/classifyNewsOnce.test.js +
-  tests/runMvpPipelineOnce.test.js + package.json + .env.example + README).
-  22 new network-free fake-HTTP tests; 246/246 passing.
+- Latest committed: `a152a66` — feat(eventstudy): add measurement-candidate
+  finder (scripts/listMeasurementCandidates.js +
+  tests/listMeasurementCandidates.test.js + scripts/reportEventStudySummary.js +
+  tests/reportEventStudySummary.test.js + package.json + README.md).
+  15 new network-free tests; 261/261 passing.
+- Previous: `a256190` — docs(status): record real-model MVP pipeline run
+  (STATUS.md only).
 - This STATUS update is committed separately as
-  `docs(status): record real-model MVP pipeline run` (STATUS.md only).
+  `docs(status): record measurement-candidate finder commit` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -489,6 +488,42 @@ end-to-end research WIRING, not signal quality or measured returns.
   market-hours measurable-event run is required before event-study expectancy
   can be evaluated. git status clean after the run; the database file and .env
   remained ignored/untracked.
+- Measurement-candidate finder (scripts/listMeasurementCandidates.js,
+  documented in README), committed as `a152a66`: manual-only, READ-ONLY
+  (SELECTs only — no writes, no migrations, no network, no credentials needed);
+  CLI-guarded (import is side-effect free). It exists to make measured-return
+  runs repeatable: past runs picked events blindly and produced all-no_baseline
+  rows, so this helper ranks EXISTING news_events (with both ticker and
+  received_at) by how likely a measurement is to yield a measured return.
+  Default mode keeps MARKET-HOURS, not-yet-measured candidates ranked best-first
+  (market-hours, then unmeasured, then newest received_at); `--all` lists every
+  eligible event, `--ticker` filters to one symbol, `--limit` defaults to 10
+  (hard max 50). Market hours is an APPROXIMATION via Intl
+  (Mon-Fri 09:30-16:00 America/New_York, DST handled automatically); it does
+  NOT model market holidays or half-days (real session calendar still deferred).
+  Per candidate it prints a strict whitelist — event id, ticker, provider,
+  received_at, an Eastern-time label, market_hours flag, model_v1 score flag,
+  measured flag, and price_reactions status counts — plus the exact
+  `measureReactionsOnce.js --ids <id>` command and a combined top-N command
+  (capped at 5, the measure script's --ids limit). Never headlines, bodies,
+  raw_payload, raw model responses, keys, or any free-text content. model_v1
+  detection imports MODEL_PROMPT_VERSION from the model classifier (the real
+  model's signature prompt_version). 13 network-free tests using an in-memory DB
+  (arg parsing/caps, EDT/EST/boundary/weekend market-hours, ranking/filtering,
+  ticker filter, limit cap, no-event behavior, suggested-command formatting +
+  cap, and output redaction). NOT a measurement path itself — it only suggests
+  the existing capped measure command; no schema/engine/measurement_status
+  changes, no trading, no model calls.
+- Event-study readiness counts added to the research summary
+  (scripts/reportEventStudySummary.js, same commit): collectSummary now also
+  returns measuredRowCount, modelV1ScoreCount (real-model model_v1 scores), and
+  readyEventCount — events that have BOTH a model_v1 score AND at least one
+  measured price_reaction, i.e. the rows an event-study expectancy readout can
+  actually use (while this is 0, no expectancy can be computed yet).
+  buildSummaryReport renders three new lines and tolerates summaries lacking the
+  fields (defaults to 0), so the MVP pipeline's composed report keeps working.
+  2 new tests plus readiness assertions on the empty-database test; still
+  read-only and paste-safe. NOT YET RUN against the live database.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -543,7 +578,15 @@ end-to-end research WIRING, not signal quality or measured returns.
   measurement -> read-only summary, composed entirely from existing paths and
   report builders. It is RESEARCH-ONLY (no trading/order calls), CLI-guarded,
   and reports SKIPPED stages plus no_baseline/no_reaction outcomes as data.
-- Tests: Node built-in test runner (`npm test`), 246/246 passing.
+- Read-only research tooling over the local database: the research summary
+  (scripts/reportEventStudySummary.js) now also reports event-study readiness
+  (measured rows, model_v1 score count, and events ready with both a model_v1
+  score and a measured reaction), and a measurement-candidate finder
+  (scripts/listMeasurementCandidates.js) ranks existing news_events into
+  paste-safe measure suggestions. Both are SELECT-only, need no credentials or
+  network, never write, and reuse the existing measure command rather than
+  measuring themselves.
+- Tests: Node built-in test runner (`npm test`), 261/261 passing.
 - No automatic/scheduled provider, market-data, or model calls. Live
   touchpoints are manual scripts only: news smoke check, news one-shot ingest,
   trades smoke check (each run against the live feed at least once), the capped
@@ -662,30 +705,42 @@ end-to-end research WIRING, not signal quality or measured returns.
 - NAMING NOTE: config now has both config.alpacaNews (Alpaca key pair) and
   config.model (anthropicApiKey + classifierModel). The earlier alpacaNews
   naming debt still stands; the new config.model block is cleanly named.
+- The measurement-candidate finder's market-hours test is an APPROXIMATION
+  (Mon-Fri 09:30-16:00 America/New_York via Intl, DST handled). It does NOT
+  model US market holidays or half-days, so an event flagged market_hours=yes on
+  a holiday can still measure to no_baseline. It is a heuristic to pick better
+  candidates, not a guarantee of a measured return; the real session calendar
+  remains deferred to the market-data client's later step. model_v1 detection
+  keys on prompt_version='model_v1' (the real model classifier's signature); a
+  future second model prompt version would need this widened.
 
 ## Next Recommended Task
-Phase C (real model-backed classifier) is now IMPLEMENTED, COMMITTED
-(`691900b`), RUN ONCE standalone against the live model, AND RUN through the
-FULL MVP pipeline with `--classifier real_model` (real model score stored in
-sentiment_scores; real Alpaca Trades measurement path exercised). That proves
-the full real end-to-end wiring, not edge — the pipeline run produced
-no_baseline=6, so there are still no measured returns.
+The measurement-candidate finder (scripts/listMeasurementCandidates.js) and the
+research-summary readiness counts are now IMPLEMENTED and COMMITTED (`a152a66`),
+so picking measurable market-hours events and verifying measured-return
+readiness are repeatable. They are READ-ONLY tooling — NOT YET RUN against the
+live database.
 
-Recommended next step: get MARKET-HOURS measured rows so real scores and real
-measured returns finally coexist. Either re-run the full pipeline during US
-market hours on a fresh, measurable event:
+Recommended next step: actually USE them to land the first MARKET-HOURS measured
+rows, so real model scores and real measured returns finally coexist. During US
+market hours:
+  1) list good candidates:
+     node --env-file=.env scripts/listMeasurementCandidates.js --limit 10
+  2) measure a suggested candidate (the finder prints the exact command):
+     node --env-file=.env scripts/measureReactionsOnce.js --ids <id>
+  3) confirm readiness in the summary (look for a non-zero "event-study ready"):
+     node --env-file=.env scripts/reportEventStudySummary.js --limit 10
+To also store a real model score on the same fresh event, run the full pipeline
+with `--classifier real_model` during market hours:
   node --env-file=.env scripts/runMvpPipelineOnce.js --classifier real_model \
     --symbols AAPL --ingest-limit 5 --classify-limit 1 --measure-limit 1
-or run the capped measurement alone against a recent market-hours event:
-  node --env-file=.env scripts/measureReactionsOnce.js --limit 1
-A small helper to SELECT recent market-hours events for measurement (still
-manual-only and capped) would make this repeatable. Outside market hours,
-horizons will keep landing on no_baseline/no_reaction (correct
-failures-as-data).
+Outside market hours, horizons will keep landing on no_baseline/no_reaction
+(correct failures-as-data) — the finder helps avoid exactly that.
 
 Only after real scores AND market-hours measured returns coexist can edge be
 measured — that is the first genuine event-study readout (expectancy sliced by
-news_type / direction / score bucket, grouped by prompt_version).
+news_type / direction / score bucket, grouped by prompt_version). The summary's
+"event-study ready" count is the gate: while it is 0, no expectancy exists yet.
 
 Optional, low priority: re-run the trades smoke check during market hours to
 confirm the price/timestamp mapping on a non-empty window.

@@ -9,7 +9,8 @@
 //   Run:  node --env-file=.env scripts/runMvpPipelineOnce.js \
 //           [--symbols AAPL] [--ingest-limit 5] [--classify-limit 1] \
 //           [--measure-limit 1] [--measure-ids 6,7,8] [--skip-ingest] \
-//           [--classifier manual_baseline|real_model]
+//           [--classifier manual_baseline|real_model] \
+//           [--baseline-lookback-minutes 60]
 //
 // MEASUREMENT TARGETING: the measure stage prefers FRESH/current-run events so
 // a market-hours run actually measures what it just ingested/scored instead of
@@ -47,7 +48,7 @@ import { createAlpacaNewsProvider } from '../src/providers/alpacaNewsProvider.js
 import { createAlpacaTradesPriceSource } from '../src/prices/alpacaTradesPriceSource.js';
 import { ingestNews } from '../src/ingestion/ingestNews.js';
 import { classifyAndStore } from '../src/ingestion/classifyNews.js';
-import { measureEvents } from '../src/eventStudy/measureReactions.js';
+import { measureEvents, DEFAULT_BASELINE_LOOKBACK_MS } from '../src/eventStudy/measureReactions.js';
 import { collectSummary, buildSummaryReport } from './reportEventStudySummary.js';
 import { buildIngestReport } from './ingestAlpacaNewsOnce.js';
 import {
@@ -62,8 +63,11 @@ import {
 import {
   buildMeasureReport,
   selectEvents,
+  resolveBaselineLookbackMs,
   DEFAULT_MEASURE_LIMIT,
   MAX_MEASURE_LIMIT,
+  DEFAULT_BASELINE_LOOKBACK_MINUTES,
+  MAX_BASELINE_LOOKBACK_MINUTES,
 } from './measureReactionsOnce.js';
 
 /** Capped defaults — tiny manual samples only. */
@@ -76,6 +80,8 @@ export {
   MAX_CLASSIFY_LIMIT,
   DEFAULT_MEASURE_LIMIT,
   MAX_MEASURE_LIMIT,
+  DEFAULT_BASELINE_LOOKBACK_MINUTES,
+  MAX_BASELINE_LOOKBACK_MINUTES,
 };
 
 /** Recent-measured-rows sample size for the closing summary. */
@@ -91,7 +97,8 @@ function clampInt(value, fallback, lo, hi) {
  * Parse CLI args. Exported for tests. Every numeric limit is clamped to its
  * hard cap, so the caps can never be exceeded regardless of input.
  *   --symbols A,B   --ingest-limit N   --classify-limit N
- *   --measure-limit N   --skip-ingest
+ *   --measure-limit N   --measure-ids 6,7,8   --skip-ingest
+ *   --classifier manual_baseline|real_model   --baseline-lookback-minutes N
  */
 export function parseArgs(argv) {
   const args = {
@@ -102,6 +109,7 @@ export function parseArgs(argv) {
     measureIds: null,
     skipIngest: false,
     classifier: DEFAULT_CLASSIFIER,
+    baselineLookbackMinutes: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -129,6 +137,14 @@ export function parseArgs(argv) {
       i += 1;
     } else if (flag === '--classifier' && argv[i + 1]) {
       args.classifier = argv[i + 1].trim();
+      i += 1;
+    } else if (flag === '--baseline-lookback-minutes' && argv[i + 1]) {
+      // Widen the engine's baseline lookback. Null (default) leaves behavior
+      // unchanged; positive ints are capped to MAX_BASELINE_LOOKBACK_MINUTES.
+      const n = Number.parseInt(argv[i + 1], 10);
+      if (Number.isInteger(n) && n > 0) {
+        args.baselineLookbackMinutes = Math.min(n, MAX_BASELINE_LOOKBACK_MINUTES);
+      }
       i += 1;
     } else if (flag === '--skip-ingest') {
       args.skipIngest = true;
@@ -202,7 +218,7 @@ export function selectMeasurementEvents(
 export async function runPipeline(
   db,
   { provider = null, providerSkipReason = 'skipped', classifier, priceSource = null, priceSkipReason = 'skipped' },
-  { symbols = ['AAPL'], ingestLimit = DEFAULT_INGEST_LIMIT, classifyLimit = DEFAULT_CLASSIFY_LIMIT, measureLimit = DEFAULT_MEASURE_LIMIT, measureIds = null, reportLimit = REPORT_RECENT_LIMIT } = {}
+  { symbols = ['AAPL'], ingestLimit = DEFAULT_INGEST_LIMIT, classifyLimit = DEFAULT_CLASSIFY_LIMIT, measureLimit = DEFAULT_MEASURE_LIMIT, measureIds = null, baselineLookbackMs = null, reportLimit = REPORT_RECENT_LIMIT } = {}
 ) {
   const result = { ingest: null, classify: null, measure: null, summary: null };
 
@@ -241,12 +257,16 @@ export async function runPipeline(
       classifiedIds: toClassify.map((r) => r.id),
       limit: measureLimit,
     });
-    const batch = await measureEvents(db, selection.events, priceSource);
+    // Only pass baselineLookbackMs when explicitly requested; otherwise the
+    // engine keeps its own default (default behavior unchanged).
+    const measureOptions = baselineLookbackMs ? { baselineLookbackMs } : {};
+    const batch = await measureEvents(db, selection.events, priceSource, measureOptions);
     result.measure = {
       ran: true,
       selectedCount: selection.events.length,
       selectionSource: selection.source,
       sourceName: priceSource.name,
+      baselineLookbackMs: baselineLookbackMs ?? DEFAULT_BASELINE_LOOKBACK_MS,
       batch,
     };
   } else {
@@ -292,6 +312,7 @@ export function buildPipelineReport(result) {
       ...buildMeasureReport(result.measure.batch, {
         selectedCount: result.measure.selectedCount,
         sourceName: result.measure.sourceName,
+        baselineLookbackMs: result.measure.baselineLookbackMs,
       })
     );
   } else {
@@ -304,8 +325,11 @@ export function buildPipelineReport(result) {
 }
 
 async function main() {
-  const { symbols, ingestLimit, classifyLimit, measureLimit, measureIds, skipIngest, classifier: classifierName } =
-    parseArgs(process.argv.slice(2));
+  const {
+    symbols, ingestLimit, classifyLimit, measureLimit, measureIds, skipIngest,
+    classifier: classifierName, baselineLookbackMinutes,
+  } = parseArgs(process.argv.slice(2));
+  const baselineLookbackMs = resolveBaselineLookbackMs(baselineLookbackMinutes);
   const config = loadConfig();
   const hasCreds = Boolean(config.alpacaNews.keyId && config.alpacaNews.secretKey);
 
@@ -344,7 +368,7 @@ async function main() {
     const result = await runPipeline(
       db,
       { provider, providerSkipReason, classifier, priceSource, priceSkipReason },
-      { symbols, ingestLimit, classifyLimit, measureLimit, measureIds, reportLimit: REPORT_RECENT_LIMIT }
+      { symbols, ingestLimit, classifyLimit, measureLimit, measureIds, baselineLookbackMs, reportLimit: REPORT_RECENT_LIMIT }
     );
 
     for (const line of buildPipelineReport(result)) console.log(line);

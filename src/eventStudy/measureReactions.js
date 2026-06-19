@@ -66,9 +66,17 @@ function lastTradeAtOrBefore(trades, cutoff, after = null) {
  * @param {string[]} [options.horizons]  subset of canonical horizons
  * @param {number} [options.baselineLookbackMs]
  * @returns {Promise<{
- *   newsEventId: number, ticker: string, anchorAt: string,
+ *   newsEventId: number, ticker: string, anchorAt: string, priceSource: string,
+ *   window: { baselineFromIso: string, reactionToIso: string,
+ *             baselineLookbackMs: number, tradeCount: number|null },
  *   results: { horizon: string, status: string, replaced: boolean }[],
  * }>}
+ *
+ * The returned `window` is sanitized DIAGNOSTIC data only — the exact bounds
+ * fetched (baseline lookback start, final reaction-window end), the lookback
+ * used, and the COUNT of trades the source returned (tradeCount stays null on
+ * source_error). It never contains trade payloads, prices, or secrets, so it
+ * is safe for the manual scripts to print.
  */
 export async function measureEvent(db, eventRow, priceSource, options = {}) {
   validatePriceSource(priceSource);
@@ -90,7 +98,20 @@ export async function measureEvent(db, eventRow, priceSource, options = {}) {
     priceSource: priceSource.name,
     measuredAt: new Date().toISOString(),
   };
-  const summary = { newsEventId: eventRow.id, ticker: eventRow.ticker, anchorAt, results: [] };
+  const summary = {
+    newsEventId: eventRow.id,
+    ticker: eventRow.ticker,
+    anchorAt,
+    priceSource: priceSource.name,
+    // Sanitized diagnostics: the exact window fetched + trade COUNT (no payloads).
+    window: {
+      baselineFromIso: fromIso,
+      reactionToIso: maxTarget,
+      baselineLookbackMs: lookbackMs,
+      tradeCount: null, // set after a successful fetch; stays null on source_error
+    },
+    results: [],
+  };
 
   // One fetch covers every horizon. A source failure marks ALL requested
   // horizons source_error — observable, never thrown.
@@ -106,6 +127,7 @@ export async function measureEvent(db, eventRow, priceSource, options = {}) {
     }
     return summary;
   }
+  summary.window.tradeCount = trades.length; // count only — never the trades
 
   const baseline = lastTradeAtOrBefore(trades, anchorAt);
 

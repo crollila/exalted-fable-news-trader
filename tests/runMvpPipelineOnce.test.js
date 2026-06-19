@@ -26,6 +26,8 @@ import {
   MAX_CLASSIFY_LIMIT,
   DEFAULT_MEASURE_LIMIT,
   MAX_MEASURE_LIMIT,
+  DEFAULT_BASELINE_LOOKBACK_MINUTES,
+  MAX_BASELINE_LOOKBACK_MINUTES,
 } from '../scripts/runMvpPipelineOnce.js';
 
 const ANCHOR = '2026-06-09T14:30:00.000Z';
@@ -109,9 +111,21 @@ test('parseArgs defaults are tiny and safe', () => {
     measureIds: null,
     skipIngest: false,
     classifier: DEFAULT_CLASSIFIER,
+    baselineLookbackMinutes: null, // null → engine default; default behavior unchanged
   });
   assert.equal(DEFAULT_INGEST_LIMIT, 5);
   assert.equal(DEFAULT_CLASSIFIER, 'manual_baseline');
+});
+
+test('parseArgs reads --baseline-lookback-minutes, caps it, and rejects junk', () => {
+  assert.equal(parseArgs(['--baseline-lookback-minutes', '60']).baselineLookbackMinutes, 60);
+  assert.equal(
+    parseArgs(['--baseline-lookback-minutes', '99999']).baselineLookbackMinutes,
+    MAX_BASELINE_LOOKBACK_MINUTES
+  );
+  assert.equal(parseArgs(['--baseline-lookback-minutes', '0']).baselineLookbackMinutes, null);
+  assert.equal(parseArgs([]).baselineLookbackMinutes, null);
+  assert.equal(DEFAULT_BASELINE_LOOKBACK_MINUTES, 15);
 });
 
 test('parseArgs reads --measure-ids, dedups, and truncates to the hard cap', () => {
@@ -202,6 +216,46 @@ test('runPipeline runs ingest -> classify -> measure -> summary with zero networ
   }
 });
 
+// --- baseline lookback threading -------------------------------------------
+
+test('runPipeline threads a wider baseline lookback into the price-source window', async () => {
+  // Recording source captures the exact window the measure stage requests.
+  const calls = [];
+  const recordingSource = {
+    name: 'recording',
+    getTradesAround: async (ticker, fromIso, toIso) => {
+      calls.push({ ticker, fromIso, toIso });
+      return [];
+    },
+  };
+
+  // Default (no option): baseline window starts 15m before the anchor, and the
+  // engine's own default is surfaced on the result for the report header.
+  const db1 = freshDb();
+  const result1 = await runPipeline(
+    db1,
+    { provider: createMockProvider(RAW_NEWS), classifier: buildManualClassifier(), priceSource: recordingSource },
+    baseOpts
+  );
+  assert.equal(calls.at(-1).fromIso, '2026-06-09T14:15:00.000Z');
+  assert.equal(result1.measure.baselineLookbackMs, 15 * 60_000);
+  const defaultToIso = calls.at(-1).toIso;
+
+  // With baselineLookbackMs (60m): window starts 60m earlier; reaction END
+  // unchanged; the chosen value is surfaced on the result.
+  const db2 = freshDb();
+  const result2 = await runPipeline(
+    db2,
+    { provider: createMockProvider(RAW_NEWS), classifier: buildManualClassifier(), priceSource: recordingSource },
+    { ...baseOpts, baselineLookbackMs: 60 * 60_000 }
+  );
+  assert.equal(calls.at(-1).fromIso, '2026-06-09T13:30:00.000Z');
+  assert.equal(calls.at(-1).toIso, defaultToIso);
+  assert.equal(result2.measure.baselineLookbackMs, 60 * 60_000);
+  closeDatabase(db1);
+  closeDatabase(db2);
+});
+
 // --- skip behavior ---------------------------------------------------------
 
 test('runPipeline skips ingest when no provider is given, still classifies + measures', async () => {
@@ -272,6 +326,9 @@ test('buildPipelineReport composes all four stages and stays sanitized', async (
   assert.match(text, /stage 3: measure reactions/);
   assert.match(text, /stage 4: research summary/);
   assert.match(text, /model "manual_baseline" prompt "manual_v1"/);
+  // The composed measure report carries the lookback header + window diagnostics.
+  assert.match(text, /lookback:   15m baseline window/);
+  assert.match(text, /window diagnostics:/);
   // The stored headline never reaches the composed, sanitized report.
   assert.ok(!text.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
   closeDatabase(db);

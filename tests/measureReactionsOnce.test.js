@@ -16,8 +16,12 @@ import {
   selectEvents,
   aggregateResults,
   buildMeasureReport,
+  perEventDiagnostics,
+  resolveBaselineLookbackMs,
   DEFAULT_MEASURE_LIMIT,
   MAX_MEASURE_LIMIT,
+  DEFAULT_BASELINE_LOOKBACK_MINUTES,
+  MAX_BASELINE_LOOKBACK_MINUTES,
 } from '../scripts/measureReactionsOnce.js';
 
 const ANCHOR = '2026-06-09T14:30:00.000Z';
@@ -61,9 +65,31 @@ function freshDb() {
 
 // --- argument parsing & cap enforcement -----------------------------------
 
-test('parseArgs defaults to a single event', () => {
-  assert.deepEqual(parseArgs([]), { limit: DEFAULT_MEASURE_LIMIT, ids: null });
+test('parseArgs defaults to a single event and no custom lookback', () => {
+  assert.deepEqual(parseArgs([]), {
+    limit: DEFAULT_MEASURE_LIMIT,
+    ids: null,
+    baselineLookbackMinutes: null, // null → engine default; default behavior unchanged
+  });
   assert.equal(DEFAULT_MEASURE_LIMIT, 1);
+});
+
+test('parseArgs reads --baseline-lookback-minutes, caps it, and rejects junk', () => {
+  assert.equal(parseArgs(['--baseline-lookback-minutes', '60']).baselineLookbackMinutes, 60);
+  // Capped to the hard max regardless of input — the window can never balloon.
+  assert.equal(
+    parseArgs(['--baseline-lookback-minutes', '99999']).baselineLookbackMinutes,
+    MAX_BASELINE_LOOKBACK_MINUTES
+  );
+  // Junk / non-positive → null, so the engine default (unchanged) is used.
+  assert.equal(parseArgs(['--baseline-lookback-minutes', '0']).baselineLookbackMinutes, null);
+  assert.equal(parseArgs(['--baseline-lookback-minutes', 'nope']).baselineLookbackMinutes, null);
+  assert.equal(DEFAULT_BASELINE_LOOKBACK_MINUTES, 15);
+});
+
+test('resolveBaselineLookbackMs maps minutes→ms and stays null when omitted', () => {
+  assert.equal(resolveBaselineLookbackMs(null), null); // omitted → engine default
+  assert.equal(resolveBaselineLookbackMs(60), 60 * 60_000);
 });
 
 test('parseArgs clamps --limit to the hard max and rejects junk', () => {
@@ -208,6 +234,83 @@ test('buildMeasureReport renders per-event errors but never raw payloads', () =>
     { selectedCount: 1, sourceName: 'alpaca_iex' }
   ).join('\n');
   assert.ok(!sneaky.includes('RAW-MUST-NOT-PRINT'));
+});
+
+// --- baseline lookback: window widening & diagnostics ----------------------
+
+test('a wider baseline lookback widens the REQUESTED price-source window', async () => {
+  const db = freshDb();
+  insertEvent(db, { id: 1, ticker: 'AAPL', receivedAt: ANCHOR });
+  const events = selectEvents(db, { limit: 1 });
+
+  // Recording source captures the exact window the engine requests (no network).
+  const calls = [];
+  const recordingSource = {
+    name: 'recording',
+    getTradesAround: async (ticker, fromIso, toIso) => {
+      calls.push({ ticker, fromIso, toIso });
+      return [];
+    },
+  };
+
+  // Default (no option): baseline window starts 15m before the anchor.
+  await measureEvents(db, events, recordingSource);
+  assert.equal(calls.at(-1).fromIso, '2026-06-09T14:15:00.000Z');
+  const defaultToIso = calls.at(-1).toIso;
+
+  // Wider lookback threaded as an engine option: window starts 60m earlier,
+  // while the reaction-window END is unchanged (only the baseline start moves).
+  await measureEvents(db, events, recordingSource, { baselineLookbackMs: resolveBaselineLookbackMs(60) });
+  assert.equal(calls.at(-1).fromIso, '2026-06-09T13:30:00.000Z');
+  assert.equal(calls.at(-1).toIso, defaultToIso);
+  closeDatabase(db);
+});
+
+test('buildMeasureReport renders sanitized window diagnostics + the lookback header', async () => {
+  const db = freshDb();
+  insertEvent(db, { id: 1, ticker: 'AAPL', receivedAt: ANCHOR });
+  const events = selectEvents(db, { limit: 1 });
+  const source = createFixturePriceSource({ tradesByTicker: { AAPL: AAPL_TRADES } });
+  const batch = await measureEvents(db, events, source);
+
+  const text = buildMeasureReport(batch, { selectedCount: 1, sourceName: source.name }).join('\n');
+  assert.match(text, /lookback:   15m baseline window/); // default header
+  assert.match(text, /window diagnostics:/);
+  assert.match(text, /anchor_at:     2026-06-09T14:30:00.000Z/);
+  assert.match(text, /baseline from: 2026-06-09T14:15:00.000Z {2}\(lookback 15m\)/);
+  assert.match(text, /reaction to:   2026-06-09T21:00:00.000Z/);
+  assert.match(text, /source:        fixture/);
+  assert.match(text, /trades seen:   7/); // COUNT only — never the trades themselves
+  // The stored headline never leaks into the diagnostics block.
+  assert.ok(!text.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
+  closeDatabase(db);
+});
+
+test('buildMeasureReport shows a custom lookback in the header', () => {
+  const text = buildMeasureReport(
+    { measuredEvents: 0, failedEvents: 0, summaries: [], errors: [] },
+    { selectedCount: 0, sourceName: 'alpaca_iex', baselineLookbackMs: 60 * 60_000 }
+  ).join('\n');
+  assert.match(text, /lookback:   60m baseline window/);
+});
+
+test('perEventDiagnostics shows an n/a trade count on source_error and stays sanitized', () => {
+  const text = perEventDiagnostics({
+    newsEventId: 3,
+    ticker: 'AAPL',
+    anchorAt: ANCHOR,
+    priceSource: 'alpaca_iex',
+    window: {
+      baselineFromIso: '2026-06-09T14:15:00.000Z',
+      reactionToIso: '2026-06-09T21:00:00.000Z',
+      baselineLookbackMs: 15 * 60_000,
+      tradeCount: null, // source error → count never invented
+    },
+  }).join('\n');
+  assert.match(text, /trades seen:   n\/a \(source error\)/);
+  assert.match(text, /source:        alpaca_iex/);
+  // A summary with no window data produces no diagnostics lines.
+  assert.deepEqual(perEventDiagnostics({ newsEventId: 9, ticker: 'X', results: [] }), []);
 });
 
 // --- integration: real writer path via fixture source (offline) -----------

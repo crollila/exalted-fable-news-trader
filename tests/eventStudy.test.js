@@ -186,6 +186,59 @@ test('measureEvents handles batches; bad rows are recorded, not fatal', async ()
   closeDatabase(db);
 });
 
+test('measureEvent summary carries sanitized window diagnostics (default lookback)', async () => {
+  const db = freshDb();
+  const row = seedEventRow(db);
+  const summary = await measureEvent(db, row, aaplSource());
+  // Sanitized window: bounds, lookback, trade COUNT, source name — no payloads.
+  assert.equal(summary.priceSource, 'fixture');
+  assert.equal(summary.window.baselineFromIso, '2026-06-09T14:15:00.000Z'); // anchor - 15m
+  assert.equal(summary.window.reactionToIso, '2026-06-09T21:00:00.000Z'); // eod target (latest)
+  assert.equal(summary.window.baselineLookbackMs, 15 * 60_000);
+  assert.equal(summary.window.tradeCount, 8); // trades in [14:15, 21:00]; the 21:30 trade excluded
+  closeDatabase(db);
+});
+
+test('a wider baseline lookback widens the requested window and can rescue a baseline', async () => {
+  const db = freshDb();
+  const row = seedEventRow(db);
+  // The only baseline candidate sits 25m before the anchor — outside default 15m.
+  const trades = [
+    { price: 100.0, at: '2026-06-09T14:05:00.000Z', size: 10 }, // 25m before anchor
+    { price: 101.0, at: '2026-06-09T14:30:45.000Z', size: 20 }, // 1m-window reaction
+  ];
+  const source = aaplSource(trades);
+
+  // Default lookback (15m): the baseline is out of range → no_baseline everywhere.
+  const def = await measureEvent(db, row, source);
+  assert.equal(def.window.baselineFromIso, '2026-06-09T14:15:00.000Z');
+  assert.ok(def.results.every((r) => r.status === 'no_baseline'));
+
+  // Wider lookback (60m): same trade is now in range → baseline found, 1m measured.
+  const wide = await measureEvent(db, row, source, { baselineLookbackMs: 60 * 60_000 });
+  assert.equal(wide.window.baselineFromIso, '2026-06-09T13:30:00.000Z'); // anchor - 60m
+  assert.equal(wide.window.baselineLookbackMs, 60 * 60_000);
+  const r1m = getPriceReaction(db, row.id, '1m');
+  assert.equal(r1m.measurement_status, 'measured');
+  assert.equal(r1m.baseline_price, 100.0);
+  closeDatabase(db);
+});
+
+test('window.tradeCount stays null on source_error (count is never invented)', async () => {
+  const db = freshDb();
+  const row = seedEventRow(db);
+  const broken = {
+    name: 'fixture',
+    getTradesAround: async () => {
+      throw new Error('simulated source outage');
+    },
+  };
+  const summary = await measureEvent(db, row, broken);
+  assert.equal(summary.window.tradeCount, null);
+  assert.ok(summary.results.every((r) => r.status === 'source_error'));
+  closeDatabase(db);
+});
+
 test('no network is touched anywhere in measurement', async () => {
   const originalFetch = globalThis.fetch;
   let networkCalls = 0;

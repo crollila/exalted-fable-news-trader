@@ -2,11 +2,21 @@
 // over EXISTING news_events, using the real Alpaca Trades PriceSource
 // (docs/market-data-client-plan.md §15, step 4 of §16).
 //
-//   Run:  node --env-file=.env scripts/measureReactionsOnce.js [--limit 1] [--ids 1,2,3]
+//   Run:  node --env-file=.env scripts/measureReactionsOnce.js [--limit 1] \
+//           [--ids 1,2,3] [--baseline-lookback-minutes 60]
 //
 // - MANUAL ONLY: never part of npm test, app startup, schedulers, or CI.
 //   One human-invoked selection + measurement, then exit. No polling, no
 //   scheduling, no background jobs.
+// - DIAGNOSTICS: for each measured event the report prints a sanitized window
+//   block (anchor_at, baseline-lookback start, final reaction-window end,
+//   source name, and the COUNT of trades the source returned) so all-no_baseline
+//   outcomes on the thin IEX feed can be understood. Counts/timestamps only —
+//   never trade prices, raw payloads, or secrets.
+// - --baseline-lookback-minutes widens how far back the engine looks for a
+//   baseline trade (default unchanged at DEFAULT_BASELINE_LOOKBACK_MINUTES). A
+//   wider lookback only changes the REQUESTED price-source window; it never
+//   changes measurement semantics or which event is selected.
 // - Reuses the EXISTING measurement path end to end: explicit
 //   createAlpacaTradesPriceSource(config) → measureEvents() → measureEvent()
 //   → insertPriceReaction(). No separate write path; re-measurement REPLACES
@@ -27,7 +37,7 @@ import { loadConfig } from '../src/config.js';
 import { createAlpacaTradesPriceSource } from '../src/prices/alpacaTradesPriceSource.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
-import { measureEvents } from '../src/eventStudy/measureReactions.js';
+import { measureEvents, DEFAULT_BASELINE_LOOKBACK_MS } from '../src/eventStudy/measureReactions.js';
 import { HORIZONS } from '../src/database/priceReactions.js';
 
 /** Tiny manual sample only. Default 1 event; never more than the hard cap. */
@@ -35,13 +45,24 @@ export const DEFAULT_MEASURE_LIMIT = 1;
 export const MAX_MEASURE_LIMIT = 5;
 
 /**
- * Parse minimal CLI args: --limit N --ids 1,2,3. Exported for tests.
- * The limit is always clamped to [1, MAX_MEASURE_LIMIT]; explicit ids are
- * deduped, kept in order, and truncated to the same hard cap. The cap can
- * never be exceeded regardless of input.
+ * Baseline-lookback CLI bounds. The default mirrors the engine's own default
+ * (so omitting the flag leaves behavior unchanged). The hard max is one full
+ * regular-session length (6.5h) — generous enough to reach the prior close on
+ * a thin feed, while keeping the requested trade window bounded.
+ */
+export const DEFAULT_BASELINE_LOOKBACK_MINUTES = DEFAULT_BASELINE_LOOKBACK_MS / 60_000;
+export const MAX_BASELINE_LOOKBACK_MINUTES = 390;
+
+/**
+ * Parse minimal CLI args: --limit N --ids 1,2,3 --baseline-lookback-minutes N.
+ * Exported for tests. The limit is always clamped to [1, MAX_MEASURE_LIMIT];
+ * explicit ids are deduped, kept in order, and truncated to the same hard cap.
+ * baselineLookbackMinutes stays null (engine default, behavior unchanged) unless
+ * a positive integer is supplied, in which case it is capped to
+ * [1, MAX_BASELINE_LOOKBACK_MINUTES]. No cap can be exceeded regardless of input.
  */
 export function parseArgs(argv) {
-  const args = { limit: DEFAULT_MEASURE_LIMIT, ids: null };
+  const args = { limit: DEFAULT_MEASURE_LIMIT, ids: null, baselineLookbackMinutes: null };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--limit' && argv[i + 1]) {
       const n = Number.parseInt(argv[i + 1], 10);
@@ -55,11 +76,29 @@ export function parseArgs(argv) {
       }
       args.ids = ids;
       i += 1;
+    } else if (argv[i] === '--baseline-lookback-minutes' && argv[i + 1]) {
+      const n = Number.parseInt(argv[i + 1], 10);
+      // Junk/non-positive input is ignored → null → engine default (unchanged).
+      if (Number.isInteger(n) && n > 0) {
+        args.baselineLookbackMinutes = Math.min(n, MAX_BASELINE_LOOKBACK_MINUTES);
+      }
+      i += 1;
     }
   }
   args.limit = Math.min(Math.max(args.limit, 1), MAX_MEASURE_LIMIT);
   if (args.ids) args.ids = args.ids.slice(0, MAX_MEASURE_LIMIT);
   return args;
+}
+
+/**
+ * Resolve the CLI minutes option to an engine `baselineLookbackMs` value, or
+ * null when the flag was omitted (so the engine keeps its own default and the
+ * default behavior is unchanged).
+ */
+export function resolveBaselineLookbackMs(baselineLookbackMinutes) {
+  return baselineLookbackMinutes === null || baselineLookbackMinutes === undefined
+    ? null
+    : baselineLookbackMinutes * 60_000;
 }
 
 /**
@@ -128,12 +167,36 @@ function perEventLine(summary) {
 }
 
 /**
+ * Sanitized per-event WINDOW DIAGNOSTICS lines built from the engine summary's
+ * `window` block. Explains the exact measurement window so all-no_baseline
+ * outcomes are debuggable. Whitelist only: event id, ticker, anchor_at,
+ * baseline-lookback start, reaction-window end, source name, and the COUNT of
+ * trades the source returned (n/a on source_error). Never prices or payloads.
+ * Returns [] for summaries without window data (older/synthetic shapes).
+ */
+export function perEventDiagnostics(summary) {
+  const w = summary?.window;
+  if (!w) return [];
+  const lookbackMin = Math.round((w.baselineLookbackMs ?? 0) / 60_000);
+  const trades =
+    w.tradeCount === null || w.tradeCount === undefined ? 'n/a (source error)' : `${w.tradeCount}`;
+  return [
+    `    - event ${summary.newsEventId} ${summary.ticker}`,
+    `        anchor_at:     ${summary.anchorAt}`,
+    `        baseline from: ${w.baselineFromIso}  (lookback ${lookbackMin}m)`,
+    `        reaction to:   ${w.reactionToIso}`,
+    `        source:        ${summary.priceSource ?? '?'}`,
+    `        trades seen:   ${trades}`,
+  ];
+}
+
+/**
  * Build the full sanitized report as an array of printable lines. Whitelist
  * only: selected count, source name, measured/failed event counts, status
  * counts, horizons attempted, replaced-row count, and per-event id/ticker/
  * status lines. No raw payloads are renderable here by construction.
  */
-export function buildMeasureReport(batch, { selectedCount, sourceName } = {}) {
+export function buildMeasureReport(batch, { selectedCount, sourceName, baselineLookbackMs } = {}) {
   const agg = aggregateResults(batch);
   const statusLine =
     Object.keys(agg.statusCounts).length > 0
@@ -142,9 +205,11 @@ export function buildMeasureReport(batch, { selectedCount, sourceName } = {}) {
           .map(([status, n]) => `${status}=${n}`)
           .join('  ')
       : '(none)';
+  const lookbackMin = Math.round((baselineLookbackMs ?? DEFAULT_BASELINE_LOOKBACK_MS) / 60_000);
   const lines = [
     `Alpaca Trades one-shot measurement via source "${sourceName ?? '?'}"`,
     `  selected:   ${selectedCount ?? 0} event(s)`,
+    `  lookback:   ${lookbackMin}m baseline window`,
     `  measured:   ${batch.measuredEvents} event(s)`,
     `  failed:     ${batch.failedEvents} event(s)`,
     `  horizons:   ${agg.horizonsAttempted.length > 0 ? agg.horizonsAttempted.join(', ') : '(none)'}`,
@@ -155,6 +220,13 @@ export function buildMeasureReport(batch, { selectedCount, sourceName } = {}) {
   for (const e of batch.errors ?? []) {
     lines.push(`  - error [event ${e.newsEventId ?? '?'}]: ${e.error}`);
   }
+  // Window diagnostics: only rendered for summaries that carry engine window
+  // data, so older/synthetic batch shapes print exactly as before.
+  const diagnostics = (batch.summaries ?? []).flatMap(perEventDiagnostics);
+  if (diagnostics.length > 0) {
+    lines.push('  window diagnostics:');
+    lines.push(...diagnostics);
+  }
   if ((selectedCount ?? 0) === 0) {
     lines.push('  (no eligible news_events rows — ingest some real events first)');
   }
@@ -162,7 +234,8 @@ export function buildMeasureReport(batch, { selectedCount, sourceName } = {}) {
 }
 
 async function main() {
-  const { limit, ids } = parseArgs(process.argv.slice(2));
+  const { limit, ids, baselineLookbackMinutes } = parseArgs(process.argv.slice(2));
+  const baselineLookbackMs = resolveBaselineLookbackMs(baselineLookbackMinutes);
   const config = loadConfig();
 
   // Same key pair as the news transport (account-level; read via config only).
@@ -184,7 +257,7 @@ async function main() {
     if (events.length === 0) {
       for (const line of buildMeasureReport(
         { measuredEvents: 0, failedEvents: 0, summaries: [], errors: [] },
-        { selectedCount: 0, sourceName: '(not constructed)' }
+        { selectedCount: 0, sourceName: '(not constructed)', baselineLookbackMs }
       )) {
         console.log(line);
       }
@@ -192,12 +265,17 @@ async function main() {
       return;
     }
 
+    // Only pass baselineLookbackMs when explicitly requested; otherwise the
+    // engine keeps its own default (default behavior unchanged).
+    const measureOptions = baselineLookbackMs ? { baselineLookbackMs } : {};
+
     // Explicit construction — the only place a real market-data path is enabled.
     const source = createAlpacaTradesPriceSource(config);
-    const batch = await measureEvents(db, events, source);
+    const batch = await measureEvents(db, events, source, measureOptions);
     for (const line of buildMeasureReport(batch, {
       selectedCount: events.length,
       sourceName: source.name,
+      baselineLookbackMs: baselineLookbackMs ?? DEFAULT_BASELINE_LOOKBACK_MS,
     })) {
       console.log(line);
     }

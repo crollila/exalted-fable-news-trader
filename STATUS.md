@@ -4,7 +4,7 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (343/343).
+- Stable. All tests passing (406/406).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 - Phase 5 (PAPER trading) FIRST VERTICAL SLICE is COMMITTED (`df1931f`): a
@@ -17,9 +17,29 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   + .env.example placeholders + 3 test files. PAPER-only, read-only EOD summary;
   Discord posts only when explicitly requested; the webhook URL is never printed.
   24 new network-free tests. OPENAI_MODEL wiring was DEFERRED (see warning below).
+- Phase 5 ADVANCED PAPER trading is COMMITTED (`b3387d5`): equities long/short,
+  single-leg long OPTIONS (explicit OCC --option-symbol; no contract discovery),
+  margin-aware risk, and a market-hours PAPER loop. New:
+  src/paper/accountCapabilities.js, src/paper/paperRisk.js,
+  src/paper/optionsProposal.js, src/paper/marketHours.js,
+  src/paper/paperTradingLoop.js, scripts/runPaperTradingLoop.js; extended
+  src/paper/alpacaPaperClient.js (account/positions/option orders) +
+  src/paper/paperTradeProposal.js (shorts) + scripts/runPaperTradingOnce.js.
+  PAPER-only, dry-run default, --execute-paper still required; options default
+  plan_only. 63 network-free tests (406 total). Part G (strategy-settings file)
+  was DEFERRED as not needed for CLI-driven caps.
 
 ## Latest Confirmed Commit
-- Latest committed: `0bb590c` — feat(notifications): add Discord webhook
+- Latest committed: `b3387d5` — feat(paper): advanced PAPER trading — long/short,
+  options, margin, market-hours loop. Account/positions snapshots + OCC option
+  market orders on the (still paper-only) client; margin-aware risk
+  (accountCapabilities + paperRisk) with notional/exposure/daily caps; long+short
+  equity proposals; single-leg long options by explicit OCC --option-symbol
+  (plan_only default); a bounded dry-run-default market-hours loop reusing the
+  one-shot. --execute-paper still required; options also need --options-mode
+  execute_paper + a verified options capability. 63 new network-free tests;
+  406/406 passing.
+- Previous: `0bb590c` — feat(notifications): add Discord webhook
   verification and paper EOD report. A PAPER-only Discord delivery path: a
   webhook client (injected HTTP; the webhook URL and its token are redacted from
   all errors and never printed/persisted), scripts/smokeDiscordWebhook.js (a
@@ -53,8 +73,9 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   baseline-lookback widening (STATUS.md only).
 - Previous: `89c7eb5` — docs(status): record Phase 5 one-shot paper slice commit
   (STATUS.md only).
+- Previous: `3ac6400` — docs(status): record Discord reporting slice (STATUS.md only).
 - This STATUS update is committed separately as
-  `docs(status): record Discord reporting slice` (STATUS.md only).
+  `docs(status): record advanced paper trading slice` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -699,6 +720,48 @@ no scheduling/loop yet.
     send/test-message use the injected client, refuse-to-send without a client,
     no raw response/headline leakage, zero real network. package.json registers
     the 3 files. NOT YET RUN against a live Discord webhook.
+- Phase 5 ADVANCED PAPER trading (committed as `b3387d5`):
+  * src/paper/alpacaPaperClient.js EXTENDED: getAccount() + getPositions()
+    (sanitized snapshots) and submitOptionMarketOrder() (OCC market order)
+    alongside the existing equity submitMarketOrder (buy=long, sell=short). All
+    GET/POST share one sanitized HTTP helper; paper endpoint stays hard-coded
+    (no live, no baseUrl option); keys redacted from every error.
+  * src/paper/accountCapabilities.js: deriveCapabilities(account) infers
+    margin/short eligibility (multiplier >= 2 AND equity >= $2000) and options
+    eligibility (clearly-reported level >= 1; unknown => fail closed); plus
+    gross/symbol exposure helpers and an option-position finder. Pure.
+  * src/paper/paperRisk.js: assessRisk() — margin-aware gate. Rejects blocked
+    accounts, ineligible shorts, sub-equity shorts, insufficient buying power,
+    and breaches of --max-order-notional / --max-symbol-exposure /
+    --max-gross-exposure / --max-daily-paper-orders / --max-daily-paper-notional
+    / --option-max-premium. Fail-safe: an EQUITY execute with no reference price
+    is refused; options with no quote are approved with an explicit "premium
+    UNVERIFIED" caveat (bounded by --option-contract-limit; paper-only). Pure.
+  * src/paper/paperTradeProposal.js: assessProposal() now does LONG (up->buy) and
+    SHORT (down->sell, only with --allow-shorts and sentiment <= -threshold);
+    unclear/none rejected. Writers unchanged (migration-001 tables).
+  * src/paper/optionsProposal.js: proposeOption() — single-leg LONG call/put only,
+    intent from direction (bullish_call/bearish_put), EXPLICIT OCC --option-symbol
+    (validated: type matches intent, underlying in allow-list, expiry window),
+    plan_only by default. No spreads/multi-leg/auto-rolls/uncovered writing.
+  * src/paper/marketHours.js: US regular-session approximation (Mon-Fri
+    09:30-16:00 ET via Intl; weekends skipped; holidays NOT modeled). Pure.
+  * src/paper/paperTradingLoop.js + scripts/runPaperTradingLoop.js: a bounded
+    market-hours loop that REUSES the one-shot logic (executeOneShot) — no trade
+    logic duplicated. Dry-run default; >= 5-min interval floor; max-iteration cap;
+    sanitized heartbeats; graceful SIGINT; optional --send-discord-eod-report.
+  * scripts/runPaperTradingOnce.js: integrates all of the above (parseArgs for
+    every advanced/cap flag; fetchAccountState + fetchReferencePrice via the
+    paper + existing trades clients; equity AND option proposals each risk-gated,
+    dry-run/executed, and persisted distinctly). DRY RUN default; --execute-paper
+    required; sanitized report shows account capability + both legs.
+  * 63 new network-free tests across tests/alpacaPaperClient.test.js (account/
+    positions/short/option), tests/accountCapabilities.test.js, paperRisk.test.js,
+    optionsProposal.test.js, marketHours.test.js, runPaperTradingOnce.test.js
+    (long/short/options/margin integration), runPaperTradingLoop.test.js (market
+    gating, bounds, Ctrl+C, heartbeat). 406 total; npm test fully offline (fake
+    HTTP / injected clients/clock; no order or Discord post is ever sent).
+    NOT YET RUN against the live paper account.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -784,7 +847,16 @@ no scheduling/loop yet.
   (scripts/sendPaperEodReport.js) is read-only over paper_trades/rejected_trades
   and dry-run by default; it sends only with --send-discord and a configured
   webhook. No trading logic and no market/model calls live in this layer.
-- Tests: Node built-in test runner (`npm test`), 343/343 passing.
+- src/paper now holds the ADVANCED PAPER stack (committed `b3387d5`): the order client
+  is still the ONLY order path and still paper-endpoint-only (equity buy/sell +
+  OCC option market orders). accountCapabilities/paperRisk add margin-aware
+  gating; optionsProposal adds explicit-OCC long calls/puts (plan_only default);
+  marketHours/paperTradingLoop add a bounded, dry-run-default market-hours loop
+  that reuses the one-shot. Live trading remains impossible/disabled; orders fire
+  only via --execute-paper, options additionally via --options-mode execute_paper
+  + a verified options capability. npm test never sends an order (fake HTTP /
+  injected clients/clock).
+- Tests: Node built-in test runner (`npm test`), 406/406 passing.
 - No automatic/scheduled provider, market-data, or model calls. Live
   touchpoints are manual scripts only: news smoke check, news one-shot ingest,
   trades smoke check (each run against the live feed at least once), the capped
@@ -964,25 +1036,69 @@ no scheduling/loop yet.
     default claude-opus-4-8). Wiring an OpenAI model id into the Anthropic call is
     incoherent; needs clarification (rename the existing model env var vs. add a
     real OpenAI provider). No OpenAI changes were made.
+- ADVANCED PAPER SLICE SAFETY/LIMITS (committed `b3387d5`):
+  * Still PAPER ONLY. The order client is hard-coded to the paper endpoint; there
+    is no live endpoint, no baseUrl override, no env override. --execute-paper is
+    still required for any order; options need --options-mode execute_paper + a
+    verified account options capability too.
+  * OPTIONS use an EXPLICIT OCC --option-symbol (no contract discovery in this
+    patch). Execution is single-leg LONG calls/puts only — no spreads, no
+    multi-leg, no auto-rolls, no uncovered writing; selling is only ever to close.
+    There is NO options quote feed, so --option-max-premium CANNOT be pre-verified
+    pre-trade; option exposure is bounded by --option-contract-limit only (a
+    market order can fill above the stated premium). PAPER-only, so no real money.
+  * REFERENCE PRICE for equity notional caps comes from the existing Alpaca
+    trades source (latest IEX trade, lagged ~16m). If unavailable, an EQUITY
+    execute is REFUSED (fail-safe); a dry run is allowed with an "unverified"
+    caveat. Margin/short eligibility is inferred from the paper account snapshot
+    (multiplier + equity + options level); it is best-effort, not a broker
+    guarantee.
+  * paper_trades has NO asset_class/option columns (migration 001), so an option
+    fill is stored with ticker=underlying and the OCC symbol/intent in
+    trade_reason text (reported distinctly, stored with a marker). A dedicated
+    options schema + a learning-log table (deferred Part E) would need additive
+    migrations.
+  * The market-hours loop is an APPROXIMATION (no US holiday/half-day calendar)
+    and is bounded (>= 5-min interval, max-iteration cap, dry-run default). It is
+    a foreground manual process — NO daemon/service/Task Scheduler registration.
+  * DEFERRED to later reviewed slices: strategy-settings file (Part G), a
+    learning-log table + reviewPaperLearningOnce, options contract discovery,
+    sell-to-close automation, and OPENAI_MODEL/provider wiring.
+  * NOT YET RUN against the live paper account.
 
 ## Next Recommended Task
-The one-shot paper slice is committed (`df1931f`). The user accelerated to a
-sequence of PAPER phases (each its own reviewed slice, since the advanced ones
-reverse the one-shot slice's long-only/no-options/no-margin constraints). The
-Discord connection-verification + end-of-day report slice is COMMITTED
-(`0bb590c`):
-  - src/notifications/discordWebhookClient.js (injected HTTP, never prints the
-    webhook URL, sanitized errors), config.discord (webhookUrl/serverId/
-    channelId) + .env.example placeholders,
-  - scripts/smokeDiscordWebhook.js (verify the channel connection), and
-  - scripts/sendPaperEodReport.js (read-only EOD summary of paper_trades /
-    rejected_trades; --dry-run prints locally, --send-discord sends only when
-    explicitly requested; safe placeholder when there are no trades yet).
-IMMEDIATE NEXT STEP: verify Discord live — put DISCORD_WEBHOOK_URL in .env and run
-`node --env-file=.env scripts/smokeDiscordWebhook.js` (expect a message in the
-channel), then `node --env-file=.env scripts/sendPaperEodReport.js --dry-run`.
-The local commits (through `0bb590c`) are NOT pushed yet; push when ready.
-Exercise the committed one-shot slice meanwhile:
+Committed so far (NOT pushed): one-shot paper slice (`df1931f`), Discord/EOD
+slice (`0bb590c`), advanced PAPER slice (`b3387d5`) — all 406/406 green, offline.
+
+IN PROGRESS (UNCOMMITTED, pending review): EOD constraint-change recommendations
+— a src/paper/constraintRecommendations.js module + sendPaperEodReport.js
+integration that ANALYZES the day's paper_trades/rejected_trades and RECOMMENDS
+(never auto-applies) conservative, bounded manual `.env` constraint edits, with a
+hard rule that the bot never edits .env/.env.example and never recommends
+LIVE_TRADING_ENABLED=true.
+
+Verify the committed slices live (paper account) carefully:
+  1) DRY RUN advanced (no orders, safe any time):
+     node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL,MSFT,NVDA \
+       --classifier real_model --allow-shorts --allow-options --options-mode plan_only \
+       --max-order-notional 500
+  2) DRY RUN the loop (no orders): same flags via scripts/runPaperTradingLoop.js
+     --interval-minutes 15 --max-iterations 20
+  3) only when intended, during market hours: add --execute-paper (and for options
+     --options-mode execute_paper --option-symbol <OCC>).
+Then verify Discord live: put DISCORD_WEBHOOK_URL in .env, run
+`node --env-file=.env scripts/smokeDiscordWebhook.js`.
+
+REMAINING DEFERRED slices (each its own reviewed task): the FULL learning/strategy
+system (runtime data/strategy-settings.json + learning engine + research-source
+allow-list + scrape-target selector), a learning-log table (additive migration
+004) + reviewPaperLearningOnce, options contract discovery + sell-to-close, and
+the OPENAI_MODEL/provider question. NOTE: most env knobs the EOD recommender
+references (MAX_*_PCT, MAX_OPEN_POSITIONS, PAPER_* flags) are NOT yet wired into
+config.js (which has MAX_*_USD + CLI caps); the recommender suggests them as
+manual edits and marks unset/not-yet-wired ones honestly.
+
+Exercise the committed slices meanwhile:
   1) populate a real-model score (during/after market hours):
      node --env-file=.env scripts/runMvpPipelineOnce.js --classifier real_model \
        --symbols AAPL --ingest-limit 5 --classify-limit 1 --measure-limit 1

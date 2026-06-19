@@ -4,12 +4,24 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (280/280).
+- Stable. All tests passing (319/319).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
+- Phase 5 (PAPER trading) FIRST VERTICAL SLICE is COMMITTED (`df1931f`): a
+  manual one-shot paper-trade path (scripts/runPaperTradingOnce.js + src/paper/*
+  + config + tests + docs). PAPER-only, dry-run by default, live trading still
+  impossible/disabled.
 
 ## Latest Confirmed Commit
-- Latest committed: `67e745f` — feat(measurement): window diagnostics +
+- Latest committed: `df1931f` — feat(paper): manual one-shot PAPER trade
+  vertical slice (Phase 5). Select a real-model-scored event → conservative
+  equity-long / market-buy proposal → minimal risk gate → a single Alpaca PAPER
+  market order ONLY with explicit --execute-paper (dry-run default). Order
+  client hard-wired to the paper endpoint (no live path, no baseUrl override);
+  keys in headers only and redacted from errors. Outcomes persist to
+  migration-001 paper_trades / rejected_trades (no schema change). 39 new
+  network-free tests; 319/319 passing.
+- Previous: `67e745f` — feat(measurement): window diagnostics +
   baseline-lookback widening (manual) (scripts/measureReactionsOnce.js +
   scripts/runMvpPipelineOnce.js + src/eventStudy/measureReactions.js + their
   tests). measureEvent's summary now carries a sanitized `window` block
@@ -23,9 +35,11 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   (STATUS.md only).
 - Previous: `5afd67f` — feat(mvp-pipeline): target fresh events for
   measurement (8 new network-free tests).
+- Previous: `009ed81` — docs(status): record measurement diagnostics +
+  baseline-lookback widening (STATUS.md only).
 - This STATUS update is committed separately as
-  `docs(status): record measurement diagnostics + baseline-lookback widening`
-  (STATUS.md only). (verify committed head with `git log -1 --oneline`)
+  `docs(status): record Phase 5 one-shot paper slice commit` (STATUS.md only).
+  (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
 Phase 2 functionally complete (contract, normalization, four adapter
@@ -53,6 +67,18 @@ research summary, all through existing insert paths, with sanitized output
 and no orders/trading. Measurement still produced no_baseline=6 (no usable
 baseline trade, likely outside market hours), so this proves the real
 end-to-end research WIRING, not signal quality or measured returns.
+Phase 5 (Paper Trading Journal) — FIRST VERTICAL SLICE COMMITTED (`df1931f`).
+The project intentionally accelerated to PAPER
+trading WITHOUT waiting for event-study-ready > 0: a manual one-shot path
+(scripts/runPaperTradingOnce.js) selects one real-model-scored event, builds a
+conservative equity-long / market-buy / whole-share proposal, runs a minimal
+risk gate, and — ONLY with the explicit --execute-paper flag and configured
+paper credentials — submits a single Alpaca PAPER market order, persisting the
+outcome to paper_trades (executed) or rejected_trades (refused). DRY RUN is the
+default and sends nothing. PAPER-ONLY by construction (the order client is
+hard-wired to the paper endpoint; no live endpoint exists anywhere); live
+trading remains impossible/default-disabled. No shorts, no options, no margin,
+no scheduling/loop yet.
 
 ## Completed Work
 - Initial setup (repo, docs, .gitignore, .env.example).
@@ -578,6 +604,50 @@ end-to-end research WIRING, not signal quality or measured returns.
   count; script flag parse/cap, requested-window widening via a recording
   source, sanitized diagnostics rendering, custom-lookback header; pipeline flag
   threading). NOT YET RUN against the live feed during market hours.
+- Phase 5 PAPER-trading first vertical slice (committed as `df1931f`):
+  * src/config.js: new config.alpacaPaper credentials block. It REUSES the
+    existing account-level Alpaca key pair (the same ALPACA_API_KEY_ID/SECRET
+    env vars — no new secrets, so .env.example is unchanged); read only here,
+    never logged/persisted. There is intentionally NO base-URL field — the paper
+    endpoint is hard-coded in the client and there is NO live-endpoint config.
+  * src/paper/alpacaPaperClient.js: the project's first and ONLY order-submitting
+    client. createAlpacaPaperClient(config, {httpFetch}) behind the same safety
+    regime as the read-only Alpaca clients — explicit construction, throws "not
+    configured" without paper keys, injected fetch (npm test fully offline),
+    keys in headers only (never body/logs), sanitized/redacted errors.
+    submitMarketOrder({symbol, qty, side='buy'}) POSTs ONE market order
+    (type 'market', time_in_force 'day') to the HARD-CODED paper endpoint
+    (PAPER_BASE_URL = https://paper-api.alpaca.markets). There is NO baseUrl
+    option and no env override, so it can never point at the live API; returns a
+    sanitized order whitelist (id/status/qty/...), never the raw payload.
+  * src/paper/paperTradeProposal.js: assessProposal() — a PURE risk gate
+    (no DB/network/clock) for the slice's ONLY trade shape: equity LONG, market
+    BUY, whole shares. Rejects (with a clear reason) unless ticker is in the CLI
+    allow-list, parser_status is parsed/fallback_used, direction is 'up' (no
+    shorts), and confidence/impact/sentiment clear conservative DEFAULT_THRESHOLDS
+    (0.6 / 0.5 / 0.3). DEFAULT_QTY=1, MAX_QTY=100 (clampQty). Plus the
+    paper_trades / rejected_trades writers (migration-001 tables; NO schema
+    change) and summarizeScore() which strips raw_response/detail.
+  * scripts/runPaperTradingOnce.js: the manual entry point. parseArgs
+    (--symbols, --qty, --event-id, --confidence/-impact/-sentiment-threshold,
+    --execute-paper); selectRecentScoredEvent() picks one recent model_v1-scored
+    event (whitelisted columns only); runPaperTradeOnce() assesses → on reject
+    writes rejected_trades; on accept+dry-run writes nothing; on accept+execute
+    submits the paper order and writes paper_trades (order errors are recorded
+    sanitized, never written as a trade). DRY RUN default; --execute-paper +
+    configured creds required to send. buildPaperReport() is a sanitized
+    whitelist. CLI-guarded (import runs nothing).
+  * 39 new network-free tests across tests/alpacaPaperClient.test.js,
+    tests/paperTradeProposal.test.js, tests/runPaperTradingOnce.test.js:
+    not-configured throws, paper-endpoint-only (never live, even with
+    liveTradingEnabled config), keys-in-headers-not-body, HTTP/network errors
+    redacted, sanitized order mapping; risk accept/reject rules incl. no-shorts
+    and threshold gates, writers + validation; dry-run sends nothing,
+    --execute-paper required, missing-creds fails safely, fake-HTTP success
+    stores a paper_trade, fake-HTTP error redacted, rejection stores
+    rejected_trades, reports sanitized (no raw response/headline/rationale),
+    zero real network, import safety. package.json registers the 3 files.
+  NOT YET RUN against the live paper account.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -644,7 +714,19 @@ end-to-end research WIRING, not signal quality or measured returns.
   paste-safe measure suggestions. Both are SELECT-only, need no credentials or
   network, never write, and reuse the existing measure command rather than
   measuring themselves.
-- Tests: Node built-in test runner (`npm test`), 280/280 passing.
+- src/paper is the new PAPER-trading layer (Phase 5, committed `df1931f`). It is
+  the ONLY place that can submit an order, and it can only submit to the Alpaca
+  paper endpoint: the order client hard-codes PAPER_BASE_URL and exposes no
+  live-endpoint option, so live trading stays impossible regardless of
+  config.liveTradingEnabled (which still no code consumes for routing). The
+  proposal/risk layer is pure and conservative (equity long, market buy, whole
+  shares, no shorts/options/margin); orders fire only via the manual
+  scripts/runPaperTradingOnce.js with the explicit --execute-paper flag and
+  configured paper credentials. Default is dry-run; npm test never sends an
+  order (injected fake HTTP / fake client only). Outcomes persist through the
+  existing migration-001 paper_trades / rejected_trades tables (no schema
+  change).
+- Tests: Node built-in test runner (`npm test`), 319/319 passing.
 - No automatic/scheduled provider, market-data, or model calls. Live
   touchpoints are manual scripts only: news smoke check, news one-shot ingest,
   trades smoke check (each run against the live feed at least once), the capped
@@ -780,11 +862,77 @@ end-to-end research WIRING, not signal quality or measured returns.
   remains deferred to the market-data client's later step. model_v1 detection
   keys on prompt_version='model_v1' (the real model classifier's signature); a
   future second model prompt version would need this widened.
+- PAPER-TRADING SLICE SAFETY/LIMITS (Phase 5, committed `df1931f`):
+  * PAPER ONLY. The order client targets the hard-coded Alpaca paper endpoint;
+    there is no live endpoint, no baseUrl override, and no env var that can point
+    it at live. Live trading remains impossible/default-disabled. Do NOT add a
+    live path without an explicit, separately reviewed task.
+  * Default is DRY RUN (no order). An order is sent only with --execute-paper AND
+    configured paper credentials. config.alpacaPaper REUSES the account-level
+    ALPACA_API_KEY_ID/SECRET pair (same naming debt as the trades client) — on a
+    paper account these authorize paper trading; if a user's keys were ever live
+    keys, the endpoint is still paper-only so no live order can result, but the
+    keys must be paper-account keys for real use.
+  * The slice is intentionally minimal: equity LONG, market BUY, whole shares,
+    qty hard-capped at 100, conservative score thresholds. No shorts, no options,
+    no margin/notional/buying-power sizing, no take-profit/stop/exit logic, no
+    risk_state/daily-loss/exposure/kill-switch wiring yet (those Phase 6 risk
+    controls are NOT in this slice). The market order has no price guard, so a
+    real execute run fills at the paper market price.
+  * paper_trades stores no broker order_id column (migration 001); the Alpaca
+    order id is kept in trade_reason text and printed in the report, not in a
+    dedicated column. A dedicated column would need a future additive migration.
+  * An accepted DRY RUN writes nothing; a rejection writes rejected_trades in ANY
+    mode (a logged refusal, not an order). Repeated dry runs on a failing event
+    therefore accumulate rejected_trades rows (by design — refusals are data).
+  * NOT YET RUN against the live paper account; selection requires existing
+    real-model (model_v1) scored events, so run the MVP pipeline /
+    classifyNewsOnce --classifier real_model first.
 
 ## Next Recommended Task
-The MVP pipeline now TARGETS FRESH events for measurement (`5afd67f`), so a
-market-hours pipeline run measures the event it just ingested/scored instead of
-defaulting back to event 1. Combined with the measurement-candidate finder
+The one-shot paper slice is committed (`df1931f`). The user accelerated to a
+sequence of PAPER phases (each its own reviewed slice, since the advanced ones
+reverse the one-shot slice's long-only/no-options/no-margin constraints). The
+chosen NEXT slice (currently being built, UNCOMMITTED, pending review) is the
+Discord connection-verification + end-of-day report slice:
+  - src/notifications/discordWebhookClient.js (injected HTTP, never prints the
+    webhook URL, sanitized errors), config.discord (webhookUrl/serverId/
+    channelId) + .env.example placeholders,
+  - scripts/smokeDiscordWebhook.js (verify the channel connection), and
+  - scripts/sendPaperEodReport.js (read-only EOD summary of paper_trades /
+    rejected_trades; --dry-run prints locally, --send-discord sends only when
+    explicitly requested; safe placeholder when there are no trades yet).
+Exercise the committed one-shot slice meanwhile:
+  1) populate a real-model score (during/after market hours):
+     node --env-file=.env scripts/runMvpPipelineOnce.js --classifier real_model \
+       --symbols AAPL --ingest-limit 5 --classify-limit 1 --measure-limit 1
+  2) DRY RUN the paper path (no order, safe any time):
+     node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL
+  3) only during US market hours, and only when you intend to, EXECUTE a paper
+     order:
+     node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL --execute-paper
+
+REMAINING STACKED PHASES (each a separate reviewed slice, in rough order):
+  - market-hours PAPER loop (scripts/runPaperTradingLoop.js +
+    src/paper/marketHours.js) — dry-run default, RTH/weekend gating, interval +
+    max-iteration caps, sanitized heartbeats, graceful shutdown;
+  - advanced equities long/short + margin-aware risk (account-capabilities
+    client, paperRisk, --allow-shorts) — reverses long-only;
+  - paper OPTIONS support (contract discovery or explicit OCC --option-symbol,
+    plan_only default) — biggest risk;
+  - learning log (additive migration 004) + reviewPaperLearningOnce;
+  - strategy-settings file (config/strategy-settings + data/strategy-settings.json,
+    bot never edits .env) + updater.
+  NOTE: a later prompt requested wiring an `OPENAI_MODEL` env var into the
+  classifier, but the real classifier is ANTHROPIC (config.model.classifierModel
+  / MODEL_CLASSIFIER_MODEL, default claude-opus-4-8). Wiring an OpenAI model id
+  into the Anthropic call is incoherent and was DEFERRED pending clarification
+  (rename the existing model env var vs. add a real OpenAI provider).
+
+Separately, the measurement track remains open (lower priority now that paper
+trading is the focus). The MVP pipeline TARGETS FRESH events for measurement
+(`5afd67f`), so a market-hours pipeline run measures the event it just
+ingested/scored instead of defaulting back to event 1. Combined with the measurement-candidate finder
 (`a152a66`), the research-summary readiness counts, and the new window
 diagnostics + `--baseline-lookback-minutes` flag (`67e745f`), the path to the
 first measured rows is now repeatable AND debuggable (the diagnostics show the

@@ -294,7 +294,69 @@ side/qty, the risk decision, and (only if an order was sent) the order id/status
 Never raw model responses, raw payloads, API keys, auth headers, or request
 configs. No options, no shorts, no margin logic, no scheduling, no background
 jobs; never part of `npm test`. The neutral `manual_baseline` score always fails
-the gate, so only real-model `up` signals can ever propose a trade.
+the gate, so only real-model `up` signals can ever propose a trade. With the
+advanced flags below it also proposes **shorts** (direction down) and **options**.
+
+## Advanced PAPER trading (long/short + options + margin)
+
+> **PAPER ONLY.** Shorts, options, and margin sizing all run against the Alpaca
+> **paper** account only. Live trading stays disabled and unsupported; the order
+> client is hard-wired to `paper-api.alpaca.markets`.
+
+The one-shot script also supports short equities (`--allow-shorts`, on a
+margin/short-eligible paper account, model direction **down**), single-leg long
+options by explicit OCC symbol (`--allow-options --option-symbol …`), and
+margin-aware risk caps. Orders still require `--execute-paper`; options additionally
+require `--options-mode execute_paper` **and** a verified account options capability.
+
+Advanced dry-run (no orders):
+
+```
+node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL,MSFT,NVDA --classifier real_model --qty 1 --allow-shorts --allow-options --options-mode plan_only --max-order-notional 500
+```
+
+Advanced paper execution (sends PAPER orders):
+
+```
+node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL,MSFT,NVDA --classifier real_model --qty 1 --allow-shorts --allow-options --options-mode execute_paper --option-symbol <OCC_OPTION_SYMBOL> --max-order-notional 500 --execute-paper
+```
+
+Risk caps (all conservative by default): `--max-order-notional`,
+`--max-symbol-exposure`, `--max-gross-exposure`, `--max-daily-paper-orders`,
+`--max-daily-paper-notional`, `--option-max-premium`. Option controls:
+`--option-symbol` (OCC, **required to execute** — there is no contract discovery
+in this patch), `--option-contract-limit`, `--option-expiry-days-min/-max`.
+Margin-aware risk rejects blocked accounts, shorts without margin/equity
+eligibility, insufficient buying power, and any cap breach (each logged to
+`rejected_trades` with a reason). Options without a quote feed cannot pre-verify
+premium — exposure is bounded by `--option-contract-limit` (paper-only).
+
+## Market-hours PAPER loop
+
+A bounded loop runs the one-shot path on an interval during the US regular
+session only (Mon–Fri 09:30–16:00 ET; weekends skipped). It is **dry-run by
+default**, reuses the one-shot logic, enforces a **≥ 5-minute** interval and a
+max-iteration cap, prints a sanitized heartbeat each iteration, and exits
+cleanly on Ctrl+C. **Holiday limitation:** US market holidays/half-days are
+**not** modeled (no exchange calendar yet) — printed at startup.
+
+Loop dry-run:
+
+```
+node --env-file=.env scripts/runPaperTradingLoop.js --symbols AAPL,MSFT,NVDA --classifier real_model --qty 1 --allow-shorts --allow-options --options-mode plan_only --interval-minutes 15 --max-iterations 20 --max-order-notional 500
+```
+
+Loop paper execution (with an end-of-day Discord report):
+
+```
+node --env-file=.env scripts/runPaperTradingLoop.js --symbols AAPL,MSFT,NVDA --classifier real_model --qty 1 --allow-shorts --allow-options --options-mode execute_paper --option-symbol <OCC_OPTION_SYMBOL> --interval-minutes 15 --max-iterations 20 --max-order-notional 500 --execute-paper --send-discord-eod-report
+```
+
+Extra loop flags: `--interval-minutes` (floored at 5), `--max-iterations`
+(capped), `--run-outside-market-hours true|false` (default false),
+`--send-discord-eod-report` (posts the EOD summary when the loop ends, if
+`DISCORD_WEBHOOK_URL` is set). Never part of `npm test` (the loop core runs with
+injected clock/sleep/market-hours/one-shot — no real timers, no network).
 
 ## Discord end-of-day reports
 

@@ -78,12 +78,40 @@ test('assessProposal rejects when the symbol is not in the CLI allow-list', () =
   assert.match(p.reason, /not in allowed list/);
 });
 
-test('assessProposal rejects a non-up direction (long-only; no shorts)', () => {
-  for (const direction of ['down', 'unclear', null]) {
+test('assessProposal rejects unclear/none direction as not actionable', () => {
+  for (const direction of ['unclear', null]) {
     const p = assessProposal({ event: EVENT, score: strongLong({ direction }), allowedSymbols: ['AAPL'] });
     assert.equal(p.accepted, false);
-    assert.match(p.reason, /is not up/);
+    assert.match(p.reason, /not actionable/);
   }
+});
+
+test('assessProposal rejects a down direction unless --allow-shorts is set', () => {
+  const noShort = assessProposal({
+    event: EVENT, score: strongLong({ direction: 'down', sentiment_score: -0.7 }), allowedSymbols: ['AAPL'],
+  });
+  assert.equal(noShort.accepted, false);
+  assert.match(noShort.reason, /requires --allow-shorts/);
+});
+
+test('assessProposal accepts a short on direction down + allowShorts + negative sentiment', () => {
+  const p = assessProposal({
+    event: EVENT, score: strongLong({ direction: 'down', sentiment_score: -0.7 }),
+    allowedSymbols: ['AAPL'], allowShorts: true, qty: 2,
+  });
+  assert.equal(p.accepted, true);
+  assert.equal(p.side, 'sell');
+  assert.equal(p.quantity, 2);
+  assert.match(p.reason, /short AAPL/);
+});
+
+test('a short still requires sentiment below the negative threshold', () => {
+  const p = assessProposal({
+    event: EVENT, score: strongLong({ direction: 'down', sentiment_score: 0.2 }), // not negative enough
+    allowedSymbols: ['AAPL'], allowShorts: true,
+  });
+  assert.equal(p.accepted, false);
+  assert.match(p.reason, /not below short threshold/);
 });
 
 test('assessProposal rejects unusable parser_status', () => {
@@ -102,7 +130,7 @@ test('assessProposal rejects sub-threshold confidence, impact, and sentiment', (
   assert.match(lowImpact.reason, /impact .* below threshold/);
 
   const lowSent = assessProposal({ event: EVENT, score: strongLong({ sentiment_score: 0.0 }), allowedSymbols: ['AAPL'] });
-  assert.match(lowSent.reason, /sentiment .* below threshold/);
+  assert.match(lowSent.reason, /sentiment .* below long threshold/);
 });
 
 test('the neutral manual-baseline score (direction unclear, zeros) always rejects', () => {

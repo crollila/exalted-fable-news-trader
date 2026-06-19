@@ -1,10 +1,11 @@
 // src/paper/paperTradeProposal.js — Conservative paper-trade proposal + minimal
 // risk gate + DB writers (Phase 5, first vertical slice).
 //
-// SCOPE OF THIS SLICE — deliberately tiny and safe:
-// - Equity LONG only. Market BUY only. Whole shares only.
-// - No shorts, no options, no margin logic, no notional/buying-power sizing
-//   (those are a later, separately reviewed phase).
+// SCOPE — conservative equity proposals (long AND short):
+// - Equity LONG (direction up -> market BUY) and SHORT (direction down ->
+//   market SELL, only when --allow-shorts is enabled). Whole shares only.
+// - Options live in optionsProposal.js; margin/notional sizing lives in
+//   paperRisk.js. assessProposal stays a PURE score/direction gate.
 // - assessProposal is a PURE function (no DB, no network, no clock): given an
 //   event + its sentiment score, it returns an accept/reject decision with a
 //   human-readable reason. The script decides whether to persist/execute.
@@ -22,7 +23,7 @@ export const DEFAULT_QTY = 1;
 /** Hard quantity cap for the first slice — no uncapped trading. */
 export const MAX_QTY = 100;
 
-/** Conservative score gates. A long trade must clear ALL of these. */
+/** Conservative score gates. A long/short trade must clear ALL of these. */
 export const DEFAULT_THRESHOLDS = Object.freeze({
   minConfidence: 0.6,
   minImpact: 0.5,
@@ -69,17 +70,17 @@ export function summarizeScore(score) {
 }
 
 /**
- * Assess a conservative long paper-trade proposal for one scored event.
- * PURE — no DB, no network. Returns a structured decision.
+ * Assess a conservative equity paper-trade proposal (long OR short) for one
+ * scored event. PURE — no DB, no network. Returns a structured decision. This
+ * is the SCORE/DIRECTION gate only; margin/notional/buying-power checks live in
+ * paperRisk.js and run afterward.
  *
- * Rejection rules (in order), each producing a clear reason:
- *   1. missing ticker
- *   2. symbol not in the CLI-provided allowed list
- *   3. parser_status not usable (need parsed/fallback_used)
- *   4. direction is not 'up' (long-only slice; shorts are out of scope)
- *   5. confidence below threshold
- *   6. impact below threshold
- *   7. sentiment below threshold
+ * Direction rules:
+ *   up      -> long (market BUY); requires sentiment >= +minSentiment
+ *   down    -> short (market SELL); requires --allow-shorts AND sentiment <= -minSentiment
+ *   other   -> rejected (unclear/none is not actionable)
+ * Shared gates (both directions): symbol in CLI allow-list, parser_status
+ * parsed/fallback_used, confidence >= minConfidence, impact >= minImpact.
  *
  * @param {object} args
  * @param {{id?: number, ticker?: string}} args.event
@@ -87,24 +88,29 @@ export function summarizeScore(score) {
  * @param {number} [args.qty]              requested shares (clamped here too)
  * @param {string[]} [args.allowedSymbols] CLI allow-list (required to pass)
  * @param {object} [args.thresholds]       overrides for DEFAULT_THRESHOLDS
+ * @param {boolean} [args.allowShorts]     gate for direction-down shorts
  * @returns {{ eventId: number|null, ticker: string, assetClass: 'equity',
- *   side: 'buy', quantity: number, thresholds: object, score: object,
+ *   side: 'buy'|'sell', quantity: number, thresholds: object, score: object,
  *   accepted: boolean, reason: string }}
  */
-export function assessProposal({ event, score, qty = DEFAULT_QTY, allowedSymbols = [], thresholds = {} } = {}) {
+export function assessProposal({
+  event, score, qty = DEFAULT_QTY, allowedSymbols = [], thresholds = {}, allowShorts = false,
+} = {}) {
   const t = { ...DEFAULT_THRESHOLDS, ...(thresholds ?? {}) };
   const ticker = String(event?.ticker ?? '').trim().toUpperCase();
   const quantity = clampQty(qty);
   const allowed = (allowedSymbols ?? []).map((s) => String(s).trim().toUpperCase()).filter(Boolean);
+  const scoreSummary = summarizeScore(score);
+  const direction = scoreSummary.direction;
 
   const base = {
     eventId: Number.isInteger(event?.id) ? event.id : null,
     ticker,
     assetClass: 'equity',
-    side: 'buy', // long-only slice: market BUY only
+    side: direction === 'down' ? 'sell' : 'buy', // intended side (short = sell)
     quantity,
     thresholds: t,
-    score: summarizeScore(score),
+    score: scoreSummary,
   };
   const reject = (reason) => ({ ...base, accepted: false, reason });
 
@@ -112,35 +118,42 @@ export function assessProposal({ event, score, qty = DEFAULT_QTY, allowedSymbols
   if (!allowed.includes(ticker)) {
     return reject(`symbol ${ticker} not in allowed list [${allowed.join(',') || 'none'}]`);
   }
-
-  const status = base.score.parserStatus;
-  if (!USABLE_PARSER_STATUSES.includes(status)) {
-    return reject(`parser_status "${status ?? '(none)'}" not usable (need parsed/fallback_used)`);
+  if (!USABLE_PARSER_STATUSES.includes(scoreSummary.parserStatus)) {
+    return reject(`parser_status "${scoreSummary.parserStatus ?? '(none)'}" not usable (need parsed/fallback_used)`);
   }
 
-  const direction = base.score.direction;
-  if (direction !== 'up') {
-    return reject(`direction "${direction ?? '(none)'}" is not up (long-only slice; no shorts)`);
-  }
-
-  const { confidence, impact, sentiment } = base.score;
+  const { confidence, impact, sentiment } = scoreSummary;
   if (confidence === null || confidence < t.minConfidence) {
     return reject(`confidence ${fmt(confidence)} below threshold ${t.minConfidence}`);
   }
   if (impact === null || impact < t.minImpact) {
     return reject(`impact ${fmt(impact)} below threshold ${t.minImpact}`);
   }
-  if (sentiment === null || sentiment < t.minSentiment) {
-    return reject(`sentiment ${fmt(sentiment)} below threshold ${t.minSentiment}`);
+
+  if (direction === 'up') {
+    if (sentiment === null || sentiment < t.minSentiment) {
+      return reject(`sentiment ${fmt(sentiment)} below long threshold ${t.minSentiment}`);
+    }
+    return {
+      ...base, accepted: true,
+      reason: `long ${ticker}: direction up, confidence ${fmt(confidence)} >= ${t.minConfidence}, ` +
+        `impact ${fmt(impact)} >= ${t.minImpact}, sentiment ${fmt(sentiment)} >= ${t.minSentiment}`,
+    };
   }
 
-  return {
-    ...base,
-    accepted: true,
-    reason:
-      `long ${ticker}: direction up, confidence ${fmt(confidence)} >= ${t.minConfidence}, ` +
-      `impact ${fmt(impact)} >= ${t.minImpact}, sentiment ${fmt(sentiment)} >= ${t.minSentiment}`,
-  };
+  if (direction === 'down') {
+    if (!allowShorts) return reject('direction down requires --allow-shorts (shorts disabled)');
+    if (sentiment === null || sentiment > -t.minSentiment) {
+      return reject(`sentiment ${fmt(sentiment)} not below short threshold ${-t.minSentiment}`);
+    }
+    return {
+      ...base, accepted: true,
+      reason: `short ${ticker}: direction down, confidence ${fmt(confidence)} >= ${t.minConfidence}, ` +
+        `impact ${fmt(impact)} >= ${t.minImpact}, sentiment ${fmt(sentiment)} <= ${-t.minSentiment}`,
+    };
+  }
+
+  return reject(`direction "${direction ?? '(none)'}" is not actionable (need up or down)`);
 }
 
 /**

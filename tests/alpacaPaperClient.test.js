@@ -129,6 +129,7 @@ test('submitMarketOrder returns a sanitized order (no raw payload leakage)', asy
     side: 'buy',
     qty: 1,
     type: 'market',
+    assetClass: null,
     status: 'filled',
     submittedAt: '2026-06-18T14:30:00.000Z',
     filledQty: 1,
@@ -200,8 +201,70 @@ test('submitMarketOrder validates symbol, qty, and side', async () => {
 test('sanitizeOrder tolerates missing fields and never throws', () => {
   assert.deepEqual(sanitizeOrder({}), {
     id: null, clientOrderId: null, symbol: null, side: null, qty: null,
-    type: null, status: null, submittedAt: null, filledQty: null, filledAvgPrice: null,
+    type: null, assetClass: null, status: null, submittedAt: null, filledQty: null, filledAvgPrice: null,
   });
+});
+
+// --- account / positions snapshots -----------------------------------------
+
+test('getAccount parses a sanitized snapshot and uses the paper endpoint', async () => {
+  const { fetchFn, calls } = fakeFetch(() => ({
+    ok: true, status: 200,
+    json: async () => ({
+      id: 'acct_1', status: 'ACTIVE', equity: '30000', cash: '10000', buying_power: '60000',
+      multiplier: '2', portfolio_value: '30000', pattern_day_trader: false,
+      trading_blocked: false, account_blocked: false, options_trading_level: 2,
+      secret: 'RAW-MUST-NOT-APPEAR',
+    }),
+  }));
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  const acct = await client.getAccount();
+  assert.ok(calls[0].url.startsWith('https://paper-api.alpaca.markets/v2/account'));
+  assert.equal(calls[0].init.method, 'GET');
+  assert.equal(acct.equity, 30000);
+  assert.equal(acct.buyingPower, 60000);
+  assert.equal(acct.multiplier, 2);
+  assert.equal(acct.optionsTradingLevel, 2);
+  assert.equal(acct.tradingBlocked, false);
+  assert.ok(!Object.prototype.hasOwnProperty.call(acct, 'secret'));
+});
+
+test('getPositions parses a sanitized array', async () => {
+  const { fetchFn, calls } = fakeFetch(() => ({
+    ok: true, status: 200,
+    json: async () => [
+      { symbol: 'AAPL', qty: '10', side: 'long', market_value: '2000', cost_basis: '1900', unrealized_pl: '100', unrealized_plpc: '0.05', asset_class: 'us_equity' },
+    ],
+  }));
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  const pos = await client.getPositions();
+  assert.ok(calls[0].url.startsWith('https://paper-api.alpaca.markets/v2/positions'));
+  assert.equal(pos.length, 1);
+  assert.equal(pos[0].symbol, 'AAPL');
+  assert.equal(pos[0].marketValue, 2000);
+  assert.equal(pos[0].unrealizedPl, 100);
+});
+
+// --- equity short + option orders ------------------------------------------
+
+test('submitMarketOrder sends a short (sell) equity order', async () => {
+  const { fetchFn, calls } = fakeFetch(() => okOrder({ side: 'sell' }));
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  await client.submitMarketOrder({ symbol: 'AAPL', qty: 2, side: 'sell' });
+  assert.equal(JSON.parse(calls[0].init.body).side, 'sell');
+  assert.ok(calls[0].url.startsWith(PAPER_BASE_URL));
+});
+
+test('submitOptionMarketOrder posts an OCC option order and validates the symbol', async () => {
+  const { fetchFn, calls } = fakeFetch(() => okOrder({ symbol: 'AAPL260116C00150000', asset_class: 'us_option' }));
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  const order = await client.submitOptionMarketOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'buy' });
+  const body = JSON.parse(calls[0].init.body);
+  assert.equal(body.symbol, 'AAPL260116C00150000');
+  assert.equal(body.type, 'market');
+  assert.equal(order.assetClass, 'us_option');
+  await assert.rejects(() => client.submitOptionMarketOrder({ optionSymbol: 'NOTANOCC', qty: 1 }), /OCC option symbol/);
+  await assert.rejects(() => client.submitOptionMarketOrder({ optionSymbol: 'AAPL260116C00150000', qty: 0 }), /positive integer/);
 });
 
 test('importing the client module performs no network and requires no credentials', () => {

@@ -4,24 +4,28 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (269/269).
+- Stable. All tests passing (280/280).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 
 ## Latest Confirmed Commit
-- Latest committed: `5afd67f` — feat(mvp-pipeline): target fresh events for
-  measurement (scripts/runMvpPipelineOnce.js + tests/runMvpPipelineOnce.test.js +
-  README.md). The MVP pipeline's measurement stage now targets fresh/current-run
-  events (explicit --measure-ids > inserted ids > classified ids > fallback)
-  instead of repeatedly re-measuring the oldest event; selection source is
-  printed in the report. 8 new network-free tests; 269/269 passing.
-- Previous: `1c64794` — docs(status): record measurement-candidate finder commit
+- Latest committed: `67e745f` — feat(measurement): window diagnostics +
+  baseline-lookback widening (manual) (scripts/measureReactionsOnce.js +
+  scripts/runMvpPipelineOnce.js + src/eventStudy/measureReactions.js + their
+  tests). measureEvent's summary now carries a sanitized `window` block
+  (baseline-lookback start, reaction-window end, lookback ms, and the COUNT of
+  trades the source returned — null on source_error). A new opt-in
+  `--baseline-lookback-minutes N` flag (capped at 390 = one RTH session) widens
+  the baseline search on the thin IEX feed; default behavior unchanged. Engine
+  change is additive (no schema/measurement_status change). 11 new network-free
+  tests; 280/280 passing.
+- Previous: `8bef1f9` — docs(status): record MVP pipeline targeting fix
   (STATUS.md only).
-- Previous: `a152a66` — feat(eventstudy): add measurement-candidate finder
-  (15 network-free tests).
+- Previous: `5afd67f` — feat(mvp-pipeline): target fresh events for
+  measurement (8 new network-free tests).
 - This STATUS update is committed separately as
-  `docs(status): record MVP pipeline targeting fix` (STATUS.md only).
-  (verify committed head with `git log -1 --oneline`)
+  `docs(status): record measurement diagnostics + baseline-lookback widening`
+  (STATUS.md only). (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
 Phase 2 functionally complete (contract, normalization, four adapter
@@ -551,6 +555,29 @@ end-to-end research WIRING, not signal quality or measured returns.
   ingest is skipped, explicit-ids-win, duplicate-only-ingest avoids event 1,
   report shows selection source, and headline redaction. No model/live calls in
   npm test. NOT YET RUN against the live feed.
+- Measurement window diagnostics + baseline-lookback widening
+  (src/eventStudy/measureReactions.js + scripts/measureReactionsOnce.js +
+  scripts/runMvpPipelineOnce.js), committed as `67e745f`: to debug the
+  all-no_baseline outcomes on the thin IEX feed, measureEvent's returned summary
+  now includes a sanitized `window` block — baseline-lookback start
+  (baselineFromIso), final reaction-window end (reactionToIso), the lookback ms
+  used, the price source name, and the COUNT of trades the source returned
+  (tradeCount; stays null on source_error, never invented). The two manual
+  measurement scripts render this as a "window diagnostics" section and a
+  `lookback:` header line (counts/timestamps/source only — never prices, raw
+  trade payloads, or secrets). A new opt-in `--baseline-lookback-minutes N` flag
+  on both measureReactionsOnce.js and runMvpPipelineOnce.js widens how far back
+  the engine looks for a baseline trade; it is null by default (engine default
+  15m, behavior unchanged) and capped to [1, 390] minutes (one full regular
+  session) so the requested trade window can never balloon. A wider lookback
+  only moves the REQUESTED baseline-window start earlier — it never changes
+  horizon targets, the anchor (received_at), measurement_status semantics, the
+  selected event, or any look-ahead guarantee. The engine summary change is
+  additive (no schema/migration change); 11 new network-free tests (engine
+  window diagnostics + a wider-lookback baseline rescue + source_error null
+  count; script flag parse/cap, requested-window widening via a recording
+  source, sanitized diagnostics rendering, custom-lookback header; pipeline flag
+  threading). NOT YET RUN against the live feed during market hours.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -617,7 +644,7 @@ end-to-end research WIRING, not signal quality or measured returns.
   paste-safe measure suggestions. Both are SELECT-only, need no credentials or
   network, never write, and reuse the existing measure command rather than
   measuring themselves.
-- Tests: Node built-in test runner (`npm test`), 269/269 passing.
+- Tests: Node built-in test runner (`npm test`), 280/280 passing.
 - No automatic/scheduled provider, market-data, or model calls. Live
   touchpoints are manual scripts only: news smoke check, news one-shot ingest,
   trades smoke check (each run against the live feed at least once), the capped
@@ -695,7 +722,16 @@ end-to-end research WIRING, not signal quality or measured returns.
   likely outside market hours), so the price/timestamp/return mapping has
   STILL not been exercised on real measured ticks. A market-hours rerun that
   yields measured rows with actual returns remains an open low-priority
-  follow-up.
+  follow-up. The new window diagnostics + `--baseline-lookback-minutes` flag
+  (`67e745f`) exist specifically to debug/reduce those no_baseline outcomes when
+  that rerun happens.
+- The measurement diagnostic `trades seen` is the COUNT of trades the source
+  returned for the WHOLE fetched window (baseline-lookback start through the
+  furthest horizon target), not a per-horizon count. It is a coarse
+  "did we get any ticks?" signal for diagnosing no_baseline, not a per-horizon
+  measure. `--baseline-lookback-minutes` is capped at 390; very wide windows can
+  still hit the trades client's hard page cap, which surfaces as a sanitized
+  source_error (stored as data), never a silent truncation.
 - The DEFAULT scorer is still the NEUTRAL placeholder (all-zero sentiment/
   impact/confidence, direction "unclear"). It proves the loop carries a score
   but carries NO predictive content — nothing downstream should treat
@@ -749,9 +785,11 @@ end-to-end research WIRING, not signal quality or measured returns.
 The MVP pipeline now TARGETS FRESH events for measurement (`5afd67f`), so a
 market-hours pipeline run measures the event it just ingested/scored instead of
 defaulting back to event 1. Combined with the measurement-candidate finder
-(`a152a66`) and the research-summary readiness counts, the path to the first
-measured rows is now repeatable. All of this is still NOT YET RUN against the
-live feed during market hours.
+(`a152a66`), the research-summary readiness counts, and the new window
+diagnostics + `--baseline-lookback-minutes` flag (`67e745f`), the path to the
+first measured rows is now repeatable AND debuggable (the diagnostics show the
+exact window and trade count behind each no_baseline). All of this is still NOT
+YET RUN against the live feed during market hours.
 
 Recommended next step: during US market hours, RUN the fixed pipeline to land
 the first MARKET-HOURS measured rows so real model scores and real measured

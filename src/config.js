@@ -80,6 +80,20 @@ export function loadConfig(env = process.env) {
       anthropicApiKey: env.ANTHROPIC_API_KEY || null,
       classifierModel: env.MODEL_CLASSIFIER_MODEL || 'claude-opus-4-8',
     }),
+    // Alpaca PAPER-trading credentials. Reuses the account-level Alpaca key
+    // pair (the SAME ALPACA_API_KEY_ID/SECRET env vars the news + trades
+    // clients use) — on a paper account these keys authorize the paper trading
+    // API, so no new secrets are required. Read ONLY here; held in memory only;
+    // never logged, printed, persisted, or normalized. Both null by default so
+    // the paper client must throw "not configured" rather than auto-enabling.
+    //
+    // IMPORTANT: there is intentionally NO base-URL field here. The paper
+    // endpoint is hard-coded inside src/paper/alpacaPaperClient.js and there is
+    // NO live-endpoint configuration anywhere — live trading stays impossible.
+    alpacaPaper: Object.freeze({
+      keyId: env.ALPACA_API_KEY_ID || null,
+      secretKey: env.ALPACA_API_SECRET_KEY || null,
+    }),
     risk: Object.freeze({
       maxDailyLossUsd: Number(env.MAX_DAILY_LOSS_USD ?? 100),
       maxPositionSizeUsd: Number(env.MAX_POSITION_SIZE_USD ?? 500),

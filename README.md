@@ -250,6 +250,52 @@ existing per-stage sanitized reports — never keys, headers, request URLs, raw
 trade payloads, raw news payloads, or raw model responses. Never part of
 `npm test`, no polling, no scheduling.
 
+## Manual PAPER trading (one-shot)
+
+> **PAPER ONLY.** This path submits orders to the Alpaca **paper** endpoint
+> only. Live trading is disabled by default and is **not supported** by this
+> script or its order client — the endpoint is hard-coded to
+> `https://paper-api.alpaca.markets` and nothing here can point at the live API.
+
+An eighth manual-only script turns one **real-model-scored** news event into a
+conservative paper-trade proposal, runs a minimal risk gate, and — only when you
+explicitly ask — submits a single PAPER market order.
+
+Dry run (the default — prints the proposal/decision, **sends no order**, needs
+no trading credentials):
+
+```
+node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL
+```
+
+Execute a PAPER order (requires Alpaca paper credentials in `.env`):
+
+```
+node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL --execute-paper
+```
+
+It selects one recent event scored by the real model (`prompt_version=model_v1`)
+whose ticker is in `--symbols`, then builds an **equity long, market buy, whole
+shares** proposal. The risk gate **rejects** unless: the ticker is in the
+`--symbols` allow-list, the parser status is `parsed`/`fallback_used`, the model
+direction is `up` (long-only — **no shorts**), and confidence/impact/sentiment
+clear conservative thresholds. Rejections are written to `rejected_trades` with a
+reason; an executed order is written to `paper_trades`. An accepted **dry run**
+writes nothing and stops before any order.
+
+Flags: `--symbols A,B` (allow-list), `--qty N` (default 1, hard-capped at 100),
+`--event-id N` (target a specific scored event), `--confidence-threshold`,
+`--impact-threshold`, `--sentiment-threshold` (each a 0–1 float), and
+`--execute-paper` (off by default). To populate scored events first, run the MVP
+pipeline / `classifyNewsOnce.js` with `--classifier real_model`.
+
+Output is sanitized — event id, ticker, model/prompt, numeric scores, proposed
+side/qty, the risk decision, and (only if an order was sent) the order id/status.
+Never raw model responses, raw payloads, API keys, auth headers, or request
+configs. No options, no shorts, no margin logic, no scheduling, no background
+jobs; never part of `npm test`. The neutral `manual_baseline` score always fails
+the gate, so only real-model `up` signals can ever propose a trade.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

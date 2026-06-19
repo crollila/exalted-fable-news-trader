@@ -38,8 +38,12 @@ function seedActivity(db) {
 
 // --- arg parsing -----------------------------------------------------------
 
-test('parseArgs defaults to a local dry run (no send)', () => {
-  assert.deepEqual(parseArgs([]), { day: null, send: false, testMessage: false, dryRun: false });
+test('parseArgs defaults to a local dry run (no send), recommendations on', () => {
+  assert.deepEqual(parseArgs([]), {
+    day: null, send: false, testMessage: false, dryRun: false, includeRecommendations: true,
+  });
+  assert.equal(parseArgs(['--no-constraint-recommendations']).includeRecommendations, false);
+  assert.equal(parseArgs(['--include-constraint-recommendations']).includeRecommendations, true);
 });
 
 test('parseArgs reads --day, --send-discord, --test-message, --dry-run', () => {
@@ -191,6 +195,74 @@ test('the full path runs with zero real network', async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// --- constraint recommendations section ------------------------------------
+
+const SAMPLE_REC = {
+  variable: 'MAX_TRADE_NOTIONAL_PCT', action: 'decrease', currentValue: 0.01, recommendedValue: 0.0075,
+  reason: 'losing day; reduce per-trade notional', confidence: 'medium', urgency: 'recommended',
+  evidence: { winningTrades: 0, losingTrades: 2, ordersSubmitted: 2, rejectedCount: 1 },
+  manualEditLine: 'MAX_TRADE_NOTIONAL_PCT=0.0075',
+};
+
+test('buildEodReport renders the recommendations section + caution when recommendations are passed', () => {
+  const db = freshDb();
+  seedActivity(db);
+  const text = buildEodReport(collectEodData(db, { day: null }), { recommendations: [SAMPLE_REC] }).join('\n');
+  assert.match(text, /Recommended manual \.env changes/);
+  assert.match(text, /MAX_TRADE_NOTIONAL_PCT=0.0075/);
+  assert.match(text, /The bot did not edit \.env\. These are recommendations only\./);
+  closeDatabase(db);
+});
+
+test('buildEodReport shows the no-change message for an empty recommendations array', () => {
+  const db = freshDb();
+  const text = buildEodReport(collectEodData(db, { day: null }), { recommendations: [] }).join('\n');
+  assert.match(text, /No manual \.env constraint changes recommended today\./);
+  closeDatabase(db);
+});
+
+test('runEodReport includes a recommendations section by default and can suppress it', async () => {
+  const db = freshDb();
+  seedActivity(db); // includes "no shorts" rejections -> triggers a recommendation
+  const withRecs = await runEodReport(db, { day: null });
+  assert.match(withRecs.content, /Recommended manual \.env changes/);
+  assert.ok(Array.isArray(withRecs.recommendations));
+
+  const without = await runEodReport(db, { day: null, includeRecommendations: false });
+  assert.ok(!without.content.includes('Recommended manual .env changes'));
+  assert.equal(without.recommendations, null);
+  closeDatabase(db);
+});
+
+test('recommendations never enable live trading (even if currently enabled, recommend false)', async () => {
+  const db = freshDb();
+  seedActivity(db);
+  const r = await runEodReport(db, { day: null, currentConstraints: { LIVE_TRADING_ENABLED: 'true' } });
+  assert.match(r.content, /LIVE_TRADING_ENABLED=false/);
+  assert.ok(!r.content.includes('LIVE_TRADING_ENABLED=true'));
+  // No recommendation line may ever propose enabling live trading.
+  for (const rec of r.recommendations) assert.notEqual(rec.manualEditLine, 'LIVE_TRADING_ENABLED=true');
+  closeDatabase(db);
+});
+
+test('the recommendations section adds no secrets/raw content to the report', async () => {
+  const db = freshDb();
+  // Seed a sentiment score with raw text; the report (incl. recommendations) must not surface it.
+  db.prepare(
+    `INSERT INTO news_events (provider, provider_event_id, ticker, headline, published_at, received_at, news_type)
+     VALUES ('t','e1','AAPL','SECRET-HEADLINE-MUST-NOT-PRINT','2026-06-18T14:00:00.000Z','2026-06-18T14:00:00.000Z','other')`
+  ).run();
+  db.prepare(
+    `INSERT INTO sentiment_scores (news_event_id, model, prompt_version, raw_response, parse_ok, parser_status)
+     VALUES (1,'m','model_v1','RAW-MODEL-RESPONSE-MUST-NOT-PRINT',1,'parsed')`
+  ).run();
+  seedActivity(db);
+  const r = await runEodReport(db, { day: null });
+  assert.ok(!r.content.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
+  assert.ok(!r.content.includes('RAW-MODEL-RESPONSE-MUST-NOT-PRINT'));
+  closeDatabase(db);
 });
 
 test('importing the script performs no network and requires no credentials', () => {

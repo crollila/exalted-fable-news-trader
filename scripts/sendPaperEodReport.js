@@ -25,6 +25,10 @@ import { loadConfig } from '../src/config.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { createDiscordWebhookClient } from '../src/notifications/discordWebhookClient.js';
+import {
+  buildConstraintRecommendations,
+  formatRecommendationsSection,
+} from '../src/paper/constraintRecommendations.js';
 
 /** Short message used by --test-message (proves delivery without a full report). */
 export const EOD_TEST_MESSAGE =
@@ -37,9 +41,10 @@ const LIST_CAP = 10;
  * Parse CLI args. Exported for tests. Dry run is the default; an actual send
  * happens only when --send-discord (or --test-message) is explicitly present.
  *   --day YYYY-MM-DD   --dry-run   --send-discord   --test-message
+ *   --include-constraint-recommendations (default on)   --no-constraint-recommendations
  */
 export function parseArgs(argv) {
-  const args = { day: null, send: false, testMessage: false, dryRun: false };
+  const args = { day: null, send: false, testMessage: false, dryRun: false, includeRecommendations: true };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     if (flag === '--day' && argv[i + 1]) {
@@ -52,6 +57,10 @@ export function parseArgs(argv) {
       args.testMessage = true;
     } else if (flag === '--dry-run') {
       args.dryRun = true;
+    } else if (flag === '--include-constraint-recommendations') {
+      args.includeRecommendations = true;
+    } else if (flag === '--no-constraint-recommendations') {
+      args.includeRecommendations = false;
     }
   }
   return args;
@@ -96,6 +105,9 @@ export function collectEodData(db, { day = null } = {}) {
   const shortCount = trades.filter((t) => t.side === 'sell').length;
   const fills = trades.filter((t) => t.fill_price !== null && t.fill_price !== undefined).length;
   const realizedPnl = trades.reduce((sum, t) => sum + (Number(t.pnl_usd) || 0), 0);
+  // Win/loss counts over ALL trades (used by the constraint recommender).
+  const winningTrades = trades.filter((t) => Number(t.pnl_usd) > 0).length;
+  const losingTrades = trades.filter((t) => Number(t.pnl_usd) < 0).length;
 
   // Recurring rejection reasons, most common first.
   const reasonCounts = {};
@@ -117,6 +129,8 @@ export function collectEodData(db, { day = null } = {}) {
     fills,
     optionsCount: 0, // options not implemented in this slice
     realizedPnl: round2(realizedPnl),
+    winningTrades,
+    losingTrades,
     rejectedCount: rejections.length,
     proposals: trades.length + rejections.length, // proxy until a learning log exists
     rejectionReasons,
@@ -139,7 +153,7 @@ export function collectEodData(db, { day = null } = {}) {
  * next-day ideas) derived ONLY from the counts above — no model calls, no free
  * text beyond our own rejection-reason strings.
  */
-export function buildEodReport(data, { day = null } = {}) {
+export function buildEodReport(data, { day = null, recommendations = null } = {}) {
   const label = day ?? data.day ?? '(all-time)';
   const lines = [
     `ExaltedFable — End-of-Day PAPER report (${label})`,
@@ -153,6 +167,7 @@ export function buildEodReport(data, { day = null } = {}) {
       'This report still proves Discord delivery; once the paper loop runs and',
       'writes paper_trades / rejected_trades, the full narrative appears here.',
     );
+    if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
     return lines;
   }
 
@@ -212,6 +227,7 @@ export function buildEodReport(data, { day = null } = {}) {
     `  Re-run during market hours; ${data.bestTicker ? `watch ${data.bestTicker}; ` : ''}` +
       'consider tightening/loosening thresholds per the refusal pattern (manually).',
   );
+  if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
   return lines;
 }
 
@@ -229,12 +245,19 @@ export function buildEodReport(data, { day = null } = {}) {
  */
 export async function runEodReport(
   db,
-  { day = null, send = false, testMessage = false, discordClient = null } = {}
+  {
+    day = null, send = false, testMessage = false, discordClient = null,
+    includeRecommendations = true, currentConstraints = {}, minSampleSize,
+  } = {}
 ) {
   const data = collectEodData(db, { day });
-  const lines = buildEodReport(data, { day });
+  // Recommendations are READ-ONLY analysis; they never edit .env or any file.
+  const recResult = includeRecommendations
+    ? buildConstraintRecommendations({ data, current: currentConstraints, minSampleSize })
+    : null;
+  const lines = buildEodReport(data, { day, recommendations: recResult ? recResult.recommendations : null });
   const content = lines.join('\n');
-  const result = { day, data, lines, content, sent: false };
+  const result = { day, data, lines, content, recommendations: recResult ? recResult.recommendations : null, sent: false };
 
   if (send || testMessage) {
     if (!discordClient) {
@@ -249,8 +272,22 @@ export async function runEodReport(
   return result;
 }
 
+/**
+ * Build the sanitized map of CURRENT .env constraint values for the recommender.
+ * Reads through config ONLY (never the raw .env). Only the knobs the system
+ * actually wires are populated; the rest stay unset so the recommender marks
+ * them "(not set)" rather than inventing a current value. LIVE_TRADING_ENABLED is
+ * surfaced so the recommender can insist it stays false (it never emits true).
+ */
+export function currentConstraintsFromConfig(config) {
+  return {
+    MAX_TRADES_PER_DAY: config?.risk?.maxTradesPerDay ?? null,
+    LIVE_TRADING_ENABLED: config?.liveTradingEnabled ? 'true' : 'false',
+  };
+}
+
 async function main() {
-  const { day, send, testMessage } = parseArgs(process.argv.slice(2));
+  const { day, send, testMessage, includeRecommendations } = parseArgs(process.argv.slice(2));
   const config = loadConfig();
   const wantSend = send || testMessage;
 
@@ -275,7 +312,11 @@ async function main() {
       discordClient = createDiscordWebhookClient(config);
     }
 
-    const result = await runEodReport(db, { day, send, testMessage, discordClient });
+    const result = await runEodReport(db, {
+      day, send, testMessage, discordClient,
+      includeRecommendations,
+      currentConstraints: currentConstraintsFromConfig(config),
+    });
     for (const line of result.lines) console.log(line);
     if (result.sent) {
       console.log(testMessage ? 'Discord test message SENT.' : 'EOD report SENT to Discord.');

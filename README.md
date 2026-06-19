@@ -413,6 +413,44 @@ when a send is requested. Never part of `npm test` (tests use fake HTTP only).
 > Strategy parameters will live in a separate settings file (planned), **not**
 > in `.env` — the bot never edits `.env`. Live trading remains disabled.
 
+### Recommended manual `.env` changes
+
+The EOD report ends with a **“Recommended manual .env changes”** section. The bot
+analyzes the day's `paper_trades` / `rejected_trades` and, **only if useful**,
+suggests conservative, bounded edits to your risk constraints — for example:
+
+```
+— Recommended manual .env changes —
+  • MAX_TRADE_NOTIONAL_PCT: decrease  (current 0.01 -> 0.0075)  [recommended, confidence medium]
+      reason: Net realized P&L was negative (-120) with 2 losing vs 1 winning trade(s); reduce per-trade notional until win rate improves.
+      evidence: wins=1 losses=2 orders=3 rejections=0
+      edit:   MAX_TRADE_NOTIONAL_PCT=0.0075
+  The bot did not edit .env. These are recommendations only.
+```
+
+If nothing is warranted it prints **“No manual .env constraint changes
+recommended today.”** Key guarantees:
+
+- **The bot NEVER edits `.env` or `.env.example`.** It only prints/sends the
+  exact line you could change by hand; you review and edit it yourself.
+- Changes are **bounded** (percentages ±25%, count limits ±20%, thresholds ±0.05
+  per day) and **conservative** — it lowers risk readily after losses, repeated
+  rejections, drawdowns, or excessive order frequency, and only suggests a small
+  bounded *increase* after strong positive evidence over enough trades.
+- It **never recommends enabling live trading**. If `LIVE_TRADING_ENABLED` ever
+  appears it is only ever recommended to stay `false`.
+- Recommendable knobs include `MAX_POSITION_PCT`, `MAX_TRADE_NOTIONAL_PCT`,
+  `MAX_DAILY_LOSS_PCT`, `MAX_TOTAL_EXPOSURE_PCT`, `MAX_TRADES_PER_DAY`,
+  `MAX_OPEN_POSITIONS`, and paper flags (`ALLOW_SHORTS`, `PAPER_OPTIONS_MODE`,
+  `PAPER_CONFIDENCE_THRESHOLD`, `PAPER_IMPACT_THRESHOLD`,
+  `PAPER_SENTIMENT_THRESHOLD`, …). Note: most of these are **not yet wired** into
+  the bot (the live caps today are CLI flags + the `MAX_*_USD` vars), so a
+  recommendation usually means *introduce/define this variable*, shown with
+  `current (not set)`.
+
+The same section is included in the Discord message (sanitized; truncated to
+Discord's length limit). Suppress it with `--no-constraint-recommendations`.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

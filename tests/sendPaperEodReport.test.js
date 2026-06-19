@@ -1,0 +1,200 @@
+// tests/sendPaperEodReport.test.js — Network-free tests for the end-of-day
+// PAPER report. Importing the script runs NOTHING (CLI guard). The DB-touching
+// tests use an in-memory database; the send path uses a FAKE Discord client, so
+// npm test never touches the network and never posts to Discord.
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { openMemoryDatabase, closeDatabase } from '../src/database/db.js';
+import { runMigrations } from '../src/database/migrations.js';
+import { insertPaperTrade, insertRejectedTrade } from '../src/paper/paperTradeProposal.js';
+import {
+  parseArgs,
+  collectEodData,
+  buildEodReport,
+  runEodReport,
+  EOD_TEST_MESSAGE,
+} from '../scripts/sendPaperEodReport.js';
+
+function freshDb() {
+  const db = openMemoryDatabase();
+  runMigrations(db);
+  return db;
+}
+
+/** A fake Discord client that records what it was asked to send. */
+function fakeDiscord() {
+  const sent = [];
+  return { sent, send: async ({ content }) => { sent.push(content); return { ok: true, status: 204 }; } };
+}
+
+function seedActivity(db) {
+  insertPaperTrade(db, { ticker: 'AAPL', side: 'buy', quantity: 1, fillPrice: 201.5, tradeReason: 'long AAPL', status: 'open' });
+  insertPaperTrade(db, { ticker: 'MSFT', side: 'buy', quantity: 2, fillPrice: null, tradeReason: 'long MSFT', status: 'open' });
+  insertRejectedTrade(db, { ticker: 'NVDA', side: 'buy', quantity: 1, reason: 'direction "down" is not up (long-only slice; no shorts)' });
+  insertRejectedTrade(db, { ticker: 'TSLA', side: 'buy', quantity: 1, reason: 'direction "down" is not up (long-only slice; no shorts)' });
+  insertRejectedTrade(db, { ticker: 'AMD', side: 'buy', quantity: 1, reason: 'confidence 0.2 below threshold 0.6' });
+}
+
+// --- arg parsing -----------------------------------------------------------
+
+test('parseArgs defaults to a local dry run (no send)', () => {
+  assert.deepEqual(parseArgs([]), { day: null, send: false, testMessage: false, dryRun: false });
+});
+
+test('parseArgs reads --day, --send-discord, --test-message, --dry-run', () => {
+  const a = parseArgs(['--day', '2026-06-18', '--send-discord']);
+  assert.equal(a.day, '2026-06-18');
+  assert.equal(a.send, true);
+  assert.equal(parseArgs(['--test-message']).testMessage, true);
+  assert.equal(parseArgs(['--dry-run']).dryRun, true);
+  // A malformed day is ignored (stays null → all-time).
+  assert.equal(parseArgs(['--day', 'nope']).day, null);
+});
+
+// --- data collection -------------------------------------------------------
+
+test('collectEodData aggregates paper_trades and rejected_trades (all-time)', () => {
+  const db = freshDb();
+  seedActivity(db);
+  const data = collectEodData(db, { day: null });
+  assert.equal(data.ordersSubmitted, 2);
+  assert.equal(data.longCount, 2);
+  assert.equal(data.shortCount, 0);
+  assert.equal(data.fills, 1); // only AAPL had a fill price
+  assert.equal(data.rejectedCount, 3);
+  assert.equal(data.proposals, 5);
+  assert.equal(data.optionsCount, 0);
+  // Recurring reason surfaces first.
+  assert.equal(data.rejectionReasons[0].n, 2);
+  assert.match(data.rejectionReasons[0].reason, /is not up/);
+  closeDatabase(db);
+});
+
+test('collectEodData filters by trading day when given one', () => {
+  const db = freshDb();
+  // Insert two rows on different days via explicit created_at.
+  db.prepare(
+    `INSERT INTO paper_trades (ticker, side, quantity, status, created_at)
+     VALUES ('AAPL','buy',1,'open','2026-06-18T20:00:00.000Z')`
+  ).run();
+  db.prepare(
+    `INSERT INTO paper_trades (ticker, side, quantity, status, created_at)
+     VALUES ('AAPL','buy',1,'open','2026-06-17T20:00:00.000Z')`
+  ).run();
+  assert.equal(collectEodData(db, { day: '2026-06-18' }).ordersSubmitted, 1);
+  assert.equal(collectEodData(db, { day: null }).ordersSubmitted, 2);
+  closeDatabase(db);
+});
+
+// --- report rendering ------------------------------------------------------
+
+test('buildEodReport includes the required narrative sections and figures', () => {
+  const db = freshDb();
+  seedActivity(db);
+  const text = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
+  assert.match(text, /End-of-Day PAPER report \(2026-06-18\)/);
+  assert.match(text, /PAPER trading only\. Live trading disabled\./);
+  assert.match(text, /What the bot did/);
+  assert.match(text, /Why it did it/);
+  assert.match(text, /What went well/);
+  assert.match(text, /What went poorly/);
+  assert.match(text, /Mistakes \/ lessons/);
+  assert.match(text, /Ideas for next trading day/);
+  assert.match(text, /orders submitted:                2/);
+  assert.match(text, /rejected:                        3/);
+  closeDatabase(db);
+});
+
+test('buildEodReport prints a safe placeholder when there is no activity', () => {
+  const db = freshDb();
+  const text = buildEodReport(collectEodData(db, { day: null }), {}).join('\n');
+  assert.match(text, /No paper-trading records for this day yet/);
+  assert.match(text, /proves Discord delivery/);
+  closeDatabase(db);
+});
+
+// --- send vs dry run -------------------------------------------------------
+
+test('runEodReport dry run builds the report and sends nothing', async () => {
+  const db = freshDb();
+  seedActivity(db);
+  const discord = fakeDiscord();
+  const result = await runEodReport(db, { day: null, send: false, discordClient: discord });
+  assert.equal(result.sent, false);
+  assert.equal(discord.sent.length, 0);
+  assert.ok(result.content.includes('End-of-Day PAPER report'));
+  closeDatabase(db);
+});
+
+test('runEodReport with send posts the full report through the Discord client', async () => {
+  const db = freshDb();
+  seedActivity(db);
+  const discord = fakeDiscord();
+  const result = await runEodReport(db, { day: null, send: true, discordClient: discord });
+  assert.equal(result.sent, true);
+  assert.equal(discord.sent.length, 1);
+  assert.ok(discord.sent[0].includes('End-of-Day PAPER report'));
+  closeDatabase(db);
+});
+
+test('runEodReport --test-message sends only the short test string', async () => {
+  const db = freshDb();
+  const discord = fakeDiscord();
+  const result = await runEodReport(db, { testMessage: true, discordClient: discord });
+  assert.equal(result.sent, true);
+  assert.equal(discord.sent[0], EOD_TEST_MESSAGE);
+  closeDatabase(db);
+});
+
+test('runEodReport refuses to send without a configured Discord client', async () => {
+  const db = freshDb();
+  await assert.rejects(() => runEodReport(db, { send: true, discordClient: null }), /not configured/);
+  closeDatabase(db);
+});
+
+// --- sanitization & no-network ---------------------------------------------
+
+test('the report never leaks raw model responses or headlines', async () => {
+  const db = freshDb();
+  // Seed a sentiment score with a raw response + a news headline; the EOD report
+  // must never surface either (it does not join those tables).
+  db.prepare(
+    `INSERT INTO news_events (provider, provider_event_id, ticker, headline, published_at, received_at, news_type)
+     VALUES ('t','e1','AAPL','SECRET-HEADLINE-MUST-NOT-PRINT','2026-06-18T14:00:00.000Z','2026-06-18T14:00:00.000Z','other')`
+  ).run();
+  db.prepare(
+    `INSERT INTO sentiment_scores (news_event_id, model, prompt_version, raw_response, parse_ok, parser_status)
+     VALUES (1,'m','model_v1','RAW-MODEL-RESPONSE-MUST-NOT-PRINT',1,'parsed')`
+  ).run();
+  seedActivity(db);
+  const result = await runEodReport(db, { day: null, send: false });
+  assert.ok(!result.content.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
+  assert.ok(!result.content.includes('RAW-MODEL-RESPONSE-MUST-NOT-PRINT'));
+  closeDatabase(db);
+});
+
+test('the full path runs with zero real network', async () => {
+  const originalFetch = globalThis.fetch;
+  let networkCalls = 0;
+  globalThis.fetch = () => {
+    networkCalls += 1;
+    throw new Error('network attempted in EOD report test');
+  };
+  try {
+    const db = freshDb();
+    seedActivity(db);
+    await runEodReport(db, { day: null, send: false });
+    await runEodReport(db, { day: null, send: true, discordClient: fakeDiscord() });
+    assert.equal(networkCalls, 0);
+    closeDatabase(db);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('importing the script performs no network and requires no credentials', () => {
+  assert.equal(typeof runEodReport, 'function');
+  assert.equal(typeof collectEodData, 'function');
+  assert.equal(typeof buildEodReport, 'function');
+});

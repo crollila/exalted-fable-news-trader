@@ -296,6 +296,61 @@ configs. No options, no shorts, no margin logic, no scheduling, no background
 jobs; never part of `npm test`. The neutral `manual_baseline` score always fails
 the gate, so only real-model `up` signals can ever propose a trade.
 
+## Discord end-of-day reports
+
+The bot can post a sanitized end-of-day PAPER summary to a Discord channel.
+
+**Create a webhook (one time):** in Discord, open **Server Settings →
+Integrations → Webhooks → New Webhook**, pick the channel, and **Copy Webhook
+URL**. That URL is a **secret** (it embeds a token) — paste it into your local
+`.env` only; never commit it. Add to `.env` (see `.env.example`):
+
+```
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/.../...
+DISCORD_SERVER_ID=1515469212213317823
+DISCORD_CHANNEL_ID=1517321598456299610
+```
+
+`DISCORD_SERVER_ID` / `DISCORD_CHANNEL_ID` are optional metadata (printed for a
+sanity check); they **cannot** post on their own — only `DISCORD_WEBHOOK_URL`
+sends.
+
+**Test the connection** (posts one small test message to the channel):
+
+```
+node --env-file=.env scripts/smokeDiscordWebhook.js
+```
+
+It prints the configured server/channel ids, whether a webhook is configured,
+and the send result — **never** the webhook URL.
+
+**Preview the end-of-day report locally (sends nothing, no webhook needed):**
+
+```
+node --env-file=.env scripts/sendPaperEodReport.js --dry-run
+```
+
+**Send the end-of-day report to Discord (requires the webhook):**
+
+```
+node --env-file=.env scripts/sendPaperEodReport.js --send-discord
+```
+
+The report summarizes the local `paper_trades` / `rejected_trades` for the
+trading day (`--day YYYY-MM-DD`, default today UTC): proposals, orders submitted,
+fills, long/short counts, rejections and their reasons, approximate realized
+P&L, plus a short **what it did / why / what went well / what went poorly /
+mistakes & lessons / next-day ideas** narrative. With no records yet it prints a
+safe placeholder that still proves delivery. Output is sanitized — counts,
+tickers, sides, statuses, our own rejection reasons, and rounded P&L only; never
+raw model responses, raw payloads, headlines, API keys, headers, or the webhook
+URL. **Dry run is the default**; an actual send happens only with
+`--send-discord` (or `--test-message`), and missing the webhook fails clearly
+when a send is requested. Never part of `npm test` (tests use fake HTTP only).
+
+> Strategy parameters will live in a separate settings file (planned), **not**
+> in `.env` — the bot never edits `.env`. Live trading remains disabled.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

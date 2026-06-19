@@ -94,6 +94,17 @@ export function loadConfig(env = process.env) {
       keyId: env.ALPACA_API_KEY_ID || null,
       secretKey: env.ALPACA_API_SECRET_KEY || null,
     }),
+    // Discord delivery for end-of-day PAPER reports. The webhook URL is
+    // SECRET-ish (it embeds a token) — read ONLY here, held in memory only,
+    // never printed, logged, returned, or persisted. serverId/channelId are
+    // non-secret metadata (ids only) used for sanitized display/validation; they
+    // are NOT sufficient to post — only webhookUrl can send. All null by default
+    // so the Discord client must throw "not configured" rather than auto-enable.
+    discord: Object.freeze({
+      webhookUrl: env.DISCORD_WEBHOOK_URL || null,
+      serverId: env.DISCORD_SERVER_ID || null,
+      channelId: env.DISCORD_CHANNEL_ID || null,
+    }),
     risk: Object.freeze({
       maxDailyLossUsd: Number(env.MAX_DAILY_LOSS_USD ?? 100),
       maxPositionSizeUsd: Number(env.MAX_POSITION_SIZE_USD ?? 500),

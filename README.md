@@ -451,6 +451,63 @@ recommended today.”** Key guarantees:
 The same section is included in the Discord message (sanitized; truncated to
 Discord's length limit). Suppress it with `--no-constraint-recommendations`.
 
+## Strategy settings & learning
+
+Non-secret strategy parameters live in a JSON **settings file**, never in `.env`:
+
+- `config/strategy-settings.example.json` — committed template/defaults.
+- `data/strategy-settings.json` — local runtime override (**gitignored**;
+  created only when you run the learning updater with `--write`).
+
+Settings include `symbols`, `allow_shorts`, `allow_options`, `options_mode`,
+`max_order_notional`, `max_*_exposure`, `max_daily_paper_*`, `max_option_premium`,
+the `*_threshold` knobs, `interval_minutes`, `max_iterations`, and research
+focus (`scrape_target_groups`, `scrape_symbol_focus`). All values are
+validated/capped on load; secrets and `LIVE_TRADING_ENABLED` are never accepted.
+
+The **learning updater** reads recent paper outcomes and recommends conservative,
+bounded changes to the settings file (notional ±25%, counts ±20%, thresholds
+±0.05). It is **dry-run by default**:
+
+```
+node --env-file=.env scripts/updateStrategySettingsFromLearning.js --limit 100
+```
+
+Only with `--write` does it write — and **only** `data/strategy-settings.json`
+(never `.env`, never secrets). Notes are **appended** (de-duplicated + capped) so
+the file does not bloat:
+
+```
+node --env-file=.env scripts/updateStrategySettingsFromLearning.js --limit 100 --write
+```
+
+Other flags: `--settings-path`, `--min-sample-size`, `--include-env-recommendations`
+(also lists manual `.env` suggestions), `--format text|json`. The EOD report also
+shows a "Strategy setting recommendations" section + a next-day research-focus plan.
+
+> The bot **never edits `.env`** and **never enables live trading**. It only
+> writes the non-secret strategy file, and only when you pass `--write`.
+
+## Research source selection (allow-list, selection-only)
+
+The bot chooses what to research next from an **approved allow-list** —
+`config/research-sources.example.json` — never arbitrary URLs. This patch is
+**selection-only**: it ranks/selects approved sources but performs **no network
+calls and never scrapes/fetches**. Disabled, paywalled, login/auth-required, and
+`scrape_mode: disabled` sources are never selected.
+
+```
+node --env-file=.env scripts/selectResearchTargetsOnce.js --symbols AAPL,MSFT,NVDA --limit 10
+node --env-file=.env scripts/selectResearchTargetsOnce.js --symbols AAPL,MSFT,NVDA --limit 10 --format json
+```
+
+Output is a sanitized **plan** (source id, type, `scrape_mode`, symbol/topic
+focus, rate-limit note, and `fetch=disabled`) plus topic hints derived from the
+day's trading. `--fetch` is **not honored** (selection-only); fetching would
+require a source explicitly marked `fetch_allowed` and a future, separately
+reviewed change with injected/fake-HTTP-tested transport. No paywalls, logins,
+robots.txt, or rate limits are ever bypassed.
+
 ## Old V1 reference
 
 https://github.com/crollila/High-Frequency-Trading-Algorithm-with-Instant-News-Sentiment-Analysis

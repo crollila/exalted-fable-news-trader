@@ -29,6 +29,8 @@ import {
   buildConstraintRecommendations,
   formatRecommendationsSection,
 } from '../src/paper/constraintRecommendations.js';
+import { buildStrategyRecommendations, formatStrategySection } from '../src/paper/strategyLearning.js';
+import { loadStrategySettings } from '../src/config/strategySettings.js';
 
 /** Short message used by --test-message (proves delivery without a full report). */
 export const EOD_TEST_MESSAGE =
@@ -44,7 +46,10 @@ const LIST_CAP = 10;
  *   --include-constraint-recommendations (default on)   --no-constraint-recommendations
  */
 export function parseArgs(argv) {
-  const args = { day: null, send: false, testMessage: false, dryRun: false, includeRecommendations: true };
+  const args = {
+    day: null, send: false, testMessage: false, dryRun: false,
+    includeRecommendations: true, includeStrategyRecommendations: true,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     if (flag === '--day' && argv[i + 1]) {
@@ -61,6 +66,10 @@ export function parseArgs(argv) {
       args.includeRecommendations = true;
     } else if (flag === '--no-constraint-recommendations') {
       args.includeRecommendations = false;
+    } else if (flag === '--no-strategy-recommendations') {
+      args.includeStrategyRecommendations = false;
+    } else if (flag === '--include-strategy-recommendations') {
+      args.includeStrategyRecommendations = true;
     }
   }
   return args;
@@ -153,7 +162,7 @@ export function collectEodData(db, { day = null } = {}) {
  * next-day ideas) derived ONLY from the counts above — no model calls, no free
  * text beyond our own rejection-reason strings.
  */
-export function buildEodReport(data, { day = null, recommendations = null } = {}) {
+export function buildEodReport(data, { day = null, recommendations = null, strategy = null } = {}) {
   const label = day ?? data.day ?? '(all-time)';
   const lines = [
     `ExaltedFable — End-of-Day PAPER report (${label})`,
@@ -167,6 +176,7 @@ export function buildEodReport(data, { day = null, recommendations = null } = {}
       'This report still proves Discord delivery; once the paper loop runs and',
       'writes paper_trades / rejected_trades, the full narrative appears here.',
     );
+    if (strategy) lines.push('', ...formatStrategySection(strategy));
     if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
     return lines;
   }
@@ -227,6 +237,7 @@ export function buildEodReport(data, { day = null, recommendations = null } = {}
     `  Re-run during market hours; ${data.bestTicker ? `watch ${data.bestTicker}; ` : ''}` +
       'consider tightening/loosening thresholds per the refusal pattern (manually).',
   );
+  if (strategy) lines.push('', ...formatStrategySection(strategy));
   if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
   return lines;
 }
@@ -248,16 +259,31 @@ export async function runEodReport(
   {
     day = null, send = false, testMessage = false, discordClient = null,
     includeRecommendations = true, currentConstraints = {}, minSampleSize,
+    includeStrategyRecommendations = true, strategySettings = null,
   } = {}
 ) {
   const data = collectEodData(db, { day });
-  // Recommendations are READ-ONLY analysis; they never edit .env or any file.
+  // Recommendations + strategy analysis are READ-ONLY; they never edit .env or
+  // any file. The strategy recommender suggests data/strategy-settings.json
+  // changes (applied only by the updater's --write), the constraint recommender
+  // suggests manual .env edits.
   const recResult = includeRecommendations
     ? buildConstraintRecommendations({ data, current: currentConstraints, minSampleSize })
     : null;
-  const lines = buildEodReport(data, { day, recommendations: recResult ? recResult.recommendations : null });
+  const strategyResult = includeStrategyRecommendations
+    ? buildStrategyRecommendations({ data, settings: strategySettings ?? loadStrategySettings().settings })
+    : null;
+  const lines = buildEodReport(data, {
+    day,
+    recommendations: recResult ? recResult.recommendations : null,
+    strategy: strategyResult,
+  });
   const content = lines.join('\n');
-  const result = { day, data, lines, content, recommendations: recResult ? recResult.recommendations : null, sent: false };
+  const result = {
+    day, data, lines, content, sent: false,
+    recommendations: recResult ? recResult.recommendations : null,
+    strategy: strategyResult,
+  };
 
   if (send || testMessage) {
     if (!discordClient) {
@@ -287,7 +313,8 @@ export function currentConstraintsFromConfig(config) {
 }
 
 async function main() {
-  const { day, send, testMessage, includeRecommendations } = parseArgs(process.argv.slice(2));
+  const { day, send, testMessage, includeRecommendations, includeStrategyRecommendations } =
+    parseArgs(process.argv.slice(2));
   const config = loadConfig();
   const wantSend = send || testMessage;
 
@@ -315,6 +342,7 @@ async function main() {
     const result = await runEodReport(db, {
       day, send, testMessage, discordClient,
       includeRecommendations,
+      includeStrategyRecommendations,
       currentConstraints: currentConstraintsFromConfig(config),
     });
     for (const line of result.lines) console.log(line);

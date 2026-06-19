@@ -40,10 +40,12 @@ function seedActivity(db) {
 
 test('parseArgs defaults to a local dry run (no send), recommendations on', () => {
   assert.deepEqual(parseArgs([]), {
-    day: null, send: false, testMessage: false, dryRun: false, includeRecommendations: true,
+    day: null, send: false, testMessage: false, dryRun: false,
+    includeRecommendations: true, includeStrategyRecommendations: true,
   });
   assert.equal(parseArgs(['--no-constraint-recommendations']).includeRecommendations, false);
   assert.equal(parseArgs(['--include-constraint-recommendations']).includeRecommendations, true);
+  assert.equal(parseArgs(['--no-strategy-recommendations']).includeStrategyRecommendations, false);
 });
 
 test('parseArgs reads --day, --send-discord, --test-message, --dry-run', () => {
@@ -262,6 +264,19 @@ test('the recommendations section adds no secrets/raw content to the report', as
   const r = await runEodReport(db, { day: null });
   assert.ok(!r.content.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
   assert.ok(!r.content.includes('RAW-MODEL-RESPONSE-MUST-NOT-PRINT'));
+  closeDatabase(db);
+});
+
+test('runEodReport includes a strategy-settings recommendations section + research focus', async () => {
+  const db = freshDb();
+  seedActivity(db); // "no shorts" rejections + the others
+  const r = await runEodReport(db, { day: null });
+  assert.match(r.content, /Strategy setting recommendations \(data\/strategy-settings\.json\)/);
+  assert.match(r.content, /Next-day research focus \(plan only\)/);
+  assert.ok(r.strategy && Array.isArray(r.strategy.changes));
+  // Suppressible.
+  const off = await runEodReport(db, { day: null, includeStrategyRecommendations: false });
+  assert.ok(!off.content.includes('Strategy setting recommendations'));
   closeDatabase(db);
 });
 

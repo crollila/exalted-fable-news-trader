@@ -4,7 +4,7 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (406/406).
+- Stable. All tests passing (425/425).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 - Phase 5 (PAPER trading) FIRST VERTICAL SLICE is COMMITTED (`df1931f`): a
@@ -28,9 +28,23 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   PAPER-only, dry-run default, --execute-paper still required; options default
   plan_only. 63 network-free tests (406 total). Part G (strategy-settings file)
   was DEFERRED as not needed for CLI-driven caps.
+- EOD constraint-change recommendations are COMMITTED (`59b953f`):
+  src/paper/constraintRecommendations.js + sendPaperEodReport.js integration. The
+  EOD report ANALYZES the day's paper_trades/rejected_trades and RECOMMENDS
+  (never auto-applies) conservative, bounded manual `.env` constraint edits, with
+  hard guarantees: the bot NEVER edits .env/.env.example and NEVER recommends
+  LIVE_TRADING_ENABLED=true. 19 network-free tests (425 total).
 
 ## Latest Confirmed Commit
-- Latest committed: `b3387d5` — feat(paper): advanced PAPER trading — long/short,
+- Latest committed: `59b953f` — feat(paper): EOD report recommends manual .env
+  constraint changes. A read-only analysis layer
+  (src/paper/constraintRecommendations.js) turns the day's
+  paper_trades/rejected_trades into conservative, bounded recommendations for
+  MANUAL .env edits (pct +/-25%, count +/-20%, threshold +/-0.05). The bot never
+  edits .env and never recommends LIVE_TRADING_ENABLED=true. sendPaperEodReport
+  appends a "Recommended manual .env changes" section (local + Discord). 19 new
+  network-free tests; 425/425.
+- Previous: `b3387d5` — feat(paper): advanced PAPER trading — long/short,
   options, margin, market-hours loop. Account/positions snapshots + OCC option
   market orders on the (still paper-only) client; margin-aware risk
   (accountCapabilities + paperRisk) with notional/exposure/daily caps; long+short
@@ -73,9 +87,10 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   baseline-lookback widening (STATUS.md only).
 - Previous: `89c7eb5` — docs(status): record Phase 5 one-shot paper slice commit
   (STATUS.md only).
-- Previous: `3ac6400` — docs(status): record Discord reporting slice (STATUS.md only).
+- Previous: `dc446cf` — docs(status): record advanced paper trading slice
+  (STATUS.md only).
 - This STATUS update is committed separately as
-  `docs(status): record advanced paper trading slice` (STATUS.md only).
+  `docs(status): record EOD constraint recommendations` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -762,6 +777,33 @@ no scheduling/loop yet.
     gating, bounds, Ctrl+C, heartbeat). 406 total; npm test fully offline (fake
     HTTP / injected clients/clock; no order or Discord post is ever sent).
     NOT YET RUN against the live paper account.
+- EOD constraint-change recommendations (committed `59b953f`):
+  * src/paper/constraintRecommendations.js: buildConstraintRecommendations()
+    turns the day's sanitized EOD aggregates (wins/losses/orders/rejections by
+    category) into conservative, BOUNDED manual-.env-edit recommendations. Each
+    rec carries variable, action, current value ("(not set)" when unwired),
+    recommended value, reason, confidence (low|medium|high), urgency
+    (monitor|recommended|important), evidence, and an exact manual_edit_line
+    (VAR=value). Bounds: pct ±25%, count ±20%, threshold ±0.05 per update, never
+    above each variable's ceiling, never unlimited. Decreases risk readily after
+    losses/repeated-rejections/drawdowns/excessive-orders; only suggests a SMALL
+    bounded INCREASE after strong positive evidence over >= minSampleSize trades.
+    HARD GUARANTEES: never edits any file; never emits LIVE_TRADING_ENABLED=true
+    (only ever "=false"); sanitized output only.
+  * scripts/sendPaperEodReport.js: collectEodData now also counts winning/losing
+    trades; runEodReport computes recommendations from the day's data + the
+    CURRENT constraints read through config ONLY (currentConstraintsFromConfig —
+    never the raw .env), and buildEodReport appends a "Recommended manual .env
+    changes" section (with a "No changes…" message when empty and a "The bot did
+    not edit .env" caution). The same section flows into the Discord message
+    (sanitized; client truncates to 2000 chars). New flags
+    --include-constraint-recommendations (default on) / --no-constraint-recommendations.
+  * 19 new network-free tests (tests/constraintRecommendations.test.js +
+    additions to tests/sendPaperEodReport.test.js): no-data/insufficient ->
+    none; losing day/notional/exposure/excessive-orders/options/shorts -> the
+    right conservative rec; strong evidence -> small bounded increase; bounds
+    respected; never enables live trading; section rendered in the report and no
+    secrets/raw text leak. 425 total; fully offline.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -856,7 +898,12 @@ no scheduling/loop yet.
   only via --execute-paper, options additionally via --options-mode execute_paper
   + a verified options capability. npm test never sends an order (fake HTTP /
   injected clients/clock).
-- Tests: Node built-in test runner (`npm test`), 406/406 passing.
+- The EOD report (scripts/sendPaperEodReport.js) now also RECOMMENDS manual
+  .env constraint edits via src/paper/constraintRecommendations.js — a read-only
+  analysis layer. It NEVER edits .env/.env.example/any file and NEVER recommends
+  enabling live trading; it only prints/sends the exact line a human could change.
+  Current constraint values are read through config only.
+- Tests: Node built-in test runner (`npm test`), 425/425 passing.
 - No automatic/scheduled provider, market-data, or model calls. Live
   touchpoints are manual scripts only: news smoke check, news one-shot ingest,
   trades smoke check (each run against the live feed at least once), the capped
@@ -1065,17 +1112,37 @@ no scheduling/loop yet.
     learning-log table + reviewPaperLearningOnce, options contract discovery,
     sell-to-close automation, and OPENAI_MODEL/provider wiring.
   * NOT YET RUN against the live paper account.
+- EOD CONSTRAINT-RECOMMENDATIONS LIMITS (committed `59b953f`):
+  * The recommender is READ-ONLY: it never edits .env/.env.example/any file and
+    never mutates thresholds — it only emits suggested manual edit lines. It
+    never recommends LIVE_TRADING_ENABLED=true (guarded + filtered).
+  * MOST recommended env vars are NOT yet consumed by the bot (config.js has
+    MAX_*_USD + CLI caps, not MAX_*_PCT / MAX_OPEN_POSITIONS / PAPER_* flags). So
+    a recommendation usually means "introduce this variable" and shows
+    current="(not set)" — honest, but wiring those knobs into config/risk is a
+    separate task. MAX_TRADES_PER_DAY and LIVE_TRADING_ENABLED are the only ones
+    currently sourced from config.
+  * Realized P&L is null today (no exit/mark logic), so win/loss-driven
+    recommendations only fire once trades carry pnl_usd; until then the
+    recommender is driven mainly by rejection patterns and order frequency.
+  * Recommendations are intentionally coarse heuristics (templated), not a
+    statistical model; the larger learning/strategy-settings engine is deferred.
 
 ## Next Recommended Task
 Committed so far (NOT pushed): one-shot paper slice (`df1931f`), Discord/EOD
 slice (`0bb590c`), advanced PAPER slice (`b3387d5`) — all 406/406 green, offline.
 
-IN PROGRESS (UNCOMMITTED, pending review): EOD constraint-change recommendations
-— a src/paper/constraintRecommendations.js module + sendPaperEodReport.js
-integration that ANALYZES the day's paper_trades/rejected_trades and RECOMMENDS
-(never auto-applies) conservative, bounded manual `.env` constraint edits, with a
-hard rule that the bot never edits .env/.env.example and never recommends
-LIVE_TRADING_ENABLED=true.
+EOD constraint-change recommendations are COMMITTED (`59b953f`).
+
+IN PROGRESS (UNCOMMITTED, pending review): the FULL learning/strategy + research
+system — a runtime data/strategy-settings.json (writable ONLY with --write; never
+.env) + src/config/strategySettings.js + a strategyLearning engine +
+scripts/updateStrategySettingsFromLearning.js + a research-source allow-list
+(src/research/researchSources.js) + a selection-only scrape-target selector
+(src/research/scrapeTargetSelector.js + scripts/selectResearchTargetsOnce.js), and
+the EOD report extended to show strategy-settings recommendations + next-day
+research focus. The learning engine APPENDS to existing notes (deduped + capped)
+to avoid bloat. Selection-only (no scraping/fetching); .env stays manual-only.
 
 Verify the committed slices live (paper account) carefully:
   1) DRY RUN advanced (no orders, safe any time):

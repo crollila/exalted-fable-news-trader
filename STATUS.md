@@ -4,16 +4,30 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (319/319).
+- Stable. All tests passing (343/343).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 - Phase 5 (PAPER trading) FIRST VERTICAL SLICE is COMMITTED (`df1931f`): a
   manual one-shot paper-trade path (scripts/runPaperTradingOnce.js + src/paper/*
   + config + tests + docs). PAPER-only, dry-run by default, live trading still
   impossible/disabled.
+- Phase 5 Discord verification + end-of-day report slice is COMMITTED
+  (`0bb590c`): src/notifications/discordWebhookClient.js +
+  scripts/smokeDiscordWebhook.js + scripts/sendPaperEodReport.js + config.discord
+  + .env.example placeholders + 3 test files. PAPER-only, read-only EOD summary;
+  Discord posts only when explicitly requested; the webhook URL is never printed.
+  24 new network-free tests. OPENAI_MODEL wiring was DEFERRED (see warning below).
 
 ## Latest Confirmed Commit
-- Latest committed: `df1931f` — feat(paper): manual one-shot PAPER trade
+- Latest committed: `0bb590c` — feat(notifications): add Discord webhook
+  verification and paper EOD report. A PAPER-only Discord delivery path: a
+  webhook client (injected HTTP; the webhook URL and its token are redacted from
+  all errors and never printed/persisted), scripts/smokeDiscordWebhook.js (a
+  channel connection test), and scripts/sendPaperEodReport.js (read-only EOD
+  summary of paper_trades / rejected_trades; DRY RUN default, posts only with
+  --send-discord/--test-message and a configured webhook). config.discord +
+  .env.example placeholders. 24 new network-free tests; 343/343 passing.
+- Previous: `df1931f` — feat(paper): manual one-shot PAPER trade
   vertical slice (Phase 5). Select a real-model-scored event → conservative
   equity-long / market-buy proposal → minimal risk gate → a single Alpaca PAPER
   market order ONLY with explicit --execute-paper (dry-run default). Order
@@ -37,8 +51,10 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   measurement (8 new network-free tests).
 - Previous: `009ed81` — docs(status): record measurement diagnostics +
   baseline-lookback widening (STATUS.md only).
+- Previous: `89c7eb5` — docs(status): record Phase 5 one-shot paper slice commit
+  (STATUS.md only).
 - This STATUS update is committed separately as
-  `docs(status): record Phase 5 one-shot paper slice commit` (STATUS.md only).
+  `docs(status): record Discord reporting slice` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -648,6 +664,41 @@ no scheduling/loop yet.
     rejected_trades, reports sanitized (no raw response/headline/rationale),
     zero real network, import safety. package.json registers the 3 files.
   NOT YET RUN against the live paper account.
+- Discord verification + end-of-day report slice (committed as `0bb590c`):
+  * src/config.js: new config.discord block (webhookUrl + serverId + channelId).
+    webhookUrl is secret-ish (embeds a token) — read only here, never printed/
+    persisted; serverId/channelId are non-secret metadata. .env.example gains
+    DISCORD_WEBHOOK_URL/SERVER_ID/CHANNEL_ID placeholders (empty).
+  * src/notifications/discordWebhookClient.js: createDiscordWebhookClient(config,
+    {httpFetch}) — explicit construction, throws "not configured" without a
+    webhook URL, injected fetch (npm test offline), POSTs {content} to the
+    webhook, truncates to Discord's 2000-char limit, and REDACTS both the URL and
+    its token from every error (the URL/token can never leak). describeDiscordTarget()
+    returns sanitized metadata (webhookConfigured + ids, never the URL).
+  * scripts/smokeDiscordWebhook.js: manual connection test. Prints sanitized
+    server/channel ids + webhook-configured + send result; sends ONE fixed test
+    message ("ExaltedFable Discord connection test — paper trading reports
+    enabled.") when configured; fails clearly when the webhook is missing; never
+    prints the URL. CLI-guarded.
+  * scripts/sendPaperEodReport.js: READ-ONLY end-of-day summary of
+    paper_trades / rejected_trades for one trading day (--day, default today
+    UTC). collectEodData() aggregates counts (proposals/orders/fills/long/short/
+    rejections + recurring reasons/approx P&L); buildEodReport() renders a
+    sanitized narrative with the required sections (what it did / why / went well
+    / went poorly / mistakes & lessons / next-day ideas), or a safe placeholder
+    when there are no records (still proves delivery). DRY RUN by default; posts
+    to Discord ONLY with --send-discord (or --test-message), and only with a
+    configured webhook (missing webhook fails clearly, never a silent skip).
+    runEodReport() is dependency-injected (fake Discord client in tests).
+  * 24 new network-free tests (tests/discordWebhookClient.test.js,
+    tests/smokeDiscordWebhook.test.js, tests/sendPaperEodReport.test.js):
+    not-configured throws, send success/{content}/truncation, URL+token redacted
+    from HTTP + network errors, metadata-only describe; smoke formatter never
+    leaks the URL + exact test message; EOD arg parsing, day filter, aggregation,
+    required narrative sections + placeholder, dry-run sends nothing,
+    send/test-message use the injected client, refuse-to-send without a client,
+    no raw response/headline leakage, zero real network. package.json registers
+    the 3 files. NOT YET RUN against a live Discord webhook.
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -726,7 +777,14 @@ no scheduling/loop yet.
   order (injected fake HTTP / fake client only). Outcomes persist through the
   existing migration-001 paper_trades / rejected_trades tables (no schema
   change).
-- Tests: Node built-in test runner (`npm test`), 319/319 passing.
+- src/notifications is the new outbound-notifications layer (Discord slice,
+  committed `0bb590c`). discordWebhookClient is the ONLY place a Discord message can be
+  sent; it requires config.discord.webhookUrl, redacts the URL/token from all
+  errors, and uses injected HTTP (npm test never posts). The EOD report
+  (scripts/sendPaperEodReport.js) is read-only over paper_trades/rejected_trades
+  and dry-run by default; it sends only with --send-discord and a configured
+  webhook. No trading logic and no market/model calls live in this layer.
+- Tests: Node built-in test runner (`npm test`), 343/343 passing.
 - No automatic/scheduled provider, market-data, or model calls. Live
   touchpoints are manual scripts only: news smoke check, news one-shot ingest,
   trades smoke check (each run against the live feed at least once), the capped
@@ -888,13 +946,31 @@ no scheduling/loop yet.
   * NOT YET RUN against the live paper account; selection requires existing
     real-model (model_v1) scored events, so run the MVP pipeline /
     classifyNewsOnce --classifier real_model first.
+- DISCORD SLICE SAFETY/LIMITS (committed `0bb590c`):
+  * The webhook URL is a SECRET (it embeds a token). It is read only via
+    config.discord.webhookUrl, never printed/logged/returned/persisted, and is
+    redacted from all client errors. DISCORD_SERVER_ID/CHANNEL_ID are metadata
+    only and cannot post on their own.
+  * Discord sends ONLY from the manual scripts with an explicit flag
+    (smokeDiscordWebhook sends a fixed test message; sendPaperEodReport sends only
+    with --send-discord/--test-message). npm test never posts (injected fake HTTP).
+  * The EOD report has NO learning-log table yet (Phase 5 learning log is a later
+    slice). Its narrative is templated from paper_trades/rejected_trades counts +
+    our own rejection-reason strings; P&L is whatever pnl_usd holds (null→0 today,
+    since exits are not yet computed). "best/worst ticker" is only meaningful once
+    realized P&L exists.
+  * OPENAI_MODEL wiring (requested in a later prompt) was DEFERRED: the real
+    classifier is ANTHROPIC (config.model.classifierModel / MODEL_CLASSIFIER_MODEL,
+    default claude-opus-4-8). Wiring an OpenAI model id into the Anthropic call is
+    incoherent; needs clarification (rename the existing model env var vs. add a
+    real OpenAI provider). No OpenAI changes were made.
 
 ## Next Recommended Task
 The one-shot paper slice is committed (`df1931f`). The user accelerated to a
 sequence of PAPER phases (each its own reviewed slice, since the advanced ones
 reverse the one-shot slice's long-only/no-options/no-margin constraints). The
-chosen NEXT slice (currently being built, UNCOMMITTED, pending review) is the
-Discord connection-verification + end-of-day report slice:
+Discord connection-verification + end-of-day report slice is COMMITTED
+(`0bb590c`):
   - src/notifications/discordWebhookClient.js (injected HTTP, never prints the
     webhook URL, sanitized errors), config.discord (webhookUrl/serverId/
     channelId) + .env.example placeholders,
@@ -902,6 +978,10 @@ Discord connection-verification + end-of-day report slice:
   - scripts/sendPaperEodReport.js (read-only EOD summary of paper_trades /
     rejected_trades; --dry-run prints locally, --send-discord sends only when
     explicitly requested; safe placeholder when there are no trades yet).
+IMMEDIATE NEXT STEP: verify Discord live — put DISCORD_WEBHOOK_URL in .env and run
+`node --env-file=.env scripts/smokeDiscordWebhook.js` (expect a message in the
+channel), then `node --env-file=.env scripts/sendPaperEodReport.js --dry-run`.
+The local commits (through `0bb590c`) are NOT pushed yet; push when ready.
 Exercise the committed one-shot slice meanwhile:
   1) populate a real-model score (during/after market hours):
      node --env-file=.env scripts/runMvpPipelineOnce.js --classifier real_model \

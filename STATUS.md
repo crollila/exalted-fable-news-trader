@@ -4,7 +4,7 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (425/425).
+- Stable. All tests passing (463/463).
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 - Phase 5 (PAPER trading) FIRST VERTICAL SLICE is COMMITTED (`df1931f`): a
@@ -34,9 +34,32 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   (never auto-applies) conservative, bounded manual `.env` constraint edits, with
   hard guarantees: the bot NEVER edits .env/.env.example and NEVER recommends
   LIVE_TRADING_ENABLED=true. 19 network-free tests (425 total).
+- The FULL learning/strategy + research-source system is COMMITTED (`385ba4c`):
+  a non-secret runtime strategy file (config/strategy-settings.example.json +
+  data/strategy-settings.json gitignored, written ONLY via --write) with
+  src/config/strategySettings.js; a learning engine (src/paper/strategyLearning.js)
+  + scripts/updateStrategySettingsFromLearning.js (dry-run default; --write writes
+  ONLY the data file; notes APPENDED deduped+capped to avoid bloat); an approved
+  research-source allow-list (config/research-sources.example.json +
+  src/research/researchSources.js) + a SELECTION-ONLY scrape-target selector
+  (src/research/scrapeTargetSelector.js + scripts/selectResearchTargetsOnce.js,
+  no network/fetch); and the EOD report extended with strategy-settings
+  recommendations + a next-day research-focus plan. .env stays manual-only;
+  never enables live trading. 38 network-free tests (463 total).
 
 ## Latest Confirmed Commit
-- Latest committed: `59b953f` — feat(paper): EOD report recommends manual .env
+- Latest committed: `385ba4c` — feat(strategy): learning-based strategy settings
+  + research-source selection. A non-secret runtime strategy file
+  (config/strategy-settings.example.json + src/config/strategySettings.js;
+  data/strategy-settings.json gitignored, written ONLY with --write, never .env,
+  notes appended deduped+capped); a bounded learning engine
+  (src/paper/strategyLearning.js) + scripts/updateStrategySettingsFromLearning.js
+  (dry-run default); an approved research-source allow-list
+  (config/research-sources.example.json + src/research/researchSources.js) + a
+  SELECTION-ONLY scrape-target selector (src/research/scrapeTargetSelector.js +
+  scripts/selectResearchTargetsOnce.js; no network/fetch). EOD report extended
+  with strategy recs + research focus. 38 new network-free tests; 463/463.
+- Previous: `59b953f` — feat(paper): EOD report recommends manual .env
   constraint changes. A read-only analysis layer
   (src/paper/constraintRecommendations.js) turns the day's
   paper_trades/rejected_trades into conservative, bounded recommendations for
@@ -87,10 +110,10 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   baseline-lookback widening (STATUS.md only).
 - Previous: `89c7eb5` — docs(status): record Phase 5 one-shot paper slice commit
   (STATUS.md only).
-- Previous: `dc446cf` — docs(status): record advanced paper trading slice
+- Previous: `452f690` — docs(status): record EOD constraint recommendations
   (STATUS.md only).
 - This STATUS update is committed separately as
-  `docs(status): record EOD constraint recommendations` (STATUS.md only).
+  `docs(status): record learning/strategy + research system` (STATUS.md only).
   (verify committed head with `git log -1 --oneline`)
 
 ## Current Phase
@@ -804,6 +827,34 @@ no scheduling/loop yet.
     right conservative rec; strong evidence -> small bounded increase; bounds
     respected; never enables live trading; section rendered in the report and no
     secrets/raw text leak. 425 total; fully offline.
+- Learning/strategy/research system (committed `385ba4c`):
+  * src/config/strategySettings.js + config/strategy-settings.example.json: a
+    NON-SECRET runtime strategy file. validate/cap every field (drops unknown +
+    secret-like + LIVE_TRADING_ENABLED keys; enforces the loop interval floor);
+    load runtime data/ override else example else defaults; appendNotes()
+    de-dupes + caps (NOTES_CAP=50) to prevent bloat; writeStrategySettings()
+    writes ONLY the data file and refuses any .env path. .gitignore now ignores
+    data/strategy-settings.json.
+  * src/paper/strategyLearning.js + scripts/updateStrategySettingsFromLearning.js:
+    bounded, conservative strategy-setting recommendations (notional ±25%, counts
+    ±20%, thresholds ±0.05; floors enforced; small increase only on strong
+    evidence) + a next-day research-focus plan. Dry-run by default; --write
+    applies changes to data/strategy-settings.json and APPENDS notes; --format
+    text|json; --include-env-recommendations adds the manual .env suggestions.
+    Never writes .env, never enables live trading.
+  * config/research-sources.example.json + src/research/researchSources.js +
+    src/research/scrapeTargetSelector.js + scripts/selectResearchTargetsOnce.js:
+    an approved source allow-list + a SELECTION-ONLY target planner. No network,
+    no fetching, no robots/paywall/login bypass; isAllowedUrl rejects any
+    non-allow-listed URL; gated sources never selected; --fetch is not honored.
+  * scripts/sendPaperEodReport.js: EOD report now also renders strategy-settings
+    recommendations + the research-focus plan (suppressible via
+    --no-strategy-recommendations).
+  * 38 new network-free tests across strategySettings, strategyLearning,
+    updateStrategySettingsFromLearning, researchSources, scrapeTargetSelector,
+    selectResearchTargetsOnce + sendPaperEodReport additions. 463 total; fully
+    offline (fake fs / in-memory DB / committed example configs; no disk .env
+    writes, no network).
 
 ## Current Architecture
 - Node.js ESM, zero runtime dependencies (Node >= 22.5 required).
@@ -903,7 +954,16 @@ no scheduling/loop yet.
   analysis layer. It NEVER edits .env/.env.example/any file and NEVER recommends
   enabling live trading; it only prints/sends the exact line a human could change.
   Current constraint values are read through config only.
-- Tests: Node built-in test runner (`npm test`), 425/425 passing.
+- NEW layers (committed `385ba4c`): src/config/strategySettings.js (non-secret runtime
+  strategy file: load/validate/cap/merge + write ONLY the data file, never .env;
+  notes appended deduped+capped), src/paper/strategyLearning.js (bounded
+  strategy-settings recommendations + next-day research focus), and src/research/*
+  (researchSources allow-list + selection-only scrapeTargetSelector). The
+  updater (scripts/updateStrategySettingsFromLearning.js) and research selector
+  (scripts/selectResearchTargetsOnce.js) are dry-run/selection-only and make no
+  network calls. The EOD report now also surfaces strategy-settings
+  recommendations + a research-focus plan. .env stays manual-only.
+- Tests: Node built-in test runner (`npm test`), 463/463 passing.
 - No automatic/scheduled provider, market-data, or model calls. Live
   touchpoints are manual scripts only: news smoke check, news one-shot ingest,
   trades smoke check (each run against the live feed at least once), the capped
@@ -1127,6 +1187,26 @@ no scheduling/loop yet.
     recommender is driven mainly by rejection patterns and order frequency.
   * Recommendations are intentionally coarse heuristics (templated), not a
     statistical model; the larger learning/strategy-settings engine is deferred.
+- LEARNING/STRATEGY/RESEARCH SLICE LIMITS (committed `385ba4c`):
+  * Strategy settings are NON-SECRET only. The updater writes ONLY
+    data/strategy-settings.json (gitignored) and ONLY with --write; it NEVER
+    writes .env/.env.example, never stores secrets, never enables live trading.
+    validateStrategySettings drops any secret-like / LIVE_TRADING_ENABLED key.
+  * Notes are appended with de-dup + a hard cap (NOTES_CAP=50) so the file stays
+    small over many updates. Bounded deltas: notional/risk ±25%, counts ±20%,
+    thresholds ±0.05; floors enforced; never unlimited.
+  * The strategy settings are NOT yet consumed by the trading scripts (the loop/
+    one-shot still take CLI flags). Wiring loadStrategySettings into the
+    loop/once defaults is a deliberate next step, kept separate so a settings
+    file can't silently change live behavior before review.
+  * RESEARCH is SELECTION-ONLY: no source is fetch_allowed, the selector and
+    scripts make NO network calls, and isAllowedUrl rejects any non-allow-listed
+    URL. Disabled/paywalled/auth-required sources are never selected. There is NO
+    scraping/fetch/robots-bypass anywhere; actual fetching is a future, separately
+    reviewed step (injected/fake-HTTP-tested) gated on a source marked
+    fetch_allowed AND an explicit CLI flag.
+  * Research example feeds are illustrative (e.g. IR RSS base_urls are blank in
+    the template); a real run needs the operator to fill in approved feed URLs.
 
 ## Next Recommended Task
 Committed so far (NOT pushed): one-shot paper slice (`df1931f`), Discord/EOD
@@ -1134,15 +1214,21 @@ slice (`0bb590c`), advanced PAPER slice (`b3387d5`) — all 406/406 green, offli
 
 EOD constraint-change recommendations are COMMITTED (`59b953f`).
 
-IN PROGRESS (UNCOMMITTED, pending review): the FULL learning/strategy + research
-system — a runtime data/strategy-settings.json (writable ONLY with --write; never
-.env) + src/config/strategySettings.js + a strategyLearning engine +
-scripts/updateStrategySettingsFromLearning.js + a research-source allow-list
-(src/research/researchSources.js) + a selection-only scrape-target selector
-(src/research/scrapeTargetSelector.js + scripts/selectResearchTargetsOnce.js), and
-the EOD report extended to show strategy-settings recommendations + next-day
-research focus. The learning engine APPENDS to existing notes (deduped + capped)
-to avoid bloat. Selection-only (no scraping/fetching); .env stays manual-only.
+The FULL learning/strategy + research system is COMMITTED (`385ba4c`). Try it:
+  node --env-file=.env scripts/updateStrategySettingsFromLearning.js --limit 100
+  node --env-file=.env scripts/updateStrategySettingsFromLearning.js --limit 100 --write
+  node --env-file=.env scripts/selectResearchTargetsOnce.js --symbols AAPL,MSFT,NVDA --limit 10
+
+Local commits through `385ba4c` are NOT pushed yet; push when ready.
+
+NEXT candidate slices (each separate/reviewed): (1) WIRE
+loadStrategySettings into the loop/one-shot defaults so the settings file
+actually drives behavior (kept separate so a file edit can't silently change
+trading before review); (2) wire the recommended PCT/PAPER_* .env knobs into
+config/risk so EOD .env recommendations target consumed values; (3) a real
+learning-log table (additive migration 004); (4) a future, fake-HTTP-tested
+research FETCH path gated on fetch_allowed + an explicit CLI flag; (5) the
+OPENAI_MODEL/provider question.
 
 Verify the committed slices live (paper account) carefully:
   1) DRY RUN advanced (no orders, safe any time):

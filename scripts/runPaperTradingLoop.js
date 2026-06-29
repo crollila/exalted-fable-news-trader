@@ -19,8 +19,11 @@
 
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from '../src/config.js';
+import { loadStrategySettings } from '../src/config/strategySettings.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
+import { createAlpacaNewsHttpTransport } from '../src/providers/alpacaNewsHttpTransport.js';
+import { createAlpacaNewsProvider } from '../src/providers/alpacaNewsProvider.js';
 import { createAlpacaPaperClient } from '../src/paper/alpacaPaperClient.js';
 import { createAlpacaTradesPriceSource } from '../src/prices/alpacaTradesPriceSource.js';
 import { createDiscordWebhookClient } from '../src/notifications/discordWebhookClient.js';
@@ -33,7 +36,14 @@ import {
   DEFAULT_INTERVAL_MINUTES,
   DEFAULT_MAX_ITERATIONS,
 } from '../src/paper/paperTradingLoop.js';
-import { parseArgs as parseOnceArgs, executeOneShot, oneLineSummary } from './runPaperTradingOnce.js';
+import {
+  parseArgs as parseOnceArgs,
+  runPaperDecisionCycle,
+  oneLineDecisionSummary,
+  buildDecisionCycleReport,
+  paperDefaultsFromStrategySettings,
+} from './runPaperTradingOnce.js';
+import { buildClassifier } from './classifyNewsOnce.js';
 import { runEodReport } from './sendPaperEodReport.js';
 
 export { MIN_INTERVAL_MINUTES };
@@ -42,11 +52,11 @@ export { MIN_INTERVAL_MINUTES };
  * Parse loop CLI args. The trade flags are parsed by the one-shot parser (so the
  * loop and one-shot stay in lockstep); the loop adds its own scheduling flags.
  */
-export function parseArgs(argv) {
-  const base = parseOnceArgs(argv);
+export function parseArgs(argv, defaults = {}) {
+  const base = parseOnceArgs(argv, defaults);
   const loop = {
-    intervalMinutes: DEFAULT_INTERVAL_MINUTES,
-    maxIterations: DEFAULT_MAX_ITERATIONS,
+    intervalMinutes: clampIntervalMinutes(defaults.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES),
+    maxIterations: clampMaxIterations(defaults.maxIterations ?? DEFAULT_MAX_ITERATIONS),
     runOutsideMarketHours: false,
     sendDiscordEod: false,
   };
@@ -63,11 +73,17 @@ export function parseArgs(argv) {
 }
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
   const config = loadConfig();
-  const hasCreds = Boolean(config.alpacaPaper.keyId && config.alpacaPaper.secretKey);
+  const strategy = loadStrategySettings();
+  const paperDefaults = strategy.source === 'runtime' ? paperDefaultsFromStrategySettings(strategy.settings) : {};
+  const loopDefaults = strategy.source === 'runtime'
+    ? { intervalMinutes: strategy.settings.interval_minutes, maxIterations: strategy.settings.max_iterations }
+    : {};
+  const args = parseArgs(process.argv.slice(2), { ...paperDefaults, ...loopDefaults });
+  const hasPaperCreds = Boolean(config.alpacaPaper.keyId && config.alpacaPaper.secretKey);
+  const hasAlpacaNewsCreds = Boolean(config.alpacaNews.keyId && config.alpacaNews.secretKey);
 
-  if (args.executePaper && !hasCreds) {
+  if (args.executePaper && !hasPaperCreds) {
     console.error(
       'Loop NOT STARTED in execute mode: Alpaca PAPER credentials are not configured.\n' +
         'Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY in .env, or omit --execute-paper.'
@@ -81,6 +97,8 @@ async function main() {
   console.log(
     `  symbols=${args.symbols.join(',')} mode=${args.executePaper ? 'EXECUTE-PAPER' : 'DRY-RUN'} ` +
       `interval=${args.intervalMinutes}m max-iter=${args.maxIterations} ` +
+      `classifier=${args.classifier ?? '(not requested)'} ingest-limit=${args.ingestLimit} ` +
+      `classify-limit=${args.classifyLimit} lookback=${args.newsLookbackMinutes}m ` +
       `shorts=${args.allowShorts ? 'on' : 'off'} options=${args.allowOptions ? args.optionsMode : 'off'} ` +
       `outside-hours=${args.runOutsideMarketHours ? 'yes' : 'no'}`
   );
@@ -99,13 +117,26 @@ async function main() {
     db = openDatabase(config.databasePath);
     runMigrations(db);
 
-    const paperClient = hasCreds ? createAlpacaPaperClient(config) : null;
-    const priceSource = hasCreds ? createAlpacaTradesPriceSource(config) : null;
+    let provider = null;
+    let providerSkipReason = null;
+    if (hasAlpacaNewsCreds) {
+      provider = createAlpacaNewsProvider({ fetchRawNews: createAlpacaNewsHttpTransport(config) });
+    } else {
+      providerSkipReason = 'Alpaca credentials not configured for news ingest';
+    }
+    const classifier = args.classifier === 'real_model' ? buildClassifier('real_model', config) : null;
+    const paperClient = hasPaperCreds ? createAlpacaPaperClient(config) : null;
+    const priceSource = hasPaperCreds ? createAlpacaTradesPriceSource(config) : null;
 
     const runOnce = async ({ nowMs }) => {
-      const { result, lines } = await executeOneShot(db, { args, paperClient, priceSource, nowMs });
-      for (const line of lines) console.log(line);
-      return result ? oneLineSummary(result) : 'no eligible scored event';
+      const cycle = await runPaperDecisionCycle(
+        db,
+        { provider, classifier, paperClient, priceSource, providerSkipReason },
+        args,
+        { nowMs }
+      );
+      for (const line of buildDecisionCycleReport(cycle, nowMs)) console.log(line);
+      return oneLineDecisionSummary(cycle, nowMs);
     };
 
     const { iterations, stopped } = await runPaperLoop({

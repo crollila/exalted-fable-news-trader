@@ -152,7 +152,11 @@ test('custom thresholds tighten the gate', () => {
   assert.equal(strict.accepted, false);
   assert.match(strict.reason, /confidence .* below threshold 0.8/);
   // Defaults remain conservative.
-  assert.equal(DEFAULT_THRESHOLDS.minConfidence, 0.6);
+  assert.deepEqual(DEFAULT_THRESHOLDS, {
+    minConfidence: 0.55,
+    minImpact: 0.35,
+    minSentiment: 0.2,
+  });
 });
 
 // --- sanitization ----------------------------------------------------------

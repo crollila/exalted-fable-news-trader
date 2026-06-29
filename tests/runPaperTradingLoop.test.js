@@ -112,12 +112,18 @@ test('buildHeartbeat shows mode + market status and no secrets', () => {
 
 test('loop parseArgs forwards advanced one-shot flags AND its own scheduling flags', () => {
   const a = parseArgs([
-    '--symbols', 'AAPL,MSFT', '--allow-shorts', '--allow-options', '--options-mode', 'plan_only',
+    '--symbols', 'AAPL,MSFT', '--classifier', 'real_model', '--ingest-limit', '12',
+    '--classify-limit', '4', '--news-lookback-minutes', '90',
+    '--allow-shorts', '--allow-options', '--options-mode', 'plan_only',
     '--max-order-notional', '500', '--interval-minutes', '1', '--max-iterations', '20',
     '--run-outside-market-hours', 'true', '--send-discord-eod-report', '--execute-paper',
   ]);
   // forwarded one-shot flags
   assert.deepEqual(a.symbols, ['AAPL', 'MSFT']);
+  assert.equal(a.classifier, 'real_model');
+  assert.equal(a.ingestLimit, 12);
+  assert.equal(a.classifyLimit, 4);
+  assert.equal(a.newsLookbackMinutes, 90);
   assert.equal(a.allowShorts, true);
   assert.equal(a.allowOptions, true);
   assert.equal(a.caps.maxOrderNotional, 500);
@@ -127,6 +133,32 @@ test('loop parseArgs forwards advanced one-shot flags AND its own scheduling fla
   assert.equal(a.maxIterations, 20);
   assert.equal(a.runOutsideMarketHours, true);
   assert.equal(a.sendDiscordEod, true);
+});
+
+test('loop parseArgs applies non-secret defaults while CLI flags still win', () => {
+  const a = parseArgs(
+    ['--symbols', 'AAPL', '--impact-threshold', '0.4', '--interval-minutes', '15'],
+    {
+      symbols: ['MSFT'],
+      classifier: 'real_model',
+      ingestLimit: 9,
+      classifyLimit: 3,
+      newsLookbackMinutes: 45,
+      thresholds: { minConfidence: 0.52, minImpact: 0.33, minSentiment: 0.18 },
+      intervalMinutes: 10,
+      maxIterations: 7,
+    }
+  );
+  assert.deepEqual(a.symbols, ['AAPL']); // CLI wins
+  assert.equal(a.classifier, 'real_model');
+  assert.equal(a.ingestLimit, 9);
+  assert.equal(a.classifyLimit, 3);
+  assert.equal(a.newsLookbackMinutes, 45);
+  assert.equal(a.thresholds.minConfidence, 0.52);
+  assert.equal(a.thresholds.minImpact, 0.4); // CLI wins over default
+  assert.equal(a.thresholds.minSentiment, 0.18);
+  assert.equal(a.intervalMinutes, 15); // CLI wins over default
+  assert.equal(a.maxIterations, 7);
 });
 
 test('importing the loop script performs no network and requires no credentials', () => {

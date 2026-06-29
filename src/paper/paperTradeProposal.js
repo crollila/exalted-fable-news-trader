@@ -25,9 +25,9 @@ export const MAX_QTY = 100;
 
 /** Conservative score gates. A long/short trade must clear ALL of these. */
 export const DEFAULT_THRESHOLDS = Object.freeze({
-  minConfidence: 0.6,
-  minImpact: 0.5,
-  minSentiment: 0.3,
+  minConfidence: 0.55,
+  minImpact: 0.35,
+  minSentiment: 0.2,
 });
 
 /** Only these parser outcomes carry a usable score (others are failures-as-data). */

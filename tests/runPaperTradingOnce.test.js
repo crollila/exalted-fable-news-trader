@@ -9,13 +9,19 @@ import assert from 'node:assert/strict';
 import { openMemoryDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { deriveCapabilities } from '../src/paper/accountCapabilities.js';
+import { createMockProvider } from '../src/providers/mockProvider.js';
 import {
   parseArgs,
+  listRecentScoredEvents,
   selectRecentScoredEvent,
+  runPaperDecisionCycle,
   runPaperTradeOnce,
   buildPaperReport,
   getDailyCounters,
   oneLineSummary,
+  oneLineDecisionSummary,
+  paperDefaultsFromStrategySettings,
+  PAPER_DECISION_OUTCOMES,
   MAX_QTY,
 } from '../scripts/runPaperTradingOnce.js';
 
@@ -71,8 +77,76 @@ function fakePaperClient() {
   const calls = { equity: [], option: [] };
   return {
     calls,
+    getAccount: async () => marginAccount(),
+    getPositions: async () => [],
     submitMarketOrder: async (o) => { calls.equity.push(o); return { id: 'ord_eq', status: 'accepted', submittedAt: '2026-06-18T14:30:01.000Z', filledAvgPrice: null }; },
     submitOptionMarketOrder: async (o) => { calls.option.push(o); return { id: 'ord_op', status: 'accepted', submittedAt: '2026-06-18T14:30:02.000Z', filledAvgPrice: null }; },
+  };
+}
+
+function throwingPaperClient(message = 'sanitized submit failure') {
+  const client = fakePaperClient();
+  client.submitMarketOrder = async (o) => {
+    client.calls.equity.push(o);
+    throw new Error(message);
+  };
+  return client;
+}
+
+function fakePriceSource(price = 200) {
+  return {
+    name: 'fake-price',
+    getTradesAround: async () => [{ price, at: '2026-06-18T14:15:00.000Z', size: 1 }],
+  };
+}
+
+function rawNews(id, over = {}) {
+  return {
+    id,
+    symbols: ['AAPL'],
+    headline: 'SECRET-HEADLINE-MUST-NOT-PRINT',
+    created_at: '2026-06-18T14:00:00.000Z',
+    received_at: '2026-06-18T14:00:01.000Z',
+    type: 'earnings',
+    ...over,
+  };
+}
+
+function realModelClassifier({ direction = 'up', sentiment = 0.3, impact = 0.4, confidence = 0.6, parserStatus = 'parsed', onClassify = null } = {}) {
+  return {
+    name: 'model',
+    modelName: 'claude-opus-4-8',
+    promptVersion: 'model_v1',
+    classifyEvent: async (event) => {
+      if (onClassify) await onClassify(event);
+      if (parserStatus !== 'parsed') {
+        return {
+          promptVersion: 'model_v1',
+          modelName: 'claude-opus-4-8',
+          parserStatus,
+          output: null,
+          rawModelResponse: '',
+          errors: ['test classifier failure'],
+        };
+      }
+      return {
+        promptVersion: 'model_v1',
+        modelName: 'claude-opus-4-8',
+        parserStatus: 'parsed',
+        output: {
+          newsType: 'earnings',
+          sentimentScore: sentiment,
+          impactScore: impact,
+          confidence,
+          direction,
+          timeHorizon: 'intraday',
+          affectedSymbols: ['AAPL'],
+          rationale: 'SECRET-RATIONALE-MUST-NOT-PRINT',
+        },
+        rawModelResponse: 'RAW-MODEL-RESPONSE-MUST-NOT-PRINT',
+        errors: [],
+      };
+    },
   };
 }
 
@@ -125,6 +199,48 @@ test('selectRecentScoredEvent picks the most recent model_v1 score in allowed sy
   closeDatabase(db);
 });
 
+test('default selection excludes already rejected/traded events; explicit event id overrides', () => {
+  const db = freshDb();
+  const oldId = seedScoredEvent(db, { ticker: 'AAPL', sentiment: 0.25 });
+  const processedId = seedScoredEvent(db, { ticker: 'AAPL', sentiment: 0.3 });
+  db.prepare(
+    `INSERT INTO rejected_trades (news_event_id, ticker, side, quantity, reason)
+     VALUES (?, 'AAPL', 'buy', 1, 'impact 0.1 below threshold 0.35')`
+  ).run(processedId);
+
+  const defaultSel = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
+  assert.equal(defaultSel.event.id, oldId);
+
+  const explicit = selectRecentScoredEvent(db, { eventId: processedId, allowedSymbols: ['AAPL'] });
+  assert.equal(explicit.event.id, processedId);
+
+  const list = listRecentScoredEvents(db, { allowedSymbols: ['AAPL'], excludeProcessed: false });
+  assert.deepEqual(list.map((s) => s.event.id), [processedId, oldId]);
+  closeDatabase(db);
+});
+
+test('paperDefaultsFromStrategySettings maps non-secret runtime settings into CLI defaults', () => {
+  const defaults = paperDefaultsFromStrategySettings({
+    symbols: ['msft', 'aapl', 'aapl'],
+    allow_shorts: true,
+    allow_options: true,
+    options_mode: 'plan_only',
+    confidence_threshold: 0.52,
+    impact_threshold: 0.33,
+    sentiment_threshold: 0.18,
+    max_order_notional: 250,
+  });
+  const args = parseArgs(['--impact-threshold', '0.4'], defaults);
+  assert.deepEqual(args.symbols, ['MSFT', 'AAPL']);
+  assert.equal(args.allowShorts, true);
+  assert.equal(args.allowOptions, true);
+  assert.equal(args.thresholds.minConfidence, 0.52);
+  assert.equal(args.thresholds.minImpact, 0.4); // CLI wins over settings default
+  assert.equal(args.thresholds.minSentiment, 0.18);
+  assert.equal(args.caps.maxOrderNotional, 250);
+  assert.equal(args.executePaper, false); // settings cannot enable execution
+});
+
 // --- equity long: dry run vs execute ---------------------------------------
 
 test('equity long DRY RUN (no account) accepts and writes nothing', async () => {
@@ -154,6 +270,160 @@ test('equity long EXECUTE submits a buy and writes paper_trades (margin account,
   assert.equal(result.equity.risk.approved, true);
   assert.deepEqual(client.calls.equity[0], { symbol: 'AAPL', qty: 1, side: 'buy' });
   assert.ok(result.equity.paperTradeId > 0);
+  closeDatabase(db);
+});
+
+// --- fresh decision cycle orchestration -----------------------------------
+
+test('fresh ingest/classify/trade cycle reaches the fake PAPER submit client', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model', '--execute-paper']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      provider: createMockProvider([rawNews('fresh-pass')]),
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource(200),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED);
+  assert.equal(cycle.ingestion.inserted, 1);
+  assert.equal(cycle.classification.stored, 1);
+  assert.equal(client.calls.equity.length, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 1);
+  const hb = oneLineDecisionSummary(cycle, Date.parse('2026-06-18T14:30:00.000Z'));
+  assert.match(hb, /event=\d+ AAPL age=30m/);
+  assert.ok(!hb.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
+  closeDatabase(db);
+});
+
+test('fresh score below a default threshold is logged as a rejection', async () => {
+  const db = freshDb();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      provider: createMockProvider([rawNews('fresh-low-impact')]),
+      classifier: realModelClassifier({ impact: 0.1 }),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.ALL_FRESH_SCORES_FAILED_SIGNAL_THRESHOLDS);
+  assert.match(cycle.skipReason, /failed signal thresholds/);
+  const row = db.prepare('SELECT reason FROM rejected_trades').get();
+  assert.match(row.reason, /impact 0.1 below threshold 0.35/);
+  closeDatabase(db);
+});
+
+test('decision cycle distinguishes no new news', async () => {
+  const db = freshDb();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    { provider: createMockProvider([]), classifier: realModelClassifier() },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.NO_NEW_NEWS);
+  assert.match(cycle.skipReason, /no new news/);
+  closeDatabase(db);
+});
+
+test('decision cycle distinguishes no fresh real-model score', async () => {
+  const db = freshDb();
+  const args = parseArgs(['--symbols', 'AAPL']); // no --classifier real_model
+  const cycle = await runPaperDecisionCycle(
+    db,
+    { provider: createMockProvider([rawNews('fresh-no-model')]), classifier: null },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.NO_FRESH_REAL_MODEL_SCORE);
+  assert.match(cycle.skipReason, /real_model classifier/);
+  closeDatabase(db);
+});
+
+test('decision cycle distinguishes already processed fresh scored events', async () => {
+  const db = freshDb();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model']);
+  const classifier = realModelClassifier({
+    onClassify: async (event) => {
+      db.prepare(
+        `INSERT INTO rejected_trades (news_event_id, ticker, side, quantity, reason)
+         VALUES (?, ?, 'buy', 1, 'already tested')`
+      ).run(event.id, event.ticker);
+    },
+  });
+  const cycle = await runPaperDecisionCycle(
+    db,
+    { provider: createMockProvider([rawNews('fresh-processed')]), classifier },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.ALREADY_PROCESSED_EVENT);
+  assert.match(cycle.skipReason, /already have paper_trades or rejected_trades/);
+  closeDatabase(db);
+});
+
+test('decision cycle distinguishes risk rejection from signal rejection', async () => {
+  const db = freshDb();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model', '--execute-paper']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      provider: createMockProvider([rawNews('fresh-risk')]),
+      classifier: realModelClassifier(),
+      paperClient: fakePaperClient(),
+      priceSource: null, // execute mode cannot verify notional without a reference price
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.RISK_REJECTION);
+  assert.match(cycle.trade.result.equity.risk.reason, /cannot verify notional caps/);
+  closeDatabase(db);
+});
+
+test('decision cycle distinguishes broker submission errors', async () => {
+  const db = freshDb();
+  const client = throwingPaperClient();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model', '--execute-paper']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      provider: createMockProvider([rawNews('fresh-broker')]),
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource(200),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR);
+  assert.equal(client.calls.equity.length, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 0);
+  closeDatabase(db);
+});
+
+test('explicit --event-id override deliberately retests a processed scored event', async () => {
+  const db = freshDb();
+  const eventId = seedScoredEvent(db, { direction: 'up', impact: 0.4, sentiment: 0.3, confidence: 0.6 });
+  db.prepare(
+    `INSERT INTO rejected_trades (news_event_id, ticker, side, quantity, reason)
+     VALUES (?, 'AAPL', 'buy', 1, 'prior rejection')`
+  ).run(eventId);
+  const args = parseArgs(['--symbols', 'AAPL', '--event-id', String(eventId)]);
+  const cycle = await runPaperDecisionCycle(db, {}, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED);
+  assert.equal(cycle.selected.event.id, eventId);
+  assert.equal(cycle.trade.result.equity.decision, 'accepted');
   closeDatabase(db);
 });
 

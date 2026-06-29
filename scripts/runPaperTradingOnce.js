@@ -28,8 +28,11 @@
 
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from '../src/config.js';
+import { loadStrategySettings } from '../src/config/strategySettings.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
+import { ingestNews } from '../src/ingestion/ingestNews.js';
+import { classifyAndStore } from '../src/ingestion/classifyNews.js';
 import { createAlpacaPaperClient } from '../src/paper/alpacaPaperClient.js';
 import { createAlpacaTradesPriceSource } from '../src/prices/alpacaTradesPriceSource.js';
 import {
@@ -49,6 +52,23 @@ export { DEFAULT_QTY, MAX_QTY, DEFAULT_THRESHOLDS, DEFAULT_CAPS };
 
 const DEFAULT_SYMBOLS = ['AAPL'];
 const OPTIONS_MODES = new Set(['plan_only', 'execute_paper']);
+export const PAPER_CLASSIFIERS = Object.freeze(['real_model']);
+export const DEFAULT_PAPER_INGEST_LIMIT = 20;
+export const MAX_PAPER_INGEST_LIMIT = 50;
+export const DEFAULT_PAPER_CLASSIFY_LIMIT = 5;
+export const MAX_PAPER_CLASSIFY_LIMIT = 5;
+export const DEFAULT_NEWS_LOOKBACK_MINUTES = 60;
+export const MAX_NEWS_LOOKBACK_MINUTES = 390;
+
+export const PAPER_DECISION_OUTCOMES = Object.freeze({
+  TRADE_ATTEMPTED: 'trade_attempted',
+  NO_NEW_NEWS: 'no_new_news',
+  NO_FRESH_REAL_MODEL_SCORE: 'no_fresh_real_model_score',
+  ALL_FRESH_SCORES_FAILED_SIGNAL_THRESHOLDS: 'all_fresh_scores_failed_signal_thresholds',
+  ALREADY_PROCESSED_EVENT: 'already_processed_event',
+  RISK_REJECTION: 'risk_rejection',
+  BROKER_SUBMISSION_ERROR: 'broker_submission_error',
+});
 
 /** Reference-price lookup window (free IEX feed is restricted for very recent data). */
 const REF_PRICE_LAG_MIN = 16;
@@ -66,27 +86,70 @@ function parsePosInt(value) {
   const n = Number.parseInt(value, 10);
   return Number.isInteger(n) && n > 0 ? n : null;
 }
+function clampInt(value, fallback, lo, hi) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isInteger(n) || n <= 0) return fallback;
+  return Math.min(Math.max(n, lo), hi);
+}
+function cleanSymbols(value, fallback = DEFAULT_SYMBOLS) {
+  const symbols = Array.isArray(value)
+    ? value.map((s) => String(s).trim().toUpperCase()).filter(Boolean)
+    : [];
+  return symbols.length > 0 ? [...new Set(symbols)] : [...fallback];
+}
+
+/** Map non-secret runtime strategy settings into paper script defaults. */
+export function paperDefaultsFromStrategySettings(settings = {}) {
+  const defaults = {};
+  if (Array.isArray(settings.symbols)) defaults.symbols = cleanSymbols(settings.symbols);
+  if (typeof settings.allow_shorts === 'boolean') defaults.allowShorts = settings.allow_shorts;
+  if (typeof settings.allow_options === 'boolean') defaults.allowOptions = settings.allow_options;
+  if (OPTIONS_MODES.has(settings.options_mode)) defaults.optionsMode = settings.options_mode;
+
+  defaults.thresholds = {};
+  if (parseUnitFloat(settings.confidence_threshold) !== null) defaults.thresholds.minConfidence = Number(settings.confidence_threshold);
+  if (parseUnitFloat(settings.impact_threshold) !== null) defaults.thresholds.minImpact = Number(settings.impact_threshold);
+  if (parseUnitFloat(settings.sentiment_threshold) !== null) defaults.thresholds.minSentiment = Number(settings.sentiment_threshold);
+  if (Object.keys(defaults.thresholds).length === 0) delete defaults.thresholds;
+
+  defaults.caps = {};
+  if (parsePosNum(settings.max_order_notional) !== null) defaults.caps.maxOrderNotional = Number(settings.max_order_notional);
+  if (parsePosNum(settings.max_symbol_exposure) !== null) defaults.caps.maxSymbolExposure = Number(settings.max_symbol_exposure);
+  if (parsePosNum(settings.max_gross_exposure) !== null) defaults.caps.maxGrossExposure = Number(settings.max_gross_exposure);
+  if (parsePosNum(settings.max_daily_paper_orders) !== null) defaults.caps.maxDailyPaperOrders = Number(settings.max_daily_paper_orders);
+  if (parsePosNum(settings.max_daily_paper_notional) !== null) defaults.caps.maxDailyPaperNotional = Number(settings.max_daily_paper_notional);
+  if (parsePosNum(settings.max_option_premium) !== null) {
+    defaults.caps.maxOptionPremium = Number(settings.max_option_premium);
+    defaults.optionMaxPremium = Number(settings.max_option_premium);
+  }
+  if (Object.keys(defaults.caps).length === 0) delete defaults.caps;
+  return defaults;
+}
 
 /**
  * Parse CLI args. Exported for tests. Every numeric value is validated; unknown
  * flags are ignored; execution stays OFF unless --execute-paper is present.
  */
-export function parseArgs(argv) {
+export function parseArgs(argv, defaults = {}) {
   const args = {
-    symbols: [...DEFAULT_SYMBOLS],
-    qty: DEFAULT_QTY,
+    symbols: cleanSymbols(defaults.symbols),
+    qty: Math.min(parsePosInt(defaults.qty) ?? DEFAULT_QTY, MAX_QTY),
     eventId: null,
     executePaper: false,
-    allowShorts: false,
-    allowOptions: false,
-    optionsMode: 'plan_only',
-    optionSymbol: null,
-    optionExpiryDaysMin: null,
-    optionExpiryDaysMax: null,
-    optionMaxPremium: null,
-    optionContractLimit: DEFAULT_OPTION_CONTRACT_LIMIT,
-    thresholds: {},
-    caps: {},
+    classifier: defaults.classifier ?? null,
+    ingestLimit: clampInt(defaults.ingestLimit, DEFAULT_PAPER_INGEST_LIMIT, 1, MAX_PAPER_INGEST_LIMIT),
+    classifyLimit: clampInt(defaults.classifyLimit, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT),
+    newsLookbackMinutes: clampInt(defaults.newsLookbackMinutes, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES),
+    allowShorts: defaults.allowShorts === true,
+    allowOptions: defaults.allowOptions === true,
+    optionsMode: OPTIONS_MODES.has(defaults.optionsMode) ? defaults.optionsMode : 'plan_only',
+    optionSymbol: defaults.optionSymbol ?? null,
+    optionExpiryDaysMin: parsePosInt(defaults.optionExpiryDaysMin),
+    optionExpiryDaysMax: parsePosInt(defaults.optionExpiryDaysMax),
+    optionMaxPremium: parsePosNum(defaults.optionMaxPremium),
+    optionContractLimit: parsePosInt(defaults.optionContractLimit) ?? DEFAULT_OPTION_CONTRACT_LIMIT,
+    thresholds: { ...(defaults.thresholds ?? {}) },
+    caps: { ...(defaults.caps ?? {}) },
   };
   const setThresh = (key, v) => { const f = parseUnitFloat(v); if (f !== null) args.thresholds[key] = f; };
   const setCap = (key, v) => { const n = parsePosNum(v); if (n !== null) args.caps[key] = n; };
@@ -104,6 +167,10 @@ export function parseArgs(argv) {
     } else if (flag === '--confidence-threshold' && next) { setThresh('minConfidence', next); i += 1; }
     else if (flag === '--impact-threshold' && next) { setThresh('minImpact', next); i += 1; }
     else if (flag === '--sentiment-threshold' && next) { setThresh('minSentiment', next); i += 1; }
+    else if (flag === '--classifier' && next) { args.classifier = next.trim(); i += 1; }
+    else if (flag === '--ingest-limit' && next) { args.ingestLimit = clampInt(next, DEFAULT_PAPER_INGEST_LIMIT, 1, MAX_PAPER_INGEST_LIMIT); i += 1; }
+    else if (flag === '--classify-limit' && next) { args.classifyLimit = clampInt(next, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT); i += 1; }
+    else if (flag === '--news-lookback-minutes' && next) { args.newsLookbackMinutes = clampInt(next, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES); i += 1; }
     else if (flag === '--allow-shorts') { args.allowShorts = true; }
     else if (flag === '--allow-options') { args.allowOptions = true; }
     else if (flag === '--options-mode' && next) {
@@ -126,22 +193,44 @@ export function parseArgs(argv) {
   return args;
 }
 
-/** Select ONE recent scored event (whitelisted columns only). */
-export function selectRecentScoredEvent(
+/** List recent scored events (whitelisted columns only). */
+export function listRecentScoredEvents(
   db,
-  { eventId = null, allowedSymbols = [], promptVersion = MODEL_PROMPT_VERSION } = {}
+  {
+    eventId = null,
+    eventIds = null,
+    allowedSymbols = [],
+    promptVersion = MODEL_PROMPT_VERSION,
+    excludeProcessed = true,
+    limit = 25,
+  } = {}
 ) {
   const symbols = (allowedSymbols ?? []).map((s) => String(s).trim().toUpperCase()).filter(Boolean);
+  const explicitEventId = Number.isInteger(eventId) && eventId > 0;
   const conds = ['s.prompt_version = ?'];
   const params = [promptVersion];
-  if (Number.isInteger(eventId) && eventId > 0) { conds.push('n.id = ?'); params.push(eventId); }
+  if (explicitEventId) {
+    conds.push('n.id = ?');
+    params.push(eventId);
+  } else if (Array.isArray(eventIds) && eventIds.length > 0) {
+    const cleanIds = eventIds.filter((id) => Number.isInteger(id) && id > 0);
+    if (cleanIds.length === 0) return [];
+    conds.push(`n.id IN (${cleanIds.map(() => '?').join(', ')})`);
+    params.push(...cleanIds);
+  }
   if (symbols.length > 0) {
     conds.push(`n.ticker IN (${symbols.map(() => '?').join(', ')})`);
     params.push(...symbols);
   }
-  const row = db
+  if (excludeProcessed && !explicitEventId) {
+    conds.push('NOT EXISTS (SELECT 1 FROM paper_trades pt WHERE pt.news_event_id = n.id)');
+    conds.push('NOT EXISTS (SELECT 1 FROM rejected_trades rt WHERE rt.news_event_id = n.id)');
+  }
+  const cap = clampInt(limit, 25, 1, 100);
+  return db
     .prepare(
       `SELECT n.id AS event_id, n.ticker AS ticker,
+              n.published_at AS published_at, n.received_at AS received_at,
               s.model AS model, s.prompt_version AS prompt_version,
               s.sentiment_score AS sentiment_score, s.impact_score AS impact_score,
               s.confidence AS confidence, s.direction AS direction,
@@ -150,19 +239,24 @@ export function selectRecentScoredEvent(
          JOIN sentiment_scores s ON s.news_event_id = n.id
         WHERE ${conds.join(' AND ')}
         ORDER BY s.id DESC
-        LIMIT 1`
+        LIMIT ?`
     )
-    .get(...params);
-  if (!row) return null;
-  return {
+    .all(...params, cap)
+    .map((row) => ({
     event: { id: row.event_id, ticker: row.ticker },
+      freshness: { publishedAt: row.published_at, receivedAt: row.received_at },
     score: {
       model: row.model, prompt_version: row.prompt_version,
       sentiment_score: row.sentiment_score, impact_score: row.impact_score,
       confidence: row.confidence, direction: row.direction,
       parser_status: row.parser_status, news_type: row.news_type,
     },
-  };
+    }));
+}
+
+/** Select ONE recent scored event (whitelisted columns only). */
+export function selectRecentScoredEvent(db, opts = {}) {
+  return listRecentScoredEvents(db, { ...opts, limit: 1 })[0] ?? null;
 }
 
 /** Today's paper-order counters from the DB, for daily caps. Read-only. */
@@ -332,6 +426,253 @@ export async function fetchAccountState(paperClient) {
   return { account, positions, capabilities: deriveCapabilities(account) };
 }
 
+/** Fetch account/reference state and run the existing paper-trade core. */
+export async function executeSelectedPaperTrade(
+  db,
+  selected,
+  { args, paperClient = null, priceSource = null, nowMs = Date.now() }
+) {
+  const { account, positions, capabilities } = await fetchAccountState(paperClient);
+  const referencePrice = await fetchReferencePrice(priceSource, selected.event.ticker, nowMs);
+  const daily = getDailyCounters(db);
+  const result = await runPaperTradeOnce(db, selected, {
+    paperClient, account, positions, capabilities, referencePrice,
+    daily, nowMs,
+    qty: args.qty, allowedSymbols: args.symbols, thresholds: args.thresholds, allowShorts: args.allowShorts,
+    allowOptions: args.allowOptions, optionsMode: args.optionsMode, optionSymbol: args.optionSymbol,
+    optionMaxPremium: args.optionMaxPremium, optionContractLimit: args.optionContractLimit,
+    optionExpiryDaysMin: args.optionExpiryDaysMin, optionExpiryDaysMax: args.optionExpiryDaysMax,
+    caps: args.caps, executePaper: args.executePaper,
+  });
+  return { selected, result, lines: buildPaperReport(result, selected) };
+}
+
+function hasSignalPass(selected, args, nowMs) {
+  const equity = assessProposal({
+    event: selected.event,
+    score: selected.score,
+    qty: args.qty,
+    allowedSymbols: args.symbols,
+    thresholds: args.thresholds,
+    allowShorts: args.allowShorts,
+  });
+  if (equity.accepted) return true;
+  const option = proposeOption({
+    event: selected.event,
+    score: selected.score,
+    allowOptions: args.allowOptions,
+    optionsMode: args.optionsMode,
+    optionSymbol: args.optionSymbol,
+    allowedSymbols: args.symbols,
+    thresholds: args.thresholds,
+    optionContractLimit: args.optionContractLimit,
+    optionExpiryDaysMin: args.optionExpiryDaysMin,
+    optionExpiryDaysMax: args.optionExpiryDaysMax,
+    optionMaxPremium: args.optionMaxPremium,
+    nowMs,
+  });
+  return option.enabled && option.accepted;
+}
+
+function tradeOutcome(result) {
+  const subs = [result?.equity, result?.option].filter(Boolean);
+  if (subs.some((s) => s.orderError)) return PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR;
+  if (subs.some((s) => s.decision === 'rejected' && s.risk && !s.risk.approved)) {
+    return PAPER_DECISION_OUTCOMES.RISK_REJECTION;
+  }
+  return PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED;
+}
+
+function ageLabel(receivedAt, nowMs) {
+  const ts = Date.parse(receivedAt);
+  if (!Number.isFinite(ts)) return 'unknown';
+  const minutes = Math.max(0, Math.round((nowMs - ts) / 60_000));
+  if (minutes < 120) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 72) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+function statusLine(statusCounts = {}) {
+  const entries = Object.entries(statusCounts);
+  if (entries.length === 0) return '(none)';
+  return entries.sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => `${k}=${v}`).join(' ');
+}
+
+/**
+ * Fresh loop cycle: ingest recent Alpaca news, score newly inserted events with
+ * the explicitly requested real-model classifier, then attempt a PAPER trade on
+ * a fresh, unprocessed scored event. All collaborators are injected for tests.
+ */
+export async function runPaperDecisionCycle(
+  db,
+  { provider = null, classifier = null, paperClient = null, priceSource = null, providerSkipReason = null } = {},
+  args = parseArgs([]),
+  { nowMs = Date.now() } = {}
+) {
+  const base = {
+    mode: args.executePaper ? 'execute_paper' : 'dry_run',
+    outcome: null,
+    skipReason: null,
+    ingestion: null,
+    classification: null,
+    freshCandidates: [],
+    selected: null,
+    trade: null,
+    lines: [],
+  };
+
+  if (Number.isInteger(args.eventId) && args.eventId > 0) {
+    const selected = selectRecentScoredEvent(db, {
+      eventId: args.eventId,
+      allowedSymbols: args.symbols,
+      excludeProcessed: false,
+    });
+    if (!selected) {
+      return {
+        ...base,
+        outcome: PAPER_DECISION_OUTCOMES.NO_FRESH_REAL_MODEL_SCORE,
+        skipReason: `explicit event ${args.eventId} has no ${MODEL_PROMPT_VERSION} score in allowed symbols`,
+      };
+    }
+    const trade = await executeSelectedPaperTrade(db, selected, { args, paperClient, priceSource, nowMs });
+    return { ...base, outcome: tradeOutcome(trade.result), selected, trade, lines: trade.lines };
+  }
+
+  if (!provider) {
+    return {
+      ...base,
+      outcome: PAPER_DECISION_OUTCOMES.NO_NEW_NEWS,
+      skipReason: providerSkipReason ?? 'Alpaca News provider not configured',
+    };
+  }
+
+  const since = new Date(nowMs - args.newsLookbackMinutes * 60_000).toISOString();
+  const until = new Date(nowMs).toISOString();
+  const ingestion = await ingestNews(db, provider, {
+    symbols: args.symbols,
+    limit: args.ingestLimit,
+    since,
+    until,
+  });
+  base.ingestion = { ...ingestion, since, until };
+  if ((ingestion.insertedIds ?? []).length === 0) {
+    return {
+      ...base,
+      outcome: PAPER_DECISION_OUTCOMES.NO_NEW_NEWS,
+      skipReason: `no new news inserted (fetched=${ingestion.fetched} duplicates=${ingestion.duplicates} failed=${ingestion.failed})`,
+    };
+  }
+
+  if (args.classifier !== 'real_model' || !classifier || classifier.promptVersion !== MODEL_PROMPT_VERSION) {
+    return {
+      ...base,
+      outcome: PAPER_DECISION_OUTCOMES.NO_FRESH_REAL_MODEL_SCORE,
+      skipReason: 'real_model classifier was not requested/configured for this loop iteration',
+    };
+  }
+
+  const idsToClassify = ingestion.insertedIds.slice(0, args.classifyLimit);
+  const classification = await classifyAndStore(db, classifier, { eventIds: idsToClassify });
+  base.classification = {
+    ...classification,
+    selectedIds: idsToClassify,
+    model: classifier.modelName,
+    promptVersion: classifier.promptVersion,
+  };
+
+  const scored = listRecentScoredEvents(db, {
+    eventIds: idsToClassify,
+    allowedSymbols: args.symbols,
+    promptVersion: MODEL_PROMPT_VERSION,
+    excludeProcessed: false,
+    limit: args.classifyLimit,
+  });
+  const usable = scored.filter((c) => ['parsed', 'fallback_used'].includes(c.score.parser_status));
+  if (usable.length === 0) {
+    return {
+      ...base,
+      outcome: PAPER_DECISION_OUTCOMES.NO_FRESH_REAL_MODEL_SCORE,
+      freshCandidates: scored,
+      skipReason: `no fresh usable ${MODEL_PROMPT_VERSION} score (statuses=${statusLine(classification.statusCounts)})`,
+    };
+  }
+
+  const unprocessed = listRecentScoredEvents(db, {
+    eventIds: idsToClassify,
+    allowedSymbols: args.symbols,
+    promptVersion: MODEL_PROMPT_VERSION,
+    excludeProcessed: true,
+    limit: args.classifyLimit,
+  }).filter((c) => ['parsed', 'fallback_used'].includes(c.score.parser_status));
+  if (unprocessed.length === 0) {
+    return {
+      ...base,
+      outcome: PAPER_DECISION_OUTCOMES.ALREADY_PROCESSED_EVENT,
+      freshCandidates: usable,
+      skipReason: 'all fresh scored events already have paper_trades or rejected_trades records',
+    };
+  }
+
+  const selected = unprocessed.find((c) => hasSignalPass(c, args, nowMs));
+  const candidate = selected ?? unprocessed[0];
+  const trade = await executeSelectedPaperTrade(db, candidate, { args, paperClient, priceSource, nowMs });
+  const outcome = selected
+    ? tradeOutcome(trade.result)
+    : PAPER_DECISION_OUTCOMES.ALL_FRESH_SCORES_FAILED_SIGNAL_THRESHOLDS;
+  return {
+    ...base,
+    outcome,
+    skipReason: selected ? null : 'all fresh usable scores failed signal thresholds',
+    freshCandidates: unprocessed,
+    selected: candidate,
+    trade,
+    lines: trade.lines,
+  };
+}
+
+export function oneLineDecisionSummary(cycle, nowMs = Date.now()) {
+  const ing = cycle?.ingestion
+    ? `ingest fetched=${cycle.ingestion.fetched} inserted=${cycle.ingestion.inserted} dup=${cycle.ingestion.duplicates}`
+    : 'ingest skipped';
+  const cls = cycle?.classification
+    ? `classify stored=${cycle.classification.stored} statuses=${statusLine(cycle.classification.statusCounts)}`
+    : 'classify skipped';
+  const selected = cycle?.selected
+    ? `event=${cycle.selected.event.id} ${cycle.selected.event.ticker} age=${ageLabel(cycle.selected.freshness?.receivedAt, nowMs)}`
+    : 'event=(none)';
+  const skip = cycle?.skipReason ? `skip=${cycle.skipReason}` : oneLineSummary(cycle?.trade?.result);
+  return `${cycle?.outcome ?? 'unknown'}; ${ing}; ${cls}; ${selected}; ${skip}`;
+}
+
+export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
+  const lines = [
+    'Paper trading decision cycle (fresh ingest/classify/trade, PAPER-only)',
+    `  outcome:    ${cycle.outcome ?? 'unknown'}`,
+  ];
+  if (cycle.ingestion) {
+    lines.push(
+      `  ingest:     fetched=${cycle.ingestion.fetched} inserted=${cycle.ingestion.inserted} ` +
+        `duplicates=${cycle.ingestion.duplicates} failed=${cycle.ingestion.failed}`
+    );
+  }
+  if (cycle.classification) {
+    lines.push(
+      `  classify:   selected=${cycle.classification.selectedIds?.length ?? 0} stored=${cycle.classification.stored} ` +
+        `statuses=${statusLine(cycle.classification.statusCounts)}`
+    );
+  }
+  if (cycle.selected) {
+    lines.push(
+      `  selected:   event ${cycle.selected.event.id} ${cycle.selected.event.ticker} ` +
+        `freshness=${ageLabel(cycle.selected.freshness?.receivedAt, nowMs)}`
+    );
+  }
+  if (cycle.skipReason) lines.push(`  skip:       ${cycle.skipReason}`);
+  if (cycle.lines?.length > 0) lines.push(...cycle.lines.map((line) => `  ${line}`));
+  return lines;
+}
+
 /** One short sanitized summary line per asset class, for loop heartbeats. */
 export function oneLineSummary(result) {
   const e = result.equity;
@@ -389,30 +730,25 @@ export function buildPaperReport(result, selected) {
  * run the trade logic. Returns { selected, result, lines }.
  */
 export async function executeOneShot(db, { args, paperClient = null, priceSource = null, nowMs = Date.now() }) {
-  const selected = selectRecentScoredEvent(db, { eventId: args.eventId, allowedSymbols: args.symbols });
+  const selected = selectRecentScoredEvent(db, {
+    eventId: args.eventId,
+    allowedSymbols: args.symbols,
+    excludeProcessed: true,
+  });
   if (!selected) {
     return { selected: null, result: null, lines: [
       `No eligible scored event found (need a ${MODEL_PROMPT_VERSION} score on one of [${args.symbols.join(',')}]).`,
     ] };
   }
-  const { account, positions, capabilities } = await fetchAccountState(paperClient);
-  const referencePrice = await fetchReferencePrice(priceSource, selected.event.ticker, nowMs);
-  const daily = getDailyCounters(db);
-  const result = await runPaperTradeOnce(db, selected, {
-    paperClient, account, positions, capabilities, referencePrice,
-    daily, nowMs,
-    qty: args.qty, allowedSymbols: args.symbols, thresholds: args.thresholds, allowShorts: args.allowShorts,
-    allowOptions: args.allowOptions, optionsMode: args.optionsMode, optionSymbol: args.optionSymbol,
-    optionMaxPremium: args.optionMaxPremium, optionContractLimit: args.optionContractLimit,
-    optionExpiryDaysMin: args.optionExpiryDaysMin, optionExpiryDaysMax: args.optionExpiryDaysMax,
-    caps: args.caps, executePaper: args.executePaper,
-  });
-  return { selected, result, lines: buildPaperReport(result, selected) };
+  const trade = await executeSelectedPaperTrade(db, selected, { args, paperClient, priceSource, nowMs });
+  return { selected, result: trade.result, lines: trade.lines };
 }
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
   const config = loadConfig();
+  const strategy = loadStrategySettings();
+  const defaults = strategy.source === 'runtime' ? paperDefaultsFromStrategySettings(strategy.settings) : {};
+  const args = parseArgs(process.argv.slice(2), defaults);
 
   let db;
   try {

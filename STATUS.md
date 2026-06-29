@@ -4,7 +4,19 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Stable. All tests passing (463/463).
+- Uncommitted PAPER-loop repair in progress: the market-hours loop now runs a
+  fresh decision cycle each open iteration (recent Alpaca ingest -> newly
+  inserted event classification with explicit `--classifier real_model` ->
+  fresh unprocessed `model_v1` selection -> existing PAPER proposal/risk/order
+  path). Default selection excludes events already present in `paper_trades` or
+  `rejected_trades`; `--event-id` remains an explicit retest override. Heartbeat
+  outcomes distinguish no new news, no fresh real-model score, signal-threshold
+  failures, already-processed candidates, risk rejections, and broker submit
+  errors. PAPER signal defaults changed from confidence/impact/sentiment
+  `0.6/0.5/0.3` to `0.55/0.35/0.2`; CLI flags and runtime
+  `data/strategy-settings.json` can still override non-secret defaults. No
+  migrations/dependencies/live-trading path added.
+- Stable. All tests passing (474/474) on the uncommitted PAPER-loop repair.
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 - Phase 5 (PAPER trading) FIRST VERTICAL SLICE is COMMITTED (`df1931f`): a

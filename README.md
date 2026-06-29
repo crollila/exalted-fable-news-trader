@@ -275,8 +275,10 @@ node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL --execute-pap
 ```
 
 It selects one recent event scored by the real model (`prompt_version=model_v1`)
-whose ticker is in `--symbols`, then builds an **equity long, market buy, whole
-shares** proposal. The risk gate **rejects** unless: the ticker is in the
+whose ticker is in `--symbols`, excluding events that already have a
+`paper_trades` row or a `rejected_trades` row. Use `--event-id N` to deliberately
+retest a specific scored event. It then builds an **equity long, market buy,
+whole shares** proposal. The risk gate **rejects** unless: the ticker is in the
 `--symbols` allow-list, the parser status is `parsed`/`fallback_used`, the model
 direction is `up` (long-only — **no shorts**), and confidence/impact/sentiment
 clear conservative thresholds. Rejections are written to `rejected_trades` with a
@@ -286,8 +288,10 @@ writes nothing and stops before any order.
 Flags: `--symbols A,B` (allow-list), `--qty N` (default 1, hard-capped at 100),
 `--event-id N` (target a specific scored event), `--confidence-threshold`,
 `--impact-threshold`, `--sentiment-threshold` (each a 0–1 float), and
-`--execute-paper` (off by default). To populate scored events first, run the MVP
-pipeline / `classifyNewsOnce.js` with `--classifier real_model`.
+`--execute-paper` (off by default). Default PAPER signal thresholds are now
+confidence `0.55`, impact `0.35`, and sentiment magnitude `0.2` (previously
+`0.6`, `0.5`, `0.3`). To populate scored events first, run the MVP pipeline /
+`classifyNewsOnce.js` with `--classifier real_model`.
 
 Output is sanitized — event id, ticker, model/prompt, numeric scores, proposed
 side/qty, the risk decision, and (only if an order was sent) the order id/status.
@@ -333,12 +337,16 @@ premium — exposure is bounded by `--option-contract-limit` (paper-only).
 
 ## Market-hours PAPER loop
 
-A bounded loop runs the one-shot path on an interval during the US regular
-session only (Mon–Fri 09:30–16:00 ET; weekends skipped). It is **dry-run by
-default**, reuses the one-shot logic, enforces a **≥ 5-minute** interval and a
-max-iteration cap, prints a sanitized heartbeat each iteration, and exits
-cleanly on Ctrl+C. **Holiday limitation:** US market holidays/half-days are
-**not** modeled (no exchange calendar yet) — printed at startup.
+A bounded loop runs a fresh decision cycle on an interval during the US regular
+session only (Mon–Fri 09:30–16:00 ET; weekends skipped). Each open-market
+iteration ingests recent Alpaca news for `--symbols`, classifies newly inserted
+events only when `--classifier real_model` is explicitly requested, selects a
+fresh unprocessed `model_v1` score, and then reuses the one-shot PAPER
+proposal/risk/order path. It is **dry-run by default**, enforces a **≥
+5-minute** interval and a max-iteration cap, prints a sanitized heartbeat each
+iteration, and exits cleanly on Ctrl+C. **Holiday limitation:** US market
+holidays/half-days are **not** modeled (no exchange calendar yet) — printed at
+startup.
 
 Loop dry-run:
 
@@ -353,10 +361,15 @@ node --env-file=.env scripts/runPaperTradingLoop.js --symbols AAPL,MSFT,NVDA --c
 ```
 
 Extra loop flags: `--interval-minutes` (floored at 5), `--max-iterations`
-(capped), `--run-outside-market-hours true|false` (default false),
+(capped), `--ingest-limit` (default 20, capped at 50), `--classify-limit`
+(default/cap 5), `--news-lookback-minutes` (default 60, capped at 390),
+`--run-outside-market-hours true|false` (default false),
 `--send-discord-eod-report` (posts the EOD summary when the loop ends, if
-`DISCORD_WEBHOOK_URL` is set). Never part of `npm test` (the loop core runs with
-injected clock/sleep/market-hours/one-shot — no real timers, no network).
+`DISCORD_WEBHOOK_URL` is set). Heartbeats distinguish `no_new_news`,
+`no_fresh_real_model_score`, `all_fresh_scores_failed_signal_thresholds`,
+`already_processed_event`, `risk_rejection`, and `broker_submission_error`.
+Never part of `npm test` (the loop core runs with injected clock/sleep/
+market-hours/fakes — no real timers, no network).
 
 ## Discord end-of-day reports
 
@@ -464,6 +477,9 @@ Settings include `symbols`, `allow_shorts`, `allow_options`, `options_mode`,
 the `*_threshold` knobs, `interval_minutes`, `max_iterations`, and research
 focus (`scrape_target_groups`, `scrape_symbol_focus`). All values are
 validated/capped on load; secrets and `LIVE_TRADING_ENABLED` are never accepted.
+When `data/strategy-settings.json` exists, the PAPER one-shot/loop use these
+non-secret values as defaults; explicit CLI flags still override them, and the
+settings file can never enable `--execute-paper`.
 
 The **learning updater** reads recent paper outcomes and recommends conservative,
 bounded changes to the settings file (notional ±25%, counts ±20%, thresholds

@@ -138,6 +138,7 @@ test('parseArgs reads --measure-ids, dedups, and truncates to the hard cap', () 
 });
 
 test('parseArgs reads --classifier', () => {
+  assert.equal(parseArgs(['--classifier', 'openai']).classifier, 'openai');
   assert.equal(parseArgs(['--classifier', 'real_model']).classifier, 'real_model');
 });
 

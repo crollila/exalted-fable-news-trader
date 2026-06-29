@@ -88,13 +88,15 @@ export function summarizeScore(score) {
  * @param {number} [args.qty]              requested shares (clamped here too)
  * @param {string[]} [args.allowedSymbols] CLI allow-list (required to pass)
  * @param {object} [args.thresholds]       overrides for DEFAULT_THRESHOLDS
- * @param {boolean} [args.allowShorts]     gate for direction-down shorts
+ * @param {boolean} [args.allowShorts]     CLI/request gate for direction-down shorts
+ * @param {boolean} [args.shortsEnabled]   central PAPER_ENABLE_SHORTS gate
  * @returns {{ eventId: number|null, ticker: string, assetClass: 'equity',
  *   side: 'buy'|'sell', quantity: number, thresholds: object, score: object,
  *   accepted: boolean, reason: string }}
  */
 export function assessProposal({
   event, score, qty = DEFAULT_QTY, allowedSymbols = [], thresholds = {}, allowShorts = false,
+  shortsEnabled = true,
 } = {}) {
   const t = { ...DEFAULT_THRESHOLDS, ...(thresholds ?? {}) };
   const ticker = String(event?.ticker ?? '').trim().toUpperCase();
@@ -143,6 +145,7 @@ export function assessProposal({
 
   if (direction === 'down') {
     if (!allowShorts) return reject('direction down requires --allow-shorts (shorts disabled)');
+    if (!shortsEnabled) return reject('shorts disabled by PAPER_ENABLE_SHORTS=false');
     if (sentiment === null || sentiment > -t.minSentiment) {
       return reject(`sentiment ${fmt(sentiment)} not below short threshold ${-t.minSentiment}`);
     }

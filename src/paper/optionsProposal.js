@@ -3,13 +3,13 @@
 // SCOPE — deliberately bounded and safe:
 // - Single-leg LONG options only: BUY a call (bullish) or a put (bearish).
 //   No spreads, no multi-leg, no auto-rolls, no selling uncovered options.
-//   Selling is only ever to CLOSE an existing option position (handled by the
-//   caller against live positions; this module proposes opens).
-// - EXPLICIT --option-symbol (OCC) ONLY — there is no contract discovery in
-//   this patch, so execution requires the operator to name the exact contract.
-// - DEFAULT plan_only: a proposal never executes unless --options-mode
-//   execute_paper is explicitly chosen (and the caller still requires
-//   --execute-paper + a verified options capability).
+//   Selling to close is intentionally deferred until tested paper exit
+//   monitoring/reporting exists; this module proposes opens for research only.
+// - Contract discovery / quote validation happens downstream through injected
+//   broker/data clients. An explicit --option-symbol narrows discovery to that
+//   OCC contract; without it, the runtime chooses one eligible long call/put.
+// - DEFAULT plan_only: the runtime validates contracts/quotes for research and
+//   currently rejects execute_paper option submissions until exits are tested.
 // - PURE function (no HTTP, no DB). The risk/premium/exposure checks live in
 //   paperRisk.js; the capability gate lives in the caller.
 
@@ -75,8 +75,9 @@ export function intentForDirection(direction) {
  * @param {{id?:number, ticker?:string}} args.event
  * @param {object} args.score
  * @param {boolean} [args.allowOptions]
+ * @param {boolean} [args.optionsEnabled]  central PAPER_ENABLE_OPTIONS gate
  * @param {'plan_only'|'execute_paper'} [args.optionsMode]
- * @param {string|null} [args.optionSymbol]   explicit OCC symbol (required to execute)
+ * @param {string|null} [args.optionSymbol]   optional OCC symbol to narrow discovery
  * @param {string[]} [args.allowedSymbols]
  * @param {object} [args.thresholds]
  * @param {number} [args.optionContractLimit]
@@ -86,13 +87,28 @@ export function intentForDirection(direction) {
  * @param {number} [args.nowMs]  injectable clock for expiry checks
  */
 export function proposeOption({
-  event, score, allowOptions = false, optionsMode = 'plan_only', optionSymbol = null,
+  event, score, allowOptions = false, optionsEnabled = true, optionsMode = 'plan_only', optionSymbol = null,
   allowedSymbols = [], thresholds = {}, optionContractLimit = DEFAULT_OPTION_CONTRACT_LIMIT,
   optionExpiryDaysMin = null, optionExpiryDaysMax = null, optionMaxPremium = null,
   nowMs = Date.now(),
 } = {}) {
   if (!allowOptions) {
     return { enabled: false, accepted: false, reason: 'options disabled (--allow-options not set)' };
+  }
+  if (!optionsEnabled) {
+    return {
+      enabled: true,
+      accepted: false,
+      reason: 'options disabled by PAPER_ENABLE_OPTIONS=false',
+      assetClass: 'option',
+      intent: 'none',
+      underlying: event?.ticker ? String(event.ticker).trim().toUpperCase() : null,
+      side: 'buy',
+      contracts: clampContracts(optionContractLimit),
+      eventId: Number.isInteger(event?.id) ? event.id : null,
+      planOnly: true,
+      mode: 'disabled',
+    };
   }
 
   const t = { ...DEFAULT_THRESHOLDS, ...(thresholds ?? {}) };
@@ -144,15 +160,12 @@ export function proposeOption({
     return reject(`sentiment ${fmt(sentiment)} not below put threshold ${-t.minSentiment}`);
   }
 
-  // No explicit contract: plan-only is fine; execution is refused.
+  // No explicit contract: discovery/quote validation is required downstream.
   if (!base.optionSymbol) {
-    if (!planOnly) {
-      return reject('option execution requires --option-symbol (no contract discovery in this patch)');
-    }
     return {
       ...base, accepted: true,
       reason: `PLAN ${intent}: buy ${contracts} ${intent === 'bullish_call' ? 'call' : 'put'}(s) on ` +
-        `${base.underlying || '(underlying)'}; provide --option-symbol to execute`,
+        `${base.underlying || '(underlying)'}; contract discovery and quote validation required`,
     };
   }
 

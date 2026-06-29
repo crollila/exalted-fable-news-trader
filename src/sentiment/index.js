@@ -15,6 +15,7 @@ export { parseModelResponse } from './parseModelResponse.js';
 export { createFixtureClassifier } from './fixtureClassifier.js';
 export {
   createModelClassifier,
+  createAnthropicModelClassifier,
   buildSystemPrompt,
   buildUserPrompt,
   MODEL_PROMPT_VERSION,

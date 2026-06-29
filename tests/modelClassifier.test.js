@@ -7,6 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  createAnthropicModelClassifier,
   createModelClassifier,
   buildSystemPrompt,
   buildUserPrompt,
@@ -20,14 +21,15 @@ import {
   OUT_OF_RANGE_RESPONSE,
 } from './fixtures/modelResponses.js';
 
-const TEST_KEY = 'SECRET-ANTHROPIC-KEY-MUST-NOT-LEAK';
+const TEST_KEY = 'SECRET-OPENAI-KEY-MUST-NOT-LEAK';
+const TEST_MODEL = 'test-openai-model';
 
 /** A config with a configured model key (never a real one). */
 function configWithKey(model) {
-  return { model: { anthropicApiKey: TEST_KEY, classifierModel: model ?? 'claude-opus-4-8' } };
+  return { model: { openaiApiKey: TEST_KEY, openaiModel: model ?? TEST_MODEL } };
 }
 
-/** Build a fake httpFetch returning one canned Messages API payload. */
+/** Build a fake httpFetch returning one canned Responses API payload. */
 function fakeOkFetch(rawText, { capture } = {}) {
   return async (url, options) => {
     if (capture) capture.push({ url, options });
@@ -36,8 +38,8 @@ function fakeOkFetch(rawText, { capture } = {}) {
       status: 200,
       statusText: 'OK',
       json: async () => ({
-        content: [{ type: 'text', text: rawText }],
-        stop_reason: 'end_turn',
+        output_text: rawText,
+        usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
       }),
     };
   };
@@ -53,26 +55,30 @@ const EVENT = {
 
 test('createModelClassifier throws a clear not-configured error without a key', () => {
   assert.throws(
-    () => createModelClassifier({ model: { anthropicApiKey: null } }, { httpFetch: () => {} }),
+    () => createModelClassifier({ model: { openaiApiKey: null, openaiModel: TEST_MODEL } }, { httpFetch: () => {} }),
     /not configured/i
+  );
+  assert.throws(
+    () => createModelClassifier({ model: { openaiApiKey: TEST_KEY, openaiModel: null } }, { httpFetch: () => {} }),
+    /OPENAI_MODEL/i
   );
   // Also throws on an entirely absent model config block.
   assert.throws(() => createModelClassifier({}, { httpFetch: () => {} }), /not configured/i);
 });
 
 test('the constructed classifier carries the model identity and model_v1 prompt', () => {
-  const classifier = createModelClassifier(configWithKey('claude-opus-4-8'), {
+  const classifier = createModelClassifier(configWithKey(TEST_MODEL), {
     httpFetch: fakeOkFetch(VALID_RESPONSE),
   });
-  assert.equal(classifier.name, 'model');
+  assert.equal(classifier.name, 'openai');
   assert.equal(classifier.promptVersion, MODEL_PROMPT_VERSION);
-  assert.equal(classifier.modelName, 'claude-opus-4-8');
+  assert.equal(classifier.modelName, TEST_MODEL);
   // An explicit model option overrides the config default.
-  const haiku = createModelClassifier(configWithKey('claude-opus-4-8'), {
+  const override = createModelClassifier(configWithKey(TEST_MODEL), {
     httpFetch: fakeOkFetch(VALID_RESPONSE),
-    model: 'claude-haiku-4-5',
+    model: 'override-model',
   });
-  assert.equal(haiku.modelName, 'claude-haiku-4-5');
+  assert.equal(override.modelName, 'override-model');
 });
 
 // --- success mapping --------------------------------------------------------
@@ -84,6 +90,8 @@ test('a valid model response maps into a parsed ClassificationResult', async () 
   assert.equal(result.output.sentimentScore, 0.62);
   assert.equal(result.output.newsType, 'earnings');
   assert.equal(result.promptVersion, MODEL_PROMPT_VERSION);
+  assert.equal(result.provider, 'openai');
+  assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 5, totalTokens: 15 });
   // Raw model text is preserved byte-for-byte for storage/audit.
   assert.equal(result.rawModelResponse, VALID_RESPONSE);
 });
@@ -95,17 +103,19 @@ test('the request sends the key in a header only — never in the body', async (
   });
   await classifier.classifyEvent(EVENT);
   assert.equal(capture.length, 1);
-  const { options } = capture[0];
-  assert.equal(options.headers['x-api-key'], TEST_KEY);
-  assert.equal(options.headers['anthropic-version'], '2023-06-01');
+  const { url, options } = capture[0];
+  assert.equal(url, 'https://api.openai.com/v1/responses');
+  assert.equal(options.headers.Authorization, `Bearer ${TEST_KEY}`);
   assert.equal(options.method, 'POST');
   // The serialized request body must not contain the secret.
   assert.ok(!options.body.includes(TEST_KEY));
   // The body carries the model id and the whitelisted event text.
   const body = JSON.parse(options.body);
-  assert.equal(body.model, 'claude-opus-4-8');
-  assert.match(body.messages[0].content, /AAPL/);
-  assert.match(body.messages[0].content, /Apple beats earnings/);
+  assert.equal(body.model, TEST_MODEL);
+  assert.equal(body.store, false);
+  assert.equal(body.text.format.type, 'json_schema');
+  assert.match(body.input[0].content[0].text, /AAPL/);
+  assert.match(body.input[0].content[0].text, /Apple beats earnings/);
 });
 
 // --- parser failure modes flow through unchanged (failures = data) ---------
@@ -187,12 +197,21 @@ test('an empty/no-text response becomes model_error (never throws)', async () =>
     ok: true,
     status: 200,
     statusText: 'OK',
-    json: async () => ({ content: [], stop_reason: 'refusal' }),
+    json: async () => ({ output: [] }),
   });
   const classifier = createModelClassifier(configWithKey(), { httpFetch });
   const result = await classifier.classifyEvent(EVENT);
   assert.equal(result.parserStatus, 'model_error');
   assert.match(result.errors.join(' '), /no text content/);
+});
+
+test('Anthropic is available only through the explicit anthropic factory', () => {
+  const classifier = createAnthropicModelClassifier(
+    { model: { anthropicApiKey: 'ANTHROPIC-TEST-KEY', anthropicModel: 'anthropic-test-model' } },
+    { httpFetch: fakeOkFetch(VALID_RESPONSE) }
+  );
+  assert.equal(classifier.name, 'anthropic');
+  assert.equal(classifier.modelName, 'anthropic-test-model');
 });
 
 test('classifyEvent never throws, even on a totally broken transport', async () => {

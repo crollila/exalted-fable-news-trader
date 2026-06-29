@@ -64,10 +64,12 @@ export function estimateNotional({ assetClass, quantity, referencePrice }) {
  * @param {object} args.capabilities deriveCapabilities() result
  * @param {object|null} args.account sanitized account snapshot
  * @param {object[]} [args.positions] sanitized positions
+ * @param {object|null} [args.asset]  sanitized asset snapshot for shortability checks
  * @param {object} [args.caps]       cap overrides
  * @param {object} [args.daily]      { orders:number, notional:number } so far today
  * @param {number|null} [args.referencePrice] per-share (equity) or per-contract premium (option)
  * @param {boolean} [args.executePaper]  whether a real order would be sent
+ * @param {boolean} [args.marginEnabled] central PAPER_ENABLE_MARGIN gate
  * @returns {{ approved:boolean, reason:string, estNotional:number|null, caps:object }}
  */
 export function assessRisk({
@@ -75,10 +77,12 @@ export function assessRisk({
   capabilities,
   account = null,
   positions = [],
+  asset = null,
   caps = {},
   daily = { orders: 0, notional: 0 },
   referencePrice = null,
   executePaper = false,
+  marginEnabled = true,
 } = {}) {
   const c = resolveCaps(caps);
   const isOption = proposal?.assetClass === 'option';
@@ -94,10 +98,20 @@ export function assessRisk({
   if (isShort && !capabilities.shortEligible) {
     return out(false, 'short rejected: account is not margin/short eligible');
   }
+  if (isShort && !marginEnabled) {
+    return out(false, 'short rejected: PAPER_ENABLE_MARGIN=false (margin disabled)');
+  }
+  if (isShort) {
+    if (!asset) return out(false, 'short rejected: asset shortability data unavailable');
+    if (asset.tradable !== true) return out(false, 'short rejected: asset is not tradable');
+    if (asset.shortable !== true) return out(false, 'short rejected: asset is not shortable');
+    // Require an explicit easy-to-borrow=true; unknown/null fails closed (no short).
+    if (asset.easyToBorrow !== true) return out(false, 'short rejected: asset is not confirmed easy-to-borrow');
+  }
   if (isShort && (account?.equity ?? 0) < MIN_SHORT_EQUITY_USD) {
     return out(false, `short rejected: equity below $${MIN_SHORT_EQUITY_USD} margin threshold`);
   }
-  if (isOption && executePaper && !capabilities.optionsEligible) {
+  if (isOption && !capabilities.optionsEligible) {
     return out(false, 'option execution rejected: account options capability is absent/unknown');
   }
 
@@ -109,10 +123,7 @@ export function assessRisk({
   // 4. Notional-dependent caps. Fail-safe when notional is unknown.
   if (estNotional === null) {
     if (isOption) {
-      // No option quote feed in this patch: premium cannot be pre-verified. The
-      // order stays bounded by --option-contract-limit + the capability gate.
-      // PAPER-only, so this relaxation cannot risk real money.
-      return out(true, 'approved (option premium UNVERIFIED — no option quote feed; bounded by --option-contract-limit)');
+      return out(false, 'option premium quote unavailable - refusing option proposal');
     }
     if (executePaper) {
       return out(false, 'cannot verify notional caps without a reference price — refusing to execute');
@@ -139,9 +150,16 @@ export function assessRisk({
   if ((daily?.notional ?? 0) + estNotional > c.maxDailyPaperNotional) {
     return out(false, `daily paper notional ${round2((daily.notional ?? 0) + estNotional)} exceeds --max-daily-paper-notional ${c.maxDailyPaperNotional}`);
   }
-  // Buying power (long equity / option debit). Shorts also consume buying power.
-  if (!isShort && typeof account?.buyingPower === 'number' && account.buyingPower < estNotional) {
-    return out(false, `insufficient buying power (${round2(account.buyingPower)} < ${round2(estNotional)})`);
+  // Buying power (long equity / option debit). When margin is disabled, use
+  // cash only; when enabled, use the broker-reported paper buying power.
+  const buyingPower =
+    marginEnabled && typeof account?.buyingPower === 'number'
+      ? account.buyingPower
+      : typeof account?.cash === 'number'
+        ? account.cash
+        : null;
+  if (!isShort && typeof buyingPower === 'number' && buyingPower < estNotional) {
+    return out(false, `insufficient buying power (${round2(buyingPower)} < ${round2(estNotional)})`);
   }
 
   return out(true, `approved: notional ${round2(estNotional)} within all caps`);

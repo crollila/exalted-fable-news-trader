@@ -31,10 +31,9 @@ export const VARIABLE_SPECS = Object.freeze({
   PAPER_CONFIDENCE_THRESHOLD: { kind: 'threshold', start: 0.6, floor: 0.0, ceil: 1.0 },
   PAPER_IMPACT_THRESHOLD: { kind: 'threshold', start: 0.5, floor: 0.0, ceil: 1.0 },
   PAPER_SENTIMENT_THRESHOLD: { kind: 'threshold', start: 0.3, floor: 0.0, ceil: 1.0 },
-  PAPER_OPTIONS_MODE: { kind: 'enum' },
-  ALLOW_SHORTS: { kind: 'flag' },
-  ALLOW_OPTIONS: { kind: 'flag' },
-  ALLOW_MARGIN: { kind: 'flag' },
+  PAPER_ENABLE_SHORTS: { kind: 'flag' },
+  PAPER_ENABLE_OPTIONS: { kind: 'flag' },
+  PAPER_ENABLE_MARGIN: { kind: 'flag' },
 });
 
 function roundTo(n, d) {
@@ -178,14 +177,14 @@ export function buildConstraintRecommendations({ data = {}, current = {}, minSam
       'medium', 'recommended', {});
   }
   if (a.categories.options >= REPEAT_CATEGORY) {
-    push('PAPER_OPTIONS_MODE', 'keep_plan_only', 'plan_only',
-      `${a.categories.options} option proposal(s) were refused; keep options in plan_only until they prove out.`,
+    push('PAPER_ENABLE_OPTIONS', 'keep_false', 'false',
+      `${a.categories.options} option proposal(s) were refused; keep PAPER_ENABLE_OPTIONS=false until options exits and outcomes prove out.`,
       'medium', 'recommended', { optionRejections: a.categories.options });
   }
   if (a.categories.shorts >= REPEAT_CATEGORY) {
     push('PAPER_SENTIMENT_THRESHOLD', 'increase',
       boundedValue('PAPER_SENTIMENT_THRESHOLD', 'up', cur.PAPER_SENTIMENT_THRESHOLD),
-      `${a.categories.shorts} short/margin refusal(s); raise the sentiment threshold (or set ALLOW_SHORTS=false) until shorts prove out.`,
+      `${a.categories.shorts} short/margin refusal(s); raise the sentiment threshold (or keep PAPER_ENABLE_SHORTS=false) until shorts prove out.`,
       'medium', 'recommended', { shortRejections: a.categories.shorts });
   }
 

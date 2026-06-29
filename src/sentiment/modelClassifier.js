@@ -1,47 +1,48 @@
-// src/sentiment/modelClassifier.js — Real model-backed classifier (Phase C).
+// src/sentiment/modelClassifier.js - OpenAI production classifier.
 //
-// The first REAL model classifier behind the existing Classifier contract
-// (src/sentiment/classifierContract.js). It is a sibling to the fixture
-// classifier: same contract, same parser, same storage path — the only
-// difference is that the "responder" is a real Anthropic Messages API call
-// (raw HTTP via injectable fetch) instead of an injected canned string. The
-// project is zero-dependency, so this uses the documented HTTP surface rather
-// than an SDK.
-//
-// Safety regime mirrors the real Alpaca transports (alpacaNewsHttpTransport,
-// alpacaTradesPriceSource):
-// - DISABLED BY DEFAULT / explicit construction only: createModelClassifier()
-//   throws "not configured" without an API key. Nothing here runs at import
-//   time, on startup, in schedulers, or in npm test.
-// - Credentials come ONLY from config (src/config.js reads process.env;
-//   nothing here touches process.env). The key goes into a request header and
-//   NOWHERE else — never thrown, logged, returned, or persisted.
-// - Errors are sanitized: messages are static text + status codes, defensively
-//   redacted so the key can never leak.
-// - The HTTP function is injectable; tests inject fakes and never hit the network.
-// - classifyEvent NEVER throws on a bad model call (contract): transport/HTTP
-//   failures become parserStatus 'model_error'; the raw model text (when
-//   present) flows through the EXISTING parseModelResponse UNCHANGED, so
-//   malformed/out-of-range/missing-field outcomes are stored as data exactly
-//   as for the fixture classifier. The parser contract is not touched.
+// The production classifier uses the OpenAI Responses API behind the existing
+// Classifier contract. It is explicit construction only, uses config-only
+// credentials, sends secrets in headers only, and never throws from
+// classifyEvent. Bad HTTP/model/parser outcomes are stored as data through the
+// existing parseModelResponse/insertSentimentScore path.
 
 import { NEWS_TYPES, DIRECTIONS, TIME_HORIZONS } from './classifierContract.js';
 import { parseModelResponse } from './parseModelResponse.js';
 
-const DEFAULT_BASE_URL = 'https://api.anthropic.com/v1/messages';
-const DEFAULT_MODEL = 'claude-opus-4-8';
+const OPENAI_BASE_URL = 'https://api.openai.com/v1/responses';
+const ANTHROPIC_BASE_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
 
-/** Prompt version for the real model classifier — distinct from manual_v1. */
 export const MODEL_PROMPT_VERSION = 'model_v1';
-
-/** Small bounded output; the classifier returns one compact JSON object. */
 export const DEFAULT_MAX_TOKENS = 1024;
 
-/** Keep the prompt token-bounded; news bodies can be long. */
 const MAX_BODY_CHARS = 2000;
 
-/** Replace any occurrence of the given secrets in text with [redacted]. */
+export const CLASSIFICATION_SCHEMA = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    news_type: { type: 'string', enum: NEWS_TYPES },
+    sentiment_score: { type: 'number', minimum: -1, maximum: 1 },
+    impact_score: { type: 'number', minimum: 0, maximum: 1 },
+    confidence: { type: 'number', minimum: 0, maximum: 1 },
+    direction: { type: 'string', enum: DIRECTIONS },
+    time_horizon: { anyOf: [{ type: 'string', enum: TIME_HORIZONS }, { type: 'null' }] },
+    affected_symbols: { type: 'array', items: { type: 'string' } },
+    rationale: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+  },
+  required: [
+    'news_type',
+    'sentiment_score',
+    'impact_score',
+    'confidence',
+    'direction',
+    'time_horizon',
+    'affected_symbols',
+    'rationale',
+  ],
+});
+
 function redact(text, secrets) {
   let out = String(text ?? '');
   for (const secret of secrets) {
@@ -50,47 +51,28 @@ function redact(text, secrets) {
   return out;
 }
 
-/**
- * Build the system prompt instructing the model to emit ONLY the JSON object
- * the existing parser expects (plan §4 schema). Pure/static — no secrets, no
- * event data. The strict "JSON only" instruction keeps the raw response
- * byte-for-byte parseable, so it can be stored unchanged and parsed by the
- * existing parseModelResponse.
- */
 export function buildSystemPrompt() {
   return [
     'You are a financial news classifier for an event-study research system.',
     'Classify the news item and estimate its likely short-term market impact.',
-    'Respond with ONLY a single JSON object and nothing else — no prose, no',
-    'markdown, no code fences. The object must have exactly these fields:',
+    'Respond with only the requested JSON object. Do not include prose,',
+    'markdown, code fences, request metadata, or chain-of-thought.',
     '',
-    `- "news_type": one of ${JSON.stringify(NEWS_TYPES)}`,
-    '- "sentiment_score": number from -1.0 (very negative) to 1.0 (very positive)',
-    '- "impact_score": number from 0.0 (no expected reaction) to 1.0 (large reaction)',
-    '- "confidence": number from 0.0 to 1.0 (your own certainty)',
-    `- "direction": one of ${JSON.stringify(DIRECTIONS)}`,
-    `- "time_horizon": one of ${JSON.stringify(TIME_HORIZONS)} (optional)`,
-    '- "affected_symbols": array of uppercase ticker strings (optional)',
-    '- "rationale": short string explaining the call (optional)',
-    '',
-    'Score honestly; use "unclear"/0 when the news is not market-relevant.',
+    `news_type must be one of ${JSON.stringify(NEWS_TYPES)}.`,
+    'sentiment_score must be -1.0 to 1.0.',
+    'impact_score and confidence must be 0.0 to 1.0.',
+    `direction must be one of ${JSON.stringify(DIRECTIONS)}.`,
+    `time_horizon must be one of ${JSON.stringify(TIME_HORIZONS)} or null.`,
+    'affected_symbols must be uppercase ticker strings.',
+    'Use "unclear" and low scores when the item is not market-relevant.',
   ].join('\n');
 }
 
-/** Whitelisted display text; never used on secrets (none reach this module). */
 function truncate(text, max) {
   const s = String(text ?? '');
-  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+  return s.length <= max ? s : `${s.slice(0, max - 1)}...`;
 }
 
-/**
- * Build the user message text from WHITELISTED news_events row fields only
- * (ticker, headline, body/summary). Never echoes raw_payload, keys, or any
- * other column. Exported for tests (redaction / field-whitelist assertions).
- *
- * @param {object} event  a news_events row (or normalized event)
- * @returns {string}
- */
 export function buildUserPrompt(event) {
   const ticker =
     typeof event?.ticker === 'string' && event.ticker.trim() !== ''
@@ -109,8 +91,29 @@ export function buildUserPrompt(event) {
   return lines.join('\n');
 }
 
-/** Concatenate the text blocks of an Anthropic Messages response payload. */
-function extractText(payload) {
+function usageFrom(payload) {
+  const u = payload?.usage;
+  if (!u || typeof u !== 'object') return null;
+  return {
+    inputTokens: Number.isFinite(Number(u.input_tokens)) ? Number(u.input_tokens) : null,
+    outputTokens: Number.isFinite(Number(u.output_tokens)) ? Number(u.output_tokens) : null,
+    totalTokens: Number.isFinite(Number(u.total_tokens)) ? Number(u.total_tokens) : null,
+  };
+}
+
+function extractOpenAiText(payload) {
+  if (typeof payload?.output_text === 'string') return payload.output_text;
+  const parts = [];
+  for (const item of Array.isArray(payload?.output) ? payload.output : []) {
+    for (const c of Array.isArray(item?.content) ? item.content : []) {
+      if (typeof c?.text === 'string') parts.push(c.text);
+      else if (typeof c?.json === 'object') parts.push(JSON.stringify(c.json));
+    }
+  }
+  return parts.join('');
+}
+
+function extractAnthropicText(payload) {
   const blocks = Array.isArray(payload?.content) ? payload.content : [];
   return blocks
     .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
@@ -118,28 +121,132 @@ function extractText(payload) {
     .join('');
 }
 
-/**
- * Create a real model-backed classifier.
- *
- * Explicit construction only — this is the single place a live model-call path
- * can come into existence, and only with a configured key.
- *
- * @param {object} config  result of loadConfig(); uses config.model only
- * @param {object} [options]
- * @param {Function} [options.httpFetch]  injected fetch-compatible function
- *   (tests inject fakes; real use defaults to globalThis.fetch)
- * @param {string} [options.baseUrl]
- * @param {string} [options.model]         model id; defaults to config.model.classifierModel
- * @param {string} [options.promptVersion] defaults to MODEL_PROMPT_VERSION
- * @param {number} [options.maxTokens]
- * @returns {import('./classifierContract.js').Classifier}
- * @throws immediately (before any HTTP) if credentials are not configured.
- */
+function modelError({ promptVersion, modelName, message, provider, usage = null }) {
+  return {
+    promptVersion,
+    modelName,
+    parserStatus: 'model_error',
+    output: null,
+    rawModelResponse: '',
+    errors: [message],
+    provider,
+    usage,
+  };
+}
+
 export function createModelClassifier(
   config,
   {
     httpFetch,
-    baseUrl = DEFAULT_BASE_URL,
+    baseUrl = OPENAI_BASE_URL,
+    model,
+    promptVersion = MODEL_PROMPT_VERSION,
+    maxTokens = DEFAULT_MAX_TOKENS,
+  } = {}
+) {
+  const apiKey = config?.model?.openaiApiKey;
+  if (!apiKey) {
+    throw new Error(
+      'modelClassifier(openai): not configured - set OPENAI_API_KEY in .env ' +
+        '(see .env.example). No model call was made.'
+    );
+  }
+  const modelName = model || config?.model?.openaiModel;
+  if (!modelName) {
+    throw new Error(
+      'modelClassifier(openai): not configured - set OPENAI_MODEL in .env ' +
+        '(see .env.example). No model call was made.'
+    );
+  }
+
+  const secrets = [apiKey];
+  const doFetch = httpFetch ?? globalThis.fetch;
+  const systemPrompt = buildSystemPrompt();
+
+  async function requestCompletion(event) {
+    const body = JSON.stringify({
+      model: modelName,
+      instructions: systemPrompt,
+      input: [
+        {
+          role: 'user',
+          content: [{ type: 'input_text', text: buildUserPrompt(event) }],
+        },
+      ],
+      max_output_tokens: maxTokens,
+      store: false,
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'exalted_fable_news_classification',
+          strict: true,
+          schema: CLASSIFICATION_SCHEMA,
+        },
+      },
+    });
+
+    let response;
+    try {
+      response = await doFetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body,
+      });
+    } catch (err) {
+      throw new Error(`request failed: ${redact(err?.message, secrets)}`);
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${redact(response.statusText ?? '', secrets)}`);
+    }
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new Error('response body was not valid JSON');
+    }
+    return { text: extractOpenAiText(payload), usage: usageFrom(payload) };
+  }
+
+  async function classifyEvent(event) {
+    let result;
+    try {
+      result = await requestCompletion(event);
+    } catch (err) {
+      return modelError({
+        promptVersion,
+        modelName,
+        provider: 'openai',
+        message: `model request failed: ${redact(err?.message, secrets)}`,
+      });
+    }
+    if (typeof result.text !== 'string' || result.text.trim() === '') {
+      return modelError({
+        promptVersion,
+        modelName,
+        provider: 'openai',
+        message: 'model returned no text content',
+        usage: result.usage,
+      });
+    }
+    const parsed = parseModelResponse(result.text, { promptVersion, modelName });
+    parsed.provider = 'openai';
+    parsed.usage = result.usage;
+    return parsed;
+  }
+
+  return { name: 'openai', provider: 'openai', promptVersion, modelName, classifyEvent };
+}
+
+export function createAnthropicModelClassifier(
+  config,
+  {
+    httpFetch,
+    baseUrl = ANTHROPIC_BASE_URL,
     model,
     promptVersion = MODEL_PROMPT_VERSION,
     maxTokens = DEFAULT_MAX_TOKENS,
@@ -148,28 +255,21 @@ export function createModelClassifier(
   const apiKey = config?.model?.anthropicApiKey;
   if (!apiKey) {
     throw new Error(
-      'modelClassifier: not configured — set ANTHROPIC_API_KEY in .env ' +
+      'modelClassifier(anthropic): not configured - set ANTHROPIC_API_KEY in .env ' +
         '(see .env.example). No model call was made.'
     );
   }
-  const modelName = model || config?.model?.classifierModel || DEFAULT_MODEL;
+  const modelName = model || config?.model?.anthropicModel || config?.model?.classifierModel;
+  if (!modelName) {
+    throw new Error(
+      'modelClassifier(anthropic): not configured - set ANTHROPIC_MODEL in .env ' +
+        '(see .env.example). No model call was made.'
+    );
+  }
   const secrets = [apiKey];
   const doFetch = httpFetch ?? globalThis.fetch;
   const systemPrompt = buildSystemPrompt();
 
-  /** Build a model_error ClassificationResult (never throws; failures = data). */
-  function modelError(message) {
-    return {
-      promptVersion,
-      modelName,
-      parserStatus: 'model_error',
-      output: null,
-      rawModelResponse: '',
-      errors: [message],
-    };
-  }
-
-  /** One Messages API call. Returns raw model text or throws a sanitized error. */
   async function requestCompletion(event) {
     const body = JSON.stringify({
       model: modelName,
@@ -190,12 +290,10 @@ export function createModelClassifier(
         body,
       });
     } catch (err) {
-      // Never rethrow raw fetch errors (they can embed request config/headers).
       throw new Error(`request failed: ${redact(err?.message, secrets)}`);
     }
 
     if (!response.ok) {
-      // Status/statusText only — never the URL, headers, or body.
       throw new Error(`HTTP ${response.status} ${redact(response.statusText ?? '', secrets)}`);
     }
 
@@ -205,26 +303,35 @@ export function createModelClassifier(
     } catch {
       throw new Error('response body was not valid JSON');
     }
-    return extractText(payload);
+    return { text: extractAnthropicText(payload), usage: usageFrom(payload) };
   }
 
-  /**
-   * Classifier contract: NEVER throws on a bad model call. Transport/HTTP
-   * failures become parserStatus 'model_error'; usable text flows through the
-   * existing parser unchanged (so its statuses are stored as data).
-   */
   async function classifyEvent(event) {
-    let rawText;
+    let result;
     try {
-      rawText = await requestCompletion(event);
+      result = await requestCompletion(event);
     } catch (err) {
-      return modelError(`model request failed: ${redact(err?.message, secrets)}`);
+      return modelError({
+        promptVersion,
+        modelName,
+        provider: 'anthropic',
+        message: `model request failed: ${redact(err?.message, secrets)}`,
+      });
     }
-    if (typeof rawText !== 'string' || rawText.trim() === '') {
-      return modelError('model returned no text content');
+    if (typeof result.text !== 'string' || result.text.trim() === '') {
+      return modelError({
+        promptVersion,
+        modelName,
+        provider: 'anthropic',
+        message: 'model returned no text content',
+        usage: result.usage,
+      });
     }
-    return parseModelResponse(rawText, { promptVersion, modelName });
+    const parsed = parseModelResponse(result.text, { promptVersion, modelName });
+    parsed.provider = 'anthropic';
+    parsed.usage = result.usage;
+    return parsed;
   }
 
-  return { name: 'model', promptVersion, modelName, classifyEvent };
+  return { name: 'anthropic', provider: 'anthropic', promptVersion, modelName, classifyEvent };
 }

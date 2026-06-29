@@ -21,6 +21,7 @@ import {
   oneLineSummary,
   oneLineDecisionSummary,
   paperDefaultsFromStrategySettings,
+  DEFAULT_PAPER_FEATURES,
   PAPER_DECISION_OUTCOMES,
   MAX_QTY,
 } from '../scripts/runPaperTradingOnce.js';
@@ -73,12 +74,37 @@ function marginAccount(over = {}) {
 }
 const cashAccount = (over = {}) => marginAccount({ multiplier: 1, optionsTradingLevel: null, optionsApprovedLevel: null, ...over });
 
-function fakePaperClient() {
-  const calls = { equity: [], option: [] };
+function shortableAsset(over = {}) {
+  return { symbol: 'AAPL', status: 'active', tradable: true, shortable: true, easyToBorrow: true, ...over };
+}
+
+function fakePaperClient({
+  asset = shortableAsset(),
+  optionContracts = null,
+  optionQuote = { symbol: 'AAPL260116C00150000', bid: 1.9, ask: 2.1, mid: 2 },
+} = {}) {
+  const calls = { equity: [], option: [], asset: [], contracts: [], quote: [] };
   return {
     calls,
     getAccount: async () => marginAccount(),
     getPositions: async () => [],
+    getAsset: async (symbol) => { calls.asset.push(symbol); return asset; },
+    getOptionContracts: async (query) => {
+      calls.contracts.push(query);
+      return {
+        contracts: optionContracts ?? [{
+          symbol: 'AAPL260116C00150000',
+          underlyingSymbol: 'AAPL',
+          status: 'active',
+          tradable: true,
+          expirationDate: '2026-01-16',
+          strikePrice: 150,
+          type: 'call',
+          openInterest: 100,
+        }],
+      };
+    },
+    getOptionQuote: async (query) => { calls.quote.push(query); return optionQuote; },
     submitMarketOrder: async (o) => { calls.equity.push(o); return { id: 'ord_eq', status: 'accepted', submittedAt: '2026-06-18T14:30:01.000Z', filledAvgPrice: null }; },
     submitOptionMarketOrder: async (o) => { calls.option.push(o); return { id: 'ord_op', status: 'accepted', submittedAt: '2026-06-18T14:30:02.000Z', filledAvgPrice: null }; },
   };
@@ -152,6 +178,7 @@ function realModelClassifier({ direction = 'up', sentiment = 0.3, impact = 0.4, 
 
 const OCC = 'AAPL260116C00150000'; // a call expiring 2026-01-16
 const NOW_MS = Date.parse('2026-01-01T00:00:00.000Z'); // ~15 days before OCC expiry (pin the clock)
+const ALL_PAPER_FEATURES = { enableShorts: true, enableOptions: true, enableMargin: true };
 
 // --- arg parsing -----------------------------------------------------------
 
@@ -161,6 +188,7 @@ test('parseArgs defaults are conservative, dry-run, no shorts/options', () => {
   assert.equal(a.executePaper, false);
   assert.equal(a.allowShorts, false);
   assert.equal(a.allowOptions, false);
+  assert.deepEqual(a.paperFeatures, DEFAULT_PAPER_FEATURES);
   assert.equal(a.optionsMode, 'plan_only');
 });
 
@@ -168,7 +196,7 @@ test('parseArgs reads advanced flags + caps and clamps qty', () => {
   const a = parseArgs([
     '--symbols', 'aapl,msft', '--qty', '99999', '--allow-shorts', '--allow-options',
     '--options-mode', 'execute_paper', '--option-symbol', OCC, '--option-max-premium', '250',
-    '--max-order-notional', '500', '--max-gross-exposure', '5000', '--execute-paper',
+    '--max-order-notional', '500', '--max-gross-exposure', '5000', '--max-symbols-per-cycle', '2', '--execute-paper',
   ]);
   assert.deepEqual(a.symbols, ['AAPL', 'MSFT']);
   assert.equal(a.qty, MAX_QTY);
@@ -177,6 +205,7 @@ test('parseArgs reads advanced flags + caps and clamps qty', () => {
   assert.equal(a.optionsMode, 'execute_paper');
   assert.equal(a.optionSymbol, OCC);
   assert.equal(a.caps.maxOrderNotional, 500);
+  assert.equal(a.maxSymbolsPerCycle, 2);
   assert.equal(a.caps.maxGrossExposure, 5000);
   assert.equal(a.caps.maxOptionPremium, 250);
   assert.equal(a.executePaper, true);
@@ -278,7 +307,7 @@ test('equity long EXECUTE submits a buy and writes paper_trades (margin account,
 test('fresh ingest/classify/trade cycle reaches the fake PAPER submit client', async () => {
   const db = freshDb();
   const client = fakePaperClient();
-  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model', '--execute-paper']);
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper']);
   const cycle = await runPaperDecisionCycle(
     db,
     {
@@ -294,6 +323,8 @@ test('fresh ingest/classify/trade cycle reaches the fake PAPER submit client', a
   assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED);
   assert.equal(cycle.ingestion.inserted, 1);
   assert.equal(cycle.classification.stored, 1);
+  assert.deepEqual(cycle.universe.selectedSymbols, ['AAPL']);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_universe_selections').get().n, 1);
   assert.equal(client.calls.equity.length, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 1);
   const hb = oneLineDecisionSummary(cycle, Date.parse('2026-06-18T14:30:00.000Z'));
@@ -304,7 +335,7 @@ test('fresh ingest/classify/trade cycle reaches the fake PAPER submit client', a
 
 test('fresh score below a default threshold is logged as a rejection', async () => {
   const db = freshDb();
-  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model']);
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai']);
   const cycle = await runPaperDecisionCycle(
     db,
     {
@@ -324,7 +355,7 @@ test('fresh score below a default threshold is logged as a rejection', async () 
 
 test('decision cycle distinguishes no new news', async () => {
   const db = freshDb();
-  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model']);
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai']);
   const cycle = await runPaperDecisionCycle(
     db,
     { provider: createMockProvider([]), classifier: realModelClassifier() },
@@ -338,7 +369,7 @@ test('decision cycle distinguishes no new news', async () => {
 
 test('decision cycle distinguishes no fresh real-model score', async () => {
   const db = freshDb();
-  const args = parseArgs(['--symbols', 'AAPL']); // no --classifier real_model
+  const args = parseArgs(['--symbols', 'AAPL']); // no model classifier requested
   const cycle = await runPaperDecisionCycle(
     db,
     { provider: createMockProvider([rawNews('fresh-no-model')]), classifier: null },
@@ -346,13 +377,13 @@ test('decision cycle distinguishes no fresh real-model score', async () => {
     { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
   );
   assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.NO_FRESH_REAL_MODEL_SCORE);
-  assert.match(cycle.skipReason, /real_model classifier/);
+  assert.match(cycle.skipReason, /model classifier/);
   closeDatabase(db);
 });
 
 test('decision cycle distinguishes already processed fresh scored events', async () => {
   const db = freshDb();
-  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model']);
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai']);
   const classifier = realModelClassifier({
     onClassify: async (event) => {
       db.prepare(
@@ -374,7 +405,7 @@ test('decision cycle distinguishes already processed fresh scored events', async
 
 test('decision cycle distinguishes risk rejection from signal rejection', async () => {
   const db = freshDb();
-  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model', '--execute-paper']);
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper']);
   const cycle = await runPaperDecisionCycle(
     db,
     {
@@ -394,7 +425,7 @@ test('decision cycle distinguishes risk rejection from signal rejection', async 
 test('decision cycle distinguishes broker submission errors', async () => {
   const db = freshDb();
   const client = throwingPaperClient();
-  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'real_model', '--execute-paper']);
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper']);
   const cycle = await runPaperDecisionCycle(
     db,
     {
@@ -438,6 +469,7 @@ test('equity short EXECUTE requires allowShorts + a short-eligible margin accoun
   const result = await runPaperTradeOnce(db, selected, {
     paperClient: client, allowedSymbols: ['AAPL'], allowShorts: true, executePaper: true,
     account, capabilities: deriveCapabilities(account), referencePrice: 100, qty: 1,
+    paperFeatures: ALL_PAPER_FEATURES,
   });
   assert.equal(result.equity.proposal.side, 'sell');
   assert.equal(result.equity.decision, 'accepted');
@@ -453,6 +485,7 @@ test('short is rejected on a cash account (not margin/short eligible) and logged
   const result = await runPaperTradeOnce(db, selected, {
     allowedSymbols: ['AAPL'], allowShorts: true, executePaper: true,
     account, capabilities: deriveCapabilities(account), referencePrice: 100, paperClient: fakePaperClient(),
+    paperFeatures: ALL_PAPER_FEATURES,
   });
   assert.equal(result.equity.decision, 'rejected');
   assert.match(result.equity.risk.reason, /margin\/short eligible/);
@@ -467,6 +500,21 @@ test('short without --allow-shorts is rejected at the proposal gate', async () =
   const result = await runPaperTradeOnce(db, selected, { allowedSymbols: ['AAPL'], allowShorts: false });
   assert.equal(result.equity.decision, 'rejected');
   assert.match(result.equity.proposal.reason, /requires --allow-shorts/);
+  closeDatabase(db);
+});
+
+test('short with CLI flag is still rejected when PAPER_ENABLE_SHORTS=false', async () => {
+  const db = freshDb();
+  seedScoredEvent(db, { direction: 'down', sentiment: -0.7 });
+  const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
+  const result = await runPaperTradeOnce(db, selected, {
+    allowedSymbols: ['AAPL'],
+    allowShorts: true,
+    paperFeatures: { enableShorts: false, enableOptions: false, enableMargin: false },
+  });
+  assert.equal(result.equity.decision, 'rejected');
+  assert.match(result.equity.proposal.reason, /PAPER_ENABLE_SHORTS=false/);
+  assert.ok(result.equity.rejectedTradeId > 0);
   closeDatabase(db);
 });
 
@@ -498,6 +546,23 @@ test('options are disabled unless --allow-options', async () => {
   closeDatabase(db);
 });
 
+test('options with CLI flag are rejected when PAPER_ENABLE_OPTIONS=false', async () => {
+  const db = freshDb();
+  seedScoredEvent(db, { direction: 'up' });
+  const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
+  const result = await runPaperTradeOnce(db, selected, {
+    allowedSymbols: ['AAPL'],
+    allowOptions: true,
+    optionsMode: 'execute_paper',
+    optionSymbol: OCC,
+    paperFeatures: { enableShorts: false, enableOptions: false, enableMargin: false },
+  });
+  assert.equal(result.option.decision, 'rejected');
+  assert.match(result.option.proposal.reason, /PAPER_ENABLE_OPTIONS=false/);
+  assert.ok(result.option.rejectedTradeId > 0);
+  closeDatabase(db);
+});
+
 test('options default to plan_only and never execute, even with --execute-paper', async () => {
   const db = freshDb();
   seedScoredEvent(db, { direction: 'up' });
@@ -507,13 +572,14 @@ test('options default to plan_only and never execute, even with --execute-paper'
   const result = await runPaperTradeOnce(db, selected, {
     allowedSymbols: ['AAPL'], allowOptions: true, optionsMode: 'plan_only', optionSymbol: OCC,
     executePaper: true, paperClient: client, account, capabilities: deriveCapabilities(account), nowMs: NOW_MS,
+    paperFeatures: ALL_PAPER_FEATURES,
   });
   assert.equal(result.option.decision, 'plan');
   assert.equal(client.calls.option.length, 0); // never sent
   closeDatabase(db);
 });
 
-test('option EXECUTION needs allow-options + execute_paper + execute-paper + option symbol + capability', async () => {
+test('option execute_paper validates contract/quote/risk but refuses submission until exit monitoring exists', async () => {
   const db = freshDb();
   seedScoredEvent(db, { direction: 'up' });
   const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
@@ -522,10 +588,18 @@ test('option EXECUTION needs allow-options + execute_paper + execute-paper + opt
   const result = await runPaperTradeOnce(db, selected, {
     allowedSymbols: ['AAPL'], allowOptions: true, optionsMode: 'execute_paper', optionSymbol: OCC,
     executePaper: true, paperClient: client, account, capabilities: deriveCapabilities(account), nowMs: NOW_MS,
+    paperFeatures: ALL_PAPER_FEATURES,
   });
-  assert.equal(result.option.decision, 'accepted');
-  assert.equal(client.calls.option[0].optionSymbol, OCC);
-  assert.ok(result.option.paperTradeId > 0);
+  assert.equal(result.option.decision, 'rejected');
+  assert.equal(client.calls.option.length, 0);
+  assert.equal(result.option.paperTradeId, null);
+  assert.equal(result.option.paperOptionTradeId, null);
+  assert.equal(result.option.risk.approved, true);
+  assert.equal(result.option.proposal.optionSymbol, OCC);
+  assert.match(
+    db.prepare('SELECT reason FROM rejected_trades WHERE id = ?').get(result.option.rejectedTradeId).reason,
+    /exit monitoring/
+  );
   closeDatabase(db);
 });
 
@@ -537,23 +611,30 @@ test('option execution is refused when the account lacks options capability', as
   const result = await runPaperTradeOnce(db, selected, {
     allowedSymbols: ['AAPL'], allowOptions: true, optionsMode: 'execute_paper', optionSymbol: OCC,
     executePaper: true, paperClient: fakePaperClient(), account, capabilities: deriveCapabilities(account), nowMs: NOW_MS,
+    paperFeatures: ALL_PAPER_FEATURES,
   });
   assert.equal(result.option.decision, 'rejected');
   assert.match(result.option.risk.reason, /options capability is absent\/unknown/);
   closeDatabase(db);
 });
 
-test('option execution without --option-symbol is refused (no contract discovery)', async () => {
+test('option execute_paper without --option-symbol discovers a contract then refuses submission pending exits', async () => {
   const db = freshDb();
   seedScoredEvent(db, { direction: 'up' });
   const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
   const account = marginAccount();
+  const client = fakePaperClient();
   const result = await runPaperTradeOnce(db, selected, {
     allowedSymbols: ['AAPL'], allowOptions: true, optionsMode: 'execute_paper', optionSymbol: null,
-    executePaper: true, paperClient: fakePaperClient(), account, capabilities: deriveCapabilities(account),
+    executePaper: true, paperClient: client, account, capabilities: deriveCapabilities(account), nowMs: NOW_MS,
+    paperFeatures: ALL_PAPER_FEATURES,
   });
   assert.equal(result.option.decision, 'rejected');
-  assert.match(result.option.proposal.reason, /requires --option-symbol/);
+  assert.equal(result.option.proposal.optionSymbol, OCC);
+  assert.equal(client.calls.contracts.length, 1);
+  assert.equal(client.calls.quote[0].optionSymbol, OCC);
+  assert.equal(client.calls.option.length, 0);
+  assert.match(result.option.proposal.reason, /premium/);
   closeDatabase(db);
 });
 
@@ -577,6 +658,7 @@ test('buildPaperReport is sanitized (no raw response/headline/rationale) and sho
   const result = await runPaperTradeOnce(db, selected, {
     allowedSymbols: ['AAPL'], allowOptions: true, optionsMode: 'plan_only', optionSymbol: OCC,
     account, capabilities: deriveCapabilities(account), referencePrice: 200, nowMs: NOW_MS,
+    paperFeatures: ALL_PAPER_FEATURES,
   });
   const text = buildPaperReport(result, selected).join('\n');
   assert.match(text, /PAPER-only — live trading disabled/);

@@ -25,6 +25,7 @@ import { loadConfig } from '../src/config.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { createDiscordWebhookClient } from '../src/notifications/discordWebhookClient.js';
+import { insertRecommendationAudit } from '../src/database/paperRuntime.js';
 import {
   buildConstraintRecommendations,
   formatRecommendationsSection,
@@ -36,6 +37,14 @@ import { loadStrategySettings } from '../src/config/strategySettings.js';
 export const EOD_TEST_MESSAGE =
   'ExaltedFable end-of-day report test — paper trading reports enabled.';
 
+/**
+ * Standing options-status disclosure. Appears in EVERY EOD report (active and
+ * no-trade) and in the paper-loop startup banner. Options remain plan/discovery
+ * only; order submission is hard-disabled.
+ */
+export const OPTIONS_DISCLOSURE =
+  'Options contract discovery and PAPER plans are available. Options order execution is disabled pending tested exit monitoring and sell-to-close reporting.';
+
 /** Cap on the per-list samples rendered in the report. */
 const LIST_CAP = 10;
 
@@ -43,11 +52,12 @@ const LIST_CAP = 10;
  * Parse CLI args. Exported for tests. Dry run is the default; an actual send
  * happens only when --send-discord (or --test-message) is explicitly present.
  *   --day YYYY-MM-DD   --dry-run   --send-discord   --test-message
+ *   --session-id N
  *   --include-constraint-recommendations (default on)   --no-constraint-recommendations
  */
 export function parseArgs(argv) {
   const args = {
-    day: null, send: false, testMessage: false, dryRun: false,
+    day: null, sessionId: null, send: false, testMessage: false, dryRun: false,
     includeRecommendations: true, includeStrategyRecommendations: true,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -55,6 +65,10 @@ export function parseArgs(argv) {
     if (flag === '--day' && argv[i + 1]) {
       const v = argv[i + 1].trim();
       if (/^\d{4}-\d{2}-\d{2}$/.test(v)) args.day = v;
+      i += 1;
+    } else if (flag === '--session-id' && argv[i + 1]) {
+      const n = Number.parseInt(argv[i + 1], 10);
+      if (Number.isInteger(n) && n > 0) args.sessionId = n;
       i += 1;
     } else if (flag === '--send-discord') {
       args.send = true;
@@ -79,6 +93,76 @@ function round2(n) {
   return Math.round(Number(n) * 100) / 100;
 }
 
+function parseJsonMap(text) {
+  try {
+    const parsed = JSON.parse(text ?? '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function mergeCounts(target, source = {}) {
+  for (const [key, value] of Object.entries(source ?? {})) {
+    target[key] = (target[key] ?? 0) + (Number(value) || 0);
+  }
+  return target;
+}
+
+function countRows(rows, key) {
+  const out = {};
+  for (const row of rows) out[row[key] ?? 'unknown'] = (out[row[key] ?? 'unknown'] ?? 0) + 1;
+  return out;
+}
+
+function activityFilter({ day = null, session = null } = {}) {
+  if (session) {
+    const end = session.ended_at ?? new Date().toISOString();
+    return {
+      clause: 'WHERE created_at >= ? AND created_at <= ?',
+      params: [session.started_at, end],
+      label: `session:${session.id}`,
+    };
+  }
+  return {
+    clause: day ? 'WHERE substr(created_at, 1, 10) = ?' : '',
+    params: day ? [day] : [],
+    label: day ?? 'all-time',
+  };
+}
+
+function uniqueEvidenceStats(trades = [], rejections = []) {
+  const attempts = [...trades, ...rejections].filter((r) => r.news_event_id !== null && r.news_event_id !== undefined);
+  const ids = new Set(attempts.map((r) => Number(r.news_event_id)));
+  return {
+    attemptsWithEventId: attempts.length,
+    uniqueEventCount: ids.size,
+    duplicateAttemptCount: Math.max(0, attempts.length - ids.size),
+  };
+}
+
+export function assessEodDataQuality(data, { minSampleSize = 10 } = {}) {
+  const warnings = [];
+  const uniqueEvents = data.uniqueEventCount ?? 0;
+  if ((data.duplicateAttemptCount ?? 0) > 0) {
+    warnings.push(`${data.duplicateAttemptCount} duplicate/stale event replay attempt(s) detected; repeated attempts are not independent evidence.`);
+  }
+  if (uniqueEvents < minSampleSize) {
+    warnings.push(`Only ${uniqueEvents} unique event(s), below minimum sample size ${minSampleSize}.`);
+  }
+  if (!data.session || Number(data.session.cycles ?? 0) <= 0) {
+    warnings.push('Session metrics are missing or empty; report conclusions are unreliable.');
+  }
+  return {
+    status: warnings.length === 0 ? 'sufficient' : 'limited',
+    canRecommend: warnings.length === 0,
+    warnings,
+    minSampleSize,
+    uniqueEventCount: uniqueEvents,
+    duplicateAttemptCount: data.duplicateAttemptCount ?? 0,
+  };
+}
+
 /**
  * Collect sanitized EOD figures from paper_trades / rejected_trades. When `day`
  * is null, all rows are counted (useful for tests/ad-hoc); otherwise rows are
@@ -90,29 +174,55 @@ function round2(n) {
  * @param {object} [opts]
  * @param {string|null} [opts.day]  'YYYY-MM-DD' or null for all-time
  */
-export function collectEodData(db, { day = null } = {}) {
-  const dayClause = day ? 'WHERE substr(created_at, 1, 10) = ?' : '';
-  const dayParams = day ? [day] : [];
+export function collectEodData(db, { day = null, sessionId = null } = {}) {
+  const session =
+    Number.isInteger(Number(sessionId)) && Number(sessionId) > 0
+      ? db.prepare('SELECT * FROM paper_runtime_sessions WHERE id = ?').get(Number(sessionId)) ?? null
+      : null;
+  const filter = activityFilter({ day, session });
+  const dayClause = filter.clause;
+  const dayParams = filter.params;
 
   const trades = db
     .prepare(
-      `SELECT ticker, side, quantity, fill_price, pnl_usd, status, created_at
+      `SELECT news_event_id, ticker, side, quantity, fill_price, pnl_usd, status, created_at
          FROM paper_trades ${dayClause}
+        ORDER BY id DESC`
+    )
+    .all(...dayParams);
+
+  const optionRows = db
+    .prepare(
+      `SELECT news_event_id, underlying, option_symbol, right, quantity, premium_entry, notional_entry,
+              strategy, exit_reason, status, created_at
+         FROM paper_option_trades ${dayClause}
         ORDER BY id DESC`
     )
     .all(...dayParams);
 
   const rejections = db
     .prepare(
-      `SELECT ticker, side, quantity, reason, created_at
+      `SELECT news_event_id, ticker, side, quantity, reason, created_at
          FROM rejected_trades ${dayClause}
         ORDER BY id DESC`
     )
     .all(...dayParams);
 
+  const sessions = db
+    .prepare(
+      `SELECT cycles, fresh_news_count, classification_count,
+              classification_status_json, skipped_reason_json, rejected_reason_json,
+              orders_submitted, order_status_json, model_request_count,
+              shorts_used, options_used, margin_used, eod_report_status
+         FROM paper_runtime_sessions ${session ? 'WHERE id = ?' : dayClause}
+        ORDER BY id DESC`
+    )
+    .all(...(session ? [session.id] : dayParams));
+
   const longCount = trades.filter((t) => t.side === 'buy').length;
   const shortCount = trades.filter((t) => t.side === 'sell').length;
   const fills = trades.filter((t) => t.fill_price !== null && t.fill_price !== undefined).length;
+  const orderStatus = countRows(trades, 'status');
   const realizedPnl = trades.reduce((sum, t) => sum + (Number(t.pnl_usd) || 0), 0);
   // Win/loss counts over ALL trades (used by the constraint recommender).
   const winningTrades = trades.filter((t) => Number(t.pnl_usd) > 0).length;
@@ -129,14 +239,64 @@ export function collectEodData(db, { day = null } = {}) {
   const byTicker = {};
   for (const t of trades) byTicker[t.ticker] = (byTicker[t.ticker] ?? 0) + (Number(t.pnl_usd) || 0);
   const tickerPnl = Object.entries(byTicker).sort((a, b) => b[1] - a[1]);
+  const openPositions = trades
+    .filter((t) => t.status === 'open')
+    .map((t) => ({
+      ticker: t.ticker,
+      side: t.side,
+      qty: t.quantity,
+      exposure: round2((Number(t.fill_price) || 0) * (Number(t.quantity) || 0)),
+    }));
+  const openExposure = round2(openPositions.reduce((sum, p) => sum + Math.abs(p.exposure), 0));
+
+  const sessionSummary = {
+    sessionId: session ? Number(session.id) : null,
+    evidenceScope: filter.label,
+    cycles: 0,
+    freshNewsCount: 0,
+    classificationCount: 0,
+    classificationStatus: {},
+    skippedReasons: {},
+    rejectedReasons: {},
+    ordersSubmitted: 0,
+    orderStatus: {},
+    modelRequestCount: 0,
+    shortsUsed: 0,
+    optionsUsed: 0,
+    marginUsed: 0,
+    eodReportStatus: {},
+  };
+  for (const s of sessions) {
+    sessionSummary.cycles += Number(s.cycles) || 0;
+    sessionSummary.freshNewsCount += Number(s.fresh_news_count) || 0;
+    sessionSummary.classificationCount += Number(s.classification_count) || 0;
+    mergeCounts(sessionSummary.classificationStatus, parseJsonMap(s.classification_status_json));
+    mergeCounts(sessionSummary.skippedReasons, parseJsonMap(s.skipped_reason_json));
+    mergeCounts(sessionSummary.rejectedReasons, parseJsonMap(s.rejected_reason_json));
+    sessionSummary.ordersSubmitted += Number(s.orders_submitted) || 0;
+    mergeCounts(sessionSummary.orderStatus, parseJsonMap(s.order_status_json));
+    sessionSummary.modelRequestCount += Number(s.model_request_count) || 0;
+    sessionSummary.shortsUsed += Number(s.shorts_used) || 0;
+    sessionSummary.optionsUsed += Number(s.options_used) || 0;
+    sessionSummary.marginUsed += Number(s.margin_used) || 0;
+    if (s.eod_report_status) mergeCounts(sessionSummary.eodReportStatus, { [s.eod_report_status]: 1 });
+  }
+  const evidence = uniqueEvidenceStats(trades, rejections);
 
   return {
     day,
+    session: sessionSummary,
+    evidenceScope: filter.label,
+    ...evidence,
     ordersSubmitted: trades.length,
     longCount,
     shortCount,
     fills,
-    optionsCount: 0, // options not implemented in this slice
+    orderStatus,
+    optionsCount: optionRows.length,
+    openPositions,
+    openExposure,
+    unrealizedPnl: null,
     realizedPnl: round2(realizedPnl),
     winningTrades,
     losingTrades,
@@ -153,6 +313,17 @@ export function collectEodData(db, { day = null } = {}) {
       fillPrice: t.fill_price,
       pnl: t.pnl_usd,
     })),
+    options: optionRows.slice(0, LIST_CAP).map((o) => ({
+      underlying: o.underlying,
+      optionSymbol: o.option_symbol,
+      right: o.right,
+      qty: o.quantity,
+      premiumEntry: o.premium_entry,
+      notionalEntry: o.notional_entry,
+      strategy: o.strategy,
+      status: o.status,
+      exitReason: o.exit_reason,
+    })),
   };
 }
 
@@ -163,14 +334,23 @@ export function collectEodData(db, { day = null } = {}) {
  * text beyond our own rejection-reason strings.
  */
 export function buildEodReport(data, { day = null, recommendations = null, strategy = null } = {}) {
-  const label = day ?? data.day ?? '(all-time)';
+  const label = day ?? data.day ?? 'all-time';
+  const session = data.session ?? {};
+  const dataQuality = data.dataQuality ?? assessEodDataQuality(data);
+  const fmtMap = (m) => {
+    const entries = Object.entries(m ?? {});
+    return entries.length === 0
+      ? '(none)'
+      : entries.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([k, v]) => `${k}=${v}`).join(' ');
+  };
   const lines = [
     `ExaltedFable — End-of-Day PAPER report (${label})`,
     'PAPER trading only. Live trading disabled.',
+    OPTIONS_DISCLOSURE,
     '',
   ];
 
-  if (data.proposals === 0) {
+  if (data.proposals === 0 && (session.cycles ?? 0) === 0) {
     lines.push(
       'No paper-trading records for this day yet.',
       'This report still proves Discord delivery; once the paper loop runs and',
@@ -183,13 +363,33 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
 
   lines.push(
     '— Figures —',
+    `  session cycles:                  ${session.cycles ?? 0}`,
+    `  fresh news inserted:             ${session.freshNewsCount ?? 0}`,
+    `  classifications stored:          ${session.classificationCount ?? 0}`,
+    `  classification outcomes:         ${fmtMap(session.classificationStatus)}`,
+    `  skipped reasons:                 ${fmtMap(session.skippedReasons)}`,
     `  proposals (orders + rejections): ${data.proposals}`,
     `  orders submitted:                ${data.ordersSubmitted}`,
+    `  order statuses:                  ${fmtMap(data.orderStatus)}`,
     `  fills (known):                   ${data.fills}`,
     `  equity long / short:             ${data.longCount} / ${data.shortCount}`,
     `  options plans / orders:          ${data.optionsCount}`,
     `  rejected:                        ${data.rejectedCount}`,
     `  realized P&L (approx, USD):      ${data.realizedPnl}`,
+    `  unrealized P&L (if available):   ${data.unrealizedPnl ?? 'unavailable'}`,
+    `  open exposure (approx, USD):     ${data.openExposure ?? 0}`,
+    `  shorts/options/margin usage:     ${session.shortsUsed ?? 0} / ${session.optionsUsed ?? 0} / ${session.marginUsed ?? 0}`,
+    `  model requests/tokens:           ${session.modelRequestCount ?? 0} request(s); token usage unavailable`,
+    `  data quality:                    ${dataQuality.status}`,
+    '',
+    '— Data-quality warnings —',
+  );
+  if (dataQuality.warnings.length === 0) {
+    lines.push('  (none)');
+  } else {
+    for (const warning of dataQuality.warnings) lines.push(`  ${warning}`);
+  }
+  lines.push(
     '',
     '— Rejections (most common) —',
   );
@@ -222,7 +422,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     '',
     '— What went poorly —',
     didNothingButRefuse
-      ? '  Nothing traded — sparse qualifying signals (expected outside active hours).'
+      ? '  No paper order was submitted; review skipped/rejected reasons and data-quality warnings.'
       : data.realizedPnl < 0
         ? `  Net realized P&L is negative (${data.realizedPnl}); review the entries below.`
         : '  Nothing notable.',
@@ -237,6 +437,22 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     `  Re-run during market hours; ${data.bestTicker ? `watch ${data.bestTicker}; ` : ''}` +
       'consider tightening/loosening thresholds per the refusal pattern (manually).',
   );
+  if ((data.openPositions ?? []).length > 0) {
+    lines.push('', '— Open positions / exposure —');
+    for (const p of data.openPositions.slice(0, LIST_CAP)) {
+      lines.push(`  ${p.ticker} ${p.side} qty=${p.qty} approxExposure=${p.exposure}`);
+    }
+  }
+  if ((data.options ?? []).length > 0) {
+    lines.push('', '— Options audit sample —');
+    for (const o of data.options.slice(0, LIST_CAP)) {
+      lines.push(
+        `  ${o.optionSymbol} ${o.strategy} ${o.right} qty=${o.qty} ` +
+        `premium=${o.premiumEntry ?? '?'} notional=${o.notionalEntry ?? '?'} status=${o.status}` +
+        `${o.exitReason ? ` exit=${o.exitReason}` : ''}`
+      );
+    }
+  }
   if (strategy) lines.push('', ...formatStrategySection(strategy));
   if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
   return lines;
@@ -250,6 +466,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
  * @param {object} db
  * @param {object} [opts]
  * @param {string|null} [opts.day]
+ * @param {number|null} [opts.sessionId]
  * @param {boolean} [opts.send]         send the full report
  * @param {boolean} [opts.testMessage]  send EOD_TEST_MESSAGE instead of the report
  * @param {object|null} [opts.discordClient]  required when send/testMessage
@@ -258,32 +475,72 @@ export async function runEodReport(
   db,
   {
     day = null, send = false, testMessage = false, discordClient = null,
+    sessionId = null,
     includeRecommendations = true, currentConstraints = {}, minSampleSize,
-    includeStrategyRecommendations = true, strategySettings = null,
+    includeStrategyRecommendations = true, strategySettings = null, sessionStats = null,
   } = {}
 ) {
-  const data = collectEodData(db, { day });
-  // Recommendations + strategy analysis are READ-ONLY; they never edit .env or
-  // any file. The strategy recommender suggests data/strategy-settings.json
-  // changes (applied only by the updater's --write), the constraint recommender
-  // suggests manual .env edits.
-  const recResult = includeRecommendations
+  const data = collectEodData(db, { day, sessionId });
+  if (sessionStats) {
+    data.session = { ...data.session, ...sessionStats };
+  }
+  const dataQuality = assessEodDataQuality(data, { minSampleSize });
+  data.dataQuality = dataQuality;
+  // Recommendations + strategy analysis are advisory only; they never edit
+  // .env, strategy files, prompts, risk limits, DB settings, or runtime behavior.
+  let recResult = includeRecommendations && dataQuality.canRecommend
     ? buildConstraintRecommendations({ data, current: currentConstraints, minSampleSize })
     : null;
-  const strategyResult = includeStrategyRecommendations
+  if (includeRecommendations && !dataQuality.canRecommend && String(currentConstraints?.LIVE_TRADING_ENABLED) === 'true') {
+    const safety = buildConstraintRecommendations({ data, current: currentConstraints, minSampleSize });
+    recResult = {
+      analysis: safety.analysis,
+      recommendations: safety.recommendations.filter((r) => r.variable === 'LIVE_TRADING_ENABLED'),
+    };
+  }
+  const strategyResult = includeStrategyRecommendations && dataQuality.canRecommend
     ? buildStrategyRecommendations({ data, settings: strategySettings ?? loadStrategySettings().settings })
+    : null;
+  const renderedRecommendations = includeRecommendations
+    ? (recResult ? recResult.recommendations : [])
     : null;
   const lines = buildEodReport(data, {
     day,
-    recommendations: recResult ? recResult.recommendations : null,
+    recommendations: renderedRecommendations,
     strategy: strategyResult,
   });
   const content = lines.join('\n');
   const result = {
     day, data, lines, content, sent: false,
-    recommendations: recResult ? recResult.recommendations : null,
+    recommendations: renderedRecommendations,
     strategy: strategyResult,
+    dataQuality,
   };
+
+  if (recResult && recResult.recommendations.length > 0) {
+    insertRecommendationAudit(db, {
+      version: 'constraint_recommendations_v1',
+      kind: 'constraint_suggestion',
+      evidenceWindowStart: day,
+      evidenceWindowEnd: day,
+      sampleSize: recResult.analysis.sampleSize,
+      dataQuality: recResult.analysis.sampleSize >= (minSampleSize ?? 10) ? 'sufficient' : 'limited',
+      observations: [recResult.analysis],
+      recommendations: recResult.recommendations,
+    });
+  }
+  if (strategyResult && strategyResult.changes.length > 0) {
+    insertRecommendationAudit(db, {
+      version: 'strategy_recommendations_v1',
+      kind: 'strategy_suggestion',
+      evidenceWindowStart: day,
+      evidenceWindowEnd: day,
+      sampleSize: strategyResult.analysis.sampleSize,
+      dataQuality: strategyResult.analysis.sampleSize >= 10 ? 'sufficient' : 'limited',
+      observations: [strategyResult.analysis, strategyResult.researchFocus],
+      recommendations: strategyResult.changes,
+    });
+  }
 
   if (send || testMessage) {
     if (!discordClient) {
@@ -313,7 +570,7 @@ export function currentConstraintsFromConfig(config) {
 }
 
 async function main() {
-  const { day, send, testMessage, includeRecommendations, includeStrategyRecommendations } =
+  const { day, sessionId, send, testMessage, includeRecommendations, includeStrategyRecommendations } =
     parseArgs(process.argv.slice(2));
   const config = loadConfig();
   const wantSend = send || testMessage;
@@ -340,7 +597,7 @@ async function main() {
     }
 
     const result = await runEodReport(db, {
-      day, send, testMessage, discordClient,
+      day, sessionId, send, testMessage, discordClient,
       includeRecommendations,
       includeStrategyRecommendations,
       currentConstraints: currentConstraintsFromConfig(config),

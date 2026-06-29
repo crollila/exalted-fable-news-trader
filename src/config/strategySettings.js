@@ -41,7 +41,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   impact_threshold: 0.5,
   sentiment_threshold: 0.3,
   interval_minutes: 15,
-  max_iterations: 20,
+  max_iterations: null,
   scrape_target_groups: ['filings', 'company_news'],
   scrape_symbol_focus: ['AAPL', 'MSFT', 'NVDA'],
 });
@@ -63,7 +63,7 @@ export const SETTING_SPECS = Object.freeze({
   impact_threshold: { kind: 'unit' },
   sentiment_threshold: { kind: 'unit' },
   interval_minutes: { kind: 'int', min: MIN_INTERVAL_MINUTES, max: 1440 },
-  max_iterations: { kind: 'int', min: 1, max: MAX_ITERATIONS_CAP },
+  max_iterations: { kind: 'optional_int', min: 1, max: MAX_ITERATIONS_CAP },
   scrape_target_groups: { kind: 'strings' },
   scrape_symbol_focus: { kind: 'symbols' },
 });
@@ -85,6 +85,12 @@ function coerceField(spec, value, fallback, warnings, key) {
       return clamp(n, spec.min, spec.max);
     }
     case 'int': {
+      const n = Number.parseInt(value, 10);
+      if (!Number.isInteger(n) || n <= 0) { warnings.push(`${key}: invalid, kept ${fallback}`); return fallback; }
+      return clamp(n, spec.min, spec.max);
+    }
+    case 'optional_int': {
+      if (value === null || value === undefined || value === '') return null;
       const n = Number.parseInt(value, 10);
       if (!Number.isInteger(n) || n <= 0) { warnings.push(`${key}: invalid, kept ${fallback}`); return fallback; }
       return clamp(n, spec.min, spec.max);

@@ -14,6 +14,7 @@ import {
   buildEodReport,
   runEodReport,
   EOD_TEST_MESSAGE,
+  OPTIONS_DISCLOSURE,
 } from '../scripts/sendPaperEodReport.js';
 
 function freshDb() {
@@ -36,11 +37,44 @@ function seedActivity(db) {
   insertRejectedTrade(db, { ticker: 'AMD', side: 'buy', quantity: 1, reason: 'confidence 0.2 below threshold 0.6' });
 }
 
+function insertEvent(db, id) {
+  return Number(db.prepare(
+    `INSERT INTO news_events (provider, provider_event_id, ticker, headline, published_at, received_at, news_type)
+     VALUES ('t', ?, 'AAPL', 'H', '2026-06-18T14:00:00.000Z', '2026-06-18T14:00:00.000Z', 'earnings')`
+  ).run(`evt-${id}`).lastInsertRowid);
+}
+
+function seedSufficientLosingSession(db) {
+  const sessionId = Number(db.prepare(
+    `INSERT INTO paper_runtime_sessions
+       (session_date, started_at, ended_at, status, cycles, fresh_news_count,
+        classification_count, classification_status_json, orders_submitted, order_status_json,
+        model_request_count)
+     VALUES
+       ('2026-06-18', '2026-06-18T13:30:00.000Z', '2026-06-18T20:00:00.000Z',
+        'closed', 10, 10, 10, '{"parsed":10}', 10, '{"filled":10}', 10)`
+  ).run().lastInsertRowid);
+  for (let i = 0; i < 10; i += 1) {
+    const eventId = insertEvent(db, i);
+    const trade = insertPaperTrade(db, {
+      newsEventId: eventId,
+      ticker: 'AAPL',
+      side: 'buy',
+      quantity: 1,
+      fillPrice: 100,
+      status: 'closed',
+    });
+    db.prepare('UPDATE paper_trades SET pnl_usd = -10, created_at = ? WHERE id = ?')
+      .run(`2026-06-18T14:${String(i).padStart(2, '0')}:00.000Z`, trade.id);
+  }
+  return sessionId;
+}
+
 // --- arg parsing -----------------------------------------------------------
 
 test('parseArgs defaults to a local dry run (no send), recommendations on', () => {
   assert.deepEqual(parseArgs([]), {
-    day: null, send: false, testMessage: false, dryRun: false,
+    day: null, sessionId: null, send: false, testMessage: false, dryRun: false,
     includeRecommendations: true, includeStrategyRecommendations: true,
   });
   assert.equal(parseArgs(['--no-constraint-recommendations']).includeRecommendations, false);
@@ -49,8 +83,9 @@ test('parseArgs defaults to a local dry run (no send), recommendations on', () =
 });
 
 test('parseArgs reads --day, --send-discord, --test-message, --dry-run', () => {
-  const a = parseArgs(['--day', '2026-06-18', '--send-discord']);
+  const a = parseArgs(['--day', '2026-06-18', '--session-id', '7', '--send-discord']);
   assert.equal(a.day, '2026-06-18');
+  assert.equal(a.sessionId, 7);
   assert.equal(a.send, true);
   assert.equal(parseArgs(['--test-message']).testMessage, true);
   assert.equal(parseArgs(['--dry-run']).dryRun, true);
@@ -93,6 +128,29 @@ test('collectEodData filters by trading day when given one', () => {
   closeDatabase(db);
 });
 
+test('collectEodData can isolate one runtime session from same-day history', () => {
+  const db = freshDb();
+  const sessionId = Number(db.prepare(
+    `INSERT INTO paper_runtime_sessions
+       (session_date, started_at, ended_at, status, cycles)
+     VALUES ('2026-06-18', '2026-06-18T14:00:00.000Z', '2026-06-18T15:00:00.000Z', 'closed', 1)`
+  ).run().lastInsertRowid);
+  db.prepare(
+    `INSERT INTO paper_trades (ticker, side, quantity, status, created_at)
+     VALUES ('AAPL','buy',1,'open','2026-06-18T14:30:00.000Z')`
+  ).run();
+  db.prepare(
+    `INSERT INTO paper_trades (ticker, side, quantity, status, created_at)
+     VALUES ('MSFT','buy',1,'open','2026-06-18T18:30:00.000Z')`
+  ).run();
+  assert.equal(collectEodData(db, { day: '2026-06-18' }).ordersSubmitted, 2);
+  const scoped = collectEodData(db, { day: '2026-06-18', sessionId });
+  assert.equal(scoped.ordersSubmitted, 1);
+  assert.equal(scoped.session.sessionId, sessionId);
+  assert.equal(scoped.evidenceScope, `session:${sessionId}`);
+  closeDatabase(db);
+});
+
 // --- report rendering ------------------------------------------------------
 
 test('buildEodReport includes the required narrative sections and figures', () => {
@@ -109,6 +167,7 @@ test('buildEodReport includes the required narrative sections and figures', () =
   assert.match(text, /Ideas for next trading day/);
   assert.match(text, /orders submitted:                2/);
   assert.match(text, /rejected:                        3/);
+  assert.ok(!text.includes('sparse qualifying signals (expected outside active hours)'));
   closeDatabase(db);
 });
 
@@ -117,6 +176,24 @@ test('buildEodReport prints a safe placeholder when there is no activity', () =>
   const text = buildEodReport(collectEodData(db, { day: null }), {}).join('\n');
   assert.match(text, /No paper-trading records for this day yet/);
   assert.match(text, /proves Discord delivery/);
+  closeDatabase(db);
+});
+
+test('every EOD report carries the exact options-execution disclosure (active AND no-trade)', () => {
+  const db = freshDb();
+  // No-trade report still discloses the options status.
+  const empty = buildEodReport(collectEodData(db, { day: null }), {}).join('\n');
+  assert.ok(empty.includes(OPTIONS_DISCLOSURE));
+  assert.match(empty, /No paper-trading records for this day yet/);
+  // Active report discloses it too.
+  seedActivity(db);
+  const active = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
+  assert.ok(active.includes(OPTIONS_DISCLOSURE));
+  // The exact wording is locked.
+  assert.equal(
+    OPTIONS_DISCLOSURE,
+    'Options contract discovery and PAPER plans are available. Options order execution is disabled pending tested exit monitoring and sell-to-close reporting.'
+  );
   closeDatabase(db);
 });
 
@@ -227,14 +304,43 @@ test('buildEodReport shows the no-change message for an empty recommendations ar
 
 test('runEodReport includes a recommendations section by default and can suppress it', async () => {
   const db = freshDb();
-  seedActivity(db); // includes "no shorts" rejections -> triggers a recommendation
+  seedActivity(db); // limited/uncorrelated sample; must not trigger threshold recommendations
   const withRecs = await runEodReport(db, { day: null });
   assert.match(withRecs.content, /Recommended manual \.env changes/);
   assert.ok(Array.isArray(withRecs.recommendations));
+  assert.deepEqual(withRecs.recommendations, []);
+  assert.match(withRecs.content, /data quality:\s+limited/);
 
   const without = await runEodReport(db, { day: null, includeRecommendations: false });
   assert.ok(!without.content.includes('Recommended manual .env changes'));
   assert.equal(without.recommendations, null);
+  closeDatabase(db);
+});
+
+test('duplicate event replay contaminates evidence and suppresses recommendations', async () => {
+  const db = freshDb();
+  const sessionId = Number(db.prepare(
+    `INSERT INTO paper_runtime_sessions
+       (session_date, started_at, ended_at, status, cycles)
+     VALUES ('2026-06-18', '2026-06-18T13:30:00.000Z', '2026-06-18T20:00:00.000Z', 'closed', 3)`
+  ).run().lastInsertRowid);
+  const eventId = insertEvent(db, 'dup');
+  for (let i = 0; i < 3; i += 1) {
+    const rejection = insertRejectedTrade(db, {
+      newsEventId: eventId,
+      ticker: 'AAPL',
+      side: 'buy',
+      quantity: 1,
+      reason: 'confidence 0.2 below threshold 0.6',
+    });
+    db.prepare('UPDATE rejected_trades SET created_at = ? WHERE id = ?')
+      .run(`2026-06-18T14:0${i}:00.000Z`, rejection.id);
+  }
+  const r = await runEodReport(db, { day: '2026-06-18', sessionId });
+  assert.equal(r.dataQuality.status, 'limited');
+  assert.match(r.content, /duplicate\/stale event replay/);
+  assert.deepEqual(r.recommendations, []);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_recommendation_audits').get().n, 0);
   closeDatabase(db);
 });
 
@@ -267,16 +373,31 @@ test('the recommendations section adds no secrets/raw content to the report', as
   closeDatabase(db);
 });
 
-test('runEodReport includes a strategy-settings recommendations section + research focus', async () => {
+test('runEodReport suppresses strategy recommendations when data quality is limited', async () => {
   const db = freshDb();
-  seedActivity(db); // "no shorts" rejections + the others
+  seedActivity(db);
   const r = await runEodReport(db, { day: null });
-  assert.match(r.content, /Strategy setting recommendations \(data\/strategy-settings\.json\)/);
-  assert.match(r.content, /Next-day research focus \(plan only\)/);
-  assert.ok(r.strategy && Array.isArray(r.strategy.changes));
+  assert.ok(!r.content.includes('Strategy setting recommendations'));
+  assert.equal(r.strategy, null);
   // Suppressible.
   const off = await runEodReport(db, { day: null, includeStrategyRecommendations: false });
   assert.ok(!off.content.includes('Strategy setting recommendations'));
+  closeDatabase(db);
+});
+
+test('sufficient unique session evidence can emit recommendations and audit them', async () => {
+  const db = freshDb();
+  const sessionId = seedSufficientLosingSession(db);
+  const r = await runEodReport(db, {
+    day: '2026-06-18',
+    sessionId,
+    currentConstraints: { MAX_TRADE_NOTIONAL_PCT: 0.01, LIVE_TRADING_ENABLED: 'false' },
+  });
+  assert.equal(r.dataQuality.status, 'sufficient');
+  assert.ok(r.recommendations.some((rec) => rec.variable === 'MAX_TRADE_NOTIONAL_PCT'));
+  assert.match(r.content, /MAX_TRADE_NOTIONAL_PCT=0\.0075/);
+  const audits = db.prepare('SELECT kind, sample_size, data_quality FROM paper_recommendation_audits').all();
+  assert.ok(audits.some((a) => a.kind === 'constraint_suggestion' && a.sample_size === 10 && a.data_quality === 'sufficient'));
   closeDatabase(db);
 });
 

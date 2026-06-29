@@ -105,6 +105,18 @@ test('assessProposal accepts a short on direction down + allowShorts + negative 
   assert.match(p.reason, /short AAPL/);
 });
 
+test('assessProposal rejects a short when PAPER_ENABLE_SHORTS is false', () => {
+  const p = assessProposal({
+    event: EVENT,
+    score: strongLong({ direction: 'down', sentiment_score: -0.7 }),
+    allowedSymbols: ['AAPL'],
+    allowShorts: true,
+    shortsEnabled: false,
+  });
+  assert.equal(p.accepted, false);
+  assert.match(p.reason, /PAPER_ENABLE_SHORTS=false/);
+});
+
 test('a short still requires sentiment below the negative threshold', () => {
   const p = assessProposal({
     event: EVENT, score: strongLong({ direction: 'down', sentiment_score: 0.2 }), // not negative enough

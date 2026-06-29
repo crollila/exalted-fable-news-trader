@@ -4,19 +4,25 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Uncommitted PAPER-loop repair in progress: the market-hours loop now runs a
-  fresh decision cycle each open iteration (recent Alpaca ingest -> newly
-  inserted event classification with explicit `--classifier real_model` ->
-  fresh unprocessed `model_v1` selection -> existing PAPER proposal/risk/order
-  path). Default selection excludes events already present in `paper_trades` or
-  `rejected_trades`; `--event-id` remains an explicit retest override. Heartbeat
-  outcomes distinguish no new news, no fresh real-model score, signal-threshold
-  failures, already-processed candidates, risk rejections, and broker submit
-  errors. PAPER signal defaults changed from confidence/impact/sentiment
-  `0.6/0.5/0.3` to `0.55/0.35/0.2`; CLI flags and runtime
-  `data/strategy-settings.json` can still override non-secret defaults. No
-  migrations/dependencies/live-trading path added.
-- Stable. All tests passing (474/474) on the uncommitted PAPER-loop repair.
+- Current working tree is an UNCOMMITTED PAPER-only implementation slice on top
+  of `e2ee6d6` (`fix(paper): run fresh news decision cycle in paper loop`).
+  It is not staged, committed, or pushed.
+- Implemented in the working tree: OpenAI classifier provider via central
+  `OPENAI_API_KEY`/`OPENAI_MODEL`; `real_model` is a visible deprecated alias
+  for OpenAI; Anthropic is explicit-only; continuous market-aware PAPER loop
+  with Alpaca clock/calendar checks; closed-market sleep without news/model/
+  price/options/order calls; persistent runtime sessions; idempotent EOD
+  Discord reports; advisory-only recommendation audits; controlled candidate
+  universe selection; PAPER capability gates for shorts/options/margin; Alpaca
+  read-only clock/calendar/asset/option-contract/option-quote helpers; and
+  migration 004 for runtime/research audit records.
+- Option scope in this working tree is deliberately limited to long call/put
+  contract discovery and quote validation for PAPER research. PAPER option order
+  submission is disabled until tested exit monitoring and sell-to-close
+  reporting are implemented.
+- Verification in this uncommitted tree: report-focused tests, affected focused
+  suites, and full `npm test` pass. Latest full suite result: 499/499 passing
+  with no network calls in tests.
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 - Phase 5 (PAPER trading) FIRST VERTICAL SLICE is COMMITTED (`df1931f`): a
@@ -60,7 +66,13 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   never enables live trading. 38 network-free tests (463 total).
 
 ## Latest Confirmed Commit
-- Latest committed: `385ba4c` — feat(strategy): learning-based strategy settings
+- Latest committed: `e2ee6d6` - fix(paper): run fresh news decision cycle in
+  paper loop. The loop now performs fresh Alpaca news ingest, real-model
+  classification of newly inserted events, fresh unprocessed `model_v1`
+  selection, and the existing PAPER proposal/risk/order path each open-market
+  iteration. Heartbeat outcomes distinguish no-news, no-score, threshold, risk,
+  processed, and broker-error cases. Tests: 474/474.
+- Previous: `385ba4c` — feat(strategy): learning-based strategy settings
   + research-source selection. A non-secret runtime strategy file
   (config/strategy-settings.example.json + src/config/strategySettings.js;
   data/strategy-settings.json gitignored, written ONLY with --write, never .env,

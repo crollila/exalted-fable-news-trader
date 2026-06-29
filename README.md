@@ -187,22 +187,20 @@ The same script can score with a **real model** behind the identical classifier
 contract, parser, and storage path. It is explicit and opt-in:
 
 ```
-node --env-file=.env scripts/classifyNewsOnce.js --classifier real_model --limit 1
+node --env-file=.env scripts/classifyNewsOnce.js --classifier openai --limit 1
 ```
 
-`--classifier` defaults to `manual_baseline`; `real_model` constructs the
-Anthropic Messages API classifier (`src/sentiment/modelClassifier.js`, raw HTTP,
-zero dependencies). It reads `ANTHROPIC_API_KEY` **from config only** and fails
-with a clear "not configured" error if the key is absent. The model id defaults
-to `claude-opus-4-8` and can be overridden with `MODEL_CLASSIFIER_MODEL`. Real
-scores are stored as `model = <model id>`, `prompt_version = "model_v1"`. The
-key is sent in a request header only — never logged, returned, or persisted; all
-errors are sanitized/redacted. The raw model response is preserved byte-for-byte
-through the existing `insertSentimentScore` path; malformed / out-of-range /
-missing-field / model-error outcomes are stored as data, never silently dropped.
-This path is **never exercised by `npm test`** (all tests inject a fake HTTP
-client); it makes a live model call only when you run it manually with a real
-key. The MVP pipeline accepts the same `--classifier real_model` flag.
+`--classifier` defaults to `manual_baseline`; `openai` constructs the production
+model classifier (`src/sentiment/modelClassifier.js`, raw HTTP, zero
+dependencies). It reads `OPENAI_API_KEY` and `OPENAI_MODEL` **from central config
+only** and fails clearly if either is absent. The model id is not defaulted in
+code; set it locally in `.env`. Real scores are stored as `model = <configured
+model id>` with `prompt_version = "model_v1"` plus parsed provider metadata.
+The key is sent in a request header only - never logged, returned, or persisted;
+errors are sanitized/redacted. npm tests inject fake HTTP/model responders and
+make zero OpenAI network calls. `--classifier real_model` is a visible
+deprecated alias that warns and resolves to OpenAI. Anthropic remains available
+only through explicit `--classifier anthropic`.
 
 ## Manual MVP pipeline (end-to-end)
 
@@ -223,8 +221,8 @@ only:
    (default 5, hard-capped at 20; skipped via `--skip-ingest` or when
    credentials are absent),
 2. **classify/score** a tiny unscored set with the deterministic manual
-   classifier above (or the real model classifier via `--classifier
-   real_model`) → `sentiment_scores` (default 1, capped at 5),
+   classifier above (or the OpenAI production classifier via `--classifier
+   openai`) -> `sentiment_scores` (default 1, capped at 5),
 3. **measure** price reactions for a tiny set via the real Alpaca Trades
    PriceSource → `price_reactions` (default 1, capped at 5; skipped when
    credentials are absent),
@@ -291,7 +289,7 @@ Flags: `--symbols A,B` (allow-list), `--qty N` (default 1, hard-capped at 100),
 `--execute-paper` (off by default). Default PAPER signal thresholds are now
 confidence `0.55`, impact `0.35`, and sentiment magnitude `0.2` (previously
 `0.6`, `0.5`, `0.3`). To populate scored events first, run the MVP pipeline /
-`classifyNewsOnce.js` with `--classifier real_model`.
+`classifyNewsOnce.js` with `--classifier openai`.
 
 Output is sanitized — event id, ticker, model/prompt, numeric scores, proposed
 side/qty, the risk decision, and (only if an order was sent) the order id/status.
@@ -307,65 +305,77 @@ advanced flags below it also proposes **shorts** (direction down) and **options*
 > **paper** account only. Live trading stays disabled and unsupported; the order
 > client is hard-wired to `paper-api.alpaca.markets`.
 
-The one-shot script also supports short equities (`--allow-shorts`, on a
-margin/short-eligible paper account, model direction **down**), single-leg long
-options by explicit OCC symbol (`--allow-options --option-symbol …`), and
-margin-aware risk caps. Orders still require `--execute-paper`; options additionally
-require `--options-mode execute_paper` **and** a verified account options capability.
+The one-shot script also supports short equities (`--allow-shorts`, model
+direction **down**) and validated single-leg long option plans (`--allow-options`,
+long calls for bullish signals and long puts for bearish signals). A CLI flag
+alone never enables these paths: `PAPER_ENABLE_SHORTS`,
+`PAPER_ENABLE_OPTIONS`, and `PAPER_ENABLE_MARGIN` must be enabled locally, and
+broker account/asset/contract/quote checks still have to pass. Orders still
+require `--execute-paper`.
 
 Advanced dry-run (no orders):
 
 ```
-node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL,MSFT,NVDA --classifier real_model --qty 1 --allow-shorts --allow-options --options-mode plan_only --max-order-notional 500
+node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL,MSFT,NVDA --classifier openai --qty 1 --allow-shorts --allow-options --options-mode plan_only --max-order-notional 500
 ```
 
-Advanced paper execution (sends PAPER orders):
+Advanced paper execution (sends PAPER equity orders):
 
 ```
-node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL,MSFT,NVDA --classifier real_model --qty 1 --allow-shorts --allow-options --options-mode execute_paper --option-symbol <OCC_OPTION_SYMBOL> --max-order-notional 500 --execute-paper
+node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL,MSFT,NVDA --classifier openai --qty 1 --allow-shorts --allow-options --options-mode plan_only --max-order-notional 500 --execute-paper
 ```
 
 Risk caps (all conservative by default): `--max-order-notional`,
 `--max-symbol-exposure`, `--max-gross-exposure`, `--max-daily-paper-orders`,
 `--max-daily-paper-notional`, `--option-max-premium`. Option controls:
-`--option-symbol` (OCC, **required to execute** — there is no contract discovery
-in this patch), `--option-contract-limit`, `--option-expiry-days-min/-max`.
-Margin-aware risk rejects blocked accounts, shorts without margin/equity
-eligibility, insufficient buying power, and any cap breach (each logged to
-`rejected_trades` with a reason). Options without a quote feed cannot pre-verify
-premium — exposure is bounded by `--option-contract-limit` (paper-only).
+`--option-symbol` (optional OCC override), `--option-contract-limit`,
+`--option-expiry-days-min/-max`. Margin-aware risk rejects blocked accounts,
+shorts without broker-confirmed margin/equity eligibility, insufficient buying
+power, and any cap breach (each logged to `rejected_trades` with a reason).
+Options require broker contract discovery/tradability and quote validation, but
+PAPER option order submission is intentionally disabled until tested option exit
+monitoring and sell-to-close reporting are implemented. Current options scope is
+plan/validation only; naked options, covered calls, spreads, assignment/exercise,
+and complex multi-leg strategies are out of scope.
 
 ## Market-hours PAPER loop
 
-A bounded loop runs a fresh decision cycle on an interval during the US regular
-session only (Mon–Fri 09:30–16:00 ET; weekends skipped). Each open-market
-iteration ingests recent Alpaca news for `--symbols`, classifies newly inserted
-events only when `--classifier real_model` is explicitly requested, selects a
-fresh unprocessed `model_v1` score, and then reuses the one-shot PAPER
-proposal/risk/order path. It is **dry-run by default**, enforces a **≥
-5-minute** interval and a max-iteration cap, prints a sanitized heartbeat each
-iteration, and exits cleanly on Ctrl+C. **Holiday limitation:** US market
-holidays/half-days are **not** modeled (no exchange calendar yet) — printed at
-startup.
+The loop runs continuously by default until Ctrl+C and performs a fresh decision
+cycle only during a valid US regular equity session. It prefers Alpaca
+clock/calendar state, including holidays and early closes, and falls back to an
+explicit local Mon-Fri regular-hours approximation only when the clock is
+unavailable. Outside a valid session it performs only the minimal market-clock
+check, prints the next wake time, and sleeps; it does not call OpenAI, news,
+price, option-contract, option-quote, or order endpoints while closed.
+
+Each open-market iteration ranks the configured base universe, ingests recent
+Alpaca news for the selected capped symbols, classifies newly inserted events
+when `--classifier openai` is requested, selects a fresh unprocessed `model_v1`
+score, and then reuses the one-shot PAPER proposal/risk/order path. It is
+**dry-run by default**, enforces a **>= 5-minute** interval, prints sanitized
+state transitions and cycle outcomes, sends one idempotent EOD report per
+completed session when requested, and exits cleanly on Ctrl+C. `--max-iterations`
+exists only as an explicit debug/test cap.
 
 Loop dry-run:
 
 ```
-node --env-file=.env scripts/runPaperTradingLoop.js --symbols AAPL,MSFT,NVDA --classifier real_model --qty 1 --allow-shorts --allow-options --options-mode plan_only --interval-minutes 15 --max-iterations 20 --max-order-notional 500
+node --env-file=.env scripts/runPaperTradingLoop.js --symbols AAPL,MSFT,NVDA --classifier openai --qty 1 --allow-shorts --allow-options --options-mode plan_only --interval-minutes 15 --max-order-notional 500
 ```
 
 Loop paper execution (with an end-of-day Discord report):
 
 ```
-node --env-file=.env scripts/runPaperTradingLoop.js --symbols AAPL,MSFT,NVDA --classifier real_model --qty 1 --allow-shorts --allow-options --options-mode execute_paper --option-symbol <OCC_OPTION_SYMBOL> --interval-minutes 15 --max-iterations 20 --max-order-notional 500 --execute-paper --send-discord-eod-report
+node --env-file=.env scripts/runPaperTradingLoop.js --symbols AAPL,MSFT,NVDA --classifier openai --qty 1 --allow-shorts --allow-options --options-mode plan_only --interval-minutes 15 --max-order-notional 500 --execute-paper --send-discord-eod-report
 ```
 
-Extra loop flags: `--interval-minutes` (floored at 5), `--max-iterations`
-(capped), `--ingest-limit` (default 20, capped at 50), `--classify-limit`
-(default/cap 5), `--news-lookback-minutes` (default 60, capped at 390),
-`--run-outside-market-hours true|false` (default false),
-`--send-discord-eod-report` (posts the EOD summary when the loop ends, if
-`DISCORD_WEBHOOK_URL` is set). Heartbeats distinguish `no_new_news`,
+Extra loop flags: `--interval-minutes` (floored at 5), `--max-iterations N`
+(explicit debug/test cap), `--ingest-limit` (default 20, capped at 50),
+`--classify-limit` (default/cap 5), `--max-symbols-per-cycle` (cost cap),
+`--news-lookback-minutes` (default 60, capped at 390), and
+`--send-discord-eod-report` (posts the idempotent EOD summary after a completed
+session if `DISCORD_WEBHOOK_URL` is set). `--run-outside-market-hours` is
+deprecated and ignored. Heartbeats distinguish `no_new_news`,
 `no_fresh_real_model_score`, `all_fresh_scores_failed_signal_thresholds`,
 `already_processed_event`, `risk_rejection`, and `broker_submission_error`.
 Never part of `npm test` (the loop core runs with injected clock/sleep/
@@ -381,28 +391,30 @@ URL**. That URL is a **secret** (it embeds a token) — paste it into your local
 `.env` only; never commit it. Add to `.env` (see `.env.example`):
 
 ```
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/.../...
-DISCORD_SERVER_ID=1515469212213317823
-DISCORD_CHANNEL_ID=1517321598456299610
+DISCORD_WEBHOOK_URL=<your Discord webhook URL>
+DISCORD_SERVER_ID=<optional server id>
+DISCORD_CHANNEL_ID=<optional channel id>
 ```
 
 `DISCORD_SERVER_ID` / `DISCORD_CHANNEL_ID` are optional metadata (printed for a
 sanity check); they **cannot** post on their own — only `DISCORD_WEBHOOK_URL`
 sends.
 
-**Test the connection** (posts one small test message to the channel):
+**Test the EOD Discord delivery path** (posts one small sanitized test message):
 
 ```
-node --env-file=.env scripts/smokeDiscordWebhook.js
+node --env-file=.env scripts/sendPaperEodReport.js --test-message
 ```
 
 It prints the configured server/channel ids, whether a webhook is configured,
-and the send result — **never** the webhook URL.
+and the send result — **never** the webhook URL. A Discord delivery failure is
+recorded as a non-fatal report status and does not stop PAPER trading cycles.
 
 **Preview the end-of-day report locally (sends nothing, no webhook needed):**
 
 ```
 node --env-file=.env scripts/sendPaperEodReport.js --dry-run
+node --env-file=.env scripts/sendPaperEodReport.js --dry-run --session-id <paper_runtime_sessions id>
 ```
 
 **Send the end-of-day report to Discord (requires the webhook):**
@@ -411,26 +423,29 @@ node --env-file=.env scripts/sendPaperEodReport.js --dry-run
 node --env-file=.env scripts/sendPaperEodReport.js --send-discord
 ```
 
-The report summarizes the local `paper_trades` / `rejected_trades` for the
-trading day (`--day YYYY-MM-DD`, default today UTC): proposals, orders submitted,
-fills, long/short counts, rejections and their reasons, approximate realized
-P&L, plus a short **what it did / why / what went well / what went poorly /
-mistakes & lessons / next-day ideas** narrative. With no records yet it prints a
-safe placeholder that still proves delivery. Output is sanitized — counts,
-tickers, sides, statuses, our own rejection reasons, and rounded P&L only; never
-raw model responses, raw payloads, headlines, API keys, headers, or the webhook
-URL. **Dry run is the default**; an actual send happens only with
-`--send-discord` (or `--test-message`), and missing the webhook fails clearly
-when a send is requested. Never part of `npm test` (tests use fake HTTP only).
+The report summarizes one completed runtime session when `--session-id` is
+provided, or the requested trading day (`--day YYYY-MM-DD`, default today UTC):
+cycles, fresh news, classification outcomes, skipped/rejected reason counts,
+orders submitted, fills/statuses, shorts/options/margin usage, open exposure,
+approximate realized/unrealized paper P&L when available, notable wins/losses,
+data-quality warnings, and advisory-only next-session observations. Output is
+sanitized — counts, tickers, sides, statuses, our own rejection reasons, and
+rounded P&L only; never raw model responses, raw payloads, headlines, API keys,
+headers, raw request URLs, or the webhook URL. **Dry run is the default**; an
+actual send happens only with `--send-discord` (or `--test-message`), and missing
+the webhook fails clearly when a send is requested. Never part of `npm test`
+(tests use fake HTTP only).
 
-> Strategy parameters will live in a separate settings file (planned), **not**
-> in `.env` — the bot never edits `.env`. Live trading remains disabled.
+> Non-secret strategy parameters live in a separate settings file, **not** in
+> `.env` — the bot never edits `.env`. Live trading remains disabled.
 
 ### Recommended manual `.env` changes
 
 The EOD report ends with a **“Recommended manual .env changes”** section. The bot
-analyzes the day's `paper_trades` / `rejected_trades` and, **only if useful**,
-suggests conservative, bounded edits to your risk constraints — for example:
+analyzes the current session's `paper_trades` / `rejected_trades` plus persisted
+runtime/research records and, **only when data quality and sample size are
+sufficient**, suggests conservative, bounded edits to your risk constraints —
+for example:
 
 ```
 — Recommended manual .env changes —
@@ -441,8 +456,9 @@ suggests conservative, bounded edits to your risk constraints — for example:
   The bot did not edit .env. These are recommendations only.
 ```
 
-If nothing is warranted it prints **“No manual .env constraint changes
-recommended today.”** Key guarantees:
+If nothing is warranted, if there are fewer than 10 unique qualifying events, or
+if duplicate/stale-event replay contaminates the evidence window, it prints
+**“No manual .env constraint changes recommended today.”** Key guarantees:
 
 - **The bot NEVER edits `.env` or `.env.example`.** It only prints/sends the
   exact line you could change by hand; you review and edit it yourself.
@@ -454,12 +470,13 @@ recommended today.”** Key guarantees:
   appears it is only ever recommended to stay `false`.
 - Recommendable knobs include `MAX_POSITION_PCT`, `MAX_TRADE_NOTIONAL_PCT`,
   `MAX_DAILY_LOSS_PCT`, `MAX_TOTAL_EXPOSURE_PCT`, `MAX_TRADES_PER_DAY`,
-  `MAX_OPEN_POSITIONS`, and paper flags (`ALLOW_SHORTS`, `PAPER_OPTIONS_MODE`,
+  `MAX_OPEN_POSITIONS`, and paper flags (`PAPER_ENABLE_SHORTS`,
+  `PAPER_ENABLE_OPTIONS`, `PAPER_ENABLE_MARGIN`,
   `PAPER_CONFIDENCE_THRESHOLD`, `PAPER_IMPACT_THRESHOLD`,
-  `PAPER_SENTIMENT_THRESHOLD`, …). Note: most of these are **not yet wired** into
-  the bot (the live caps today are CLI flags + the `MAX_*_USD` vars), so a
-  recommendation usually means *introduce/define this variable*, shown with
-  `current (not set)`.
+  `PAPER_SENTIMENT_THRESHOLD`, ...). Recommendations record the evidence window,
+  sample size, data-quality status, old->new proposal, rationale, confidence,
+  and limitations in `paper_recommendation_audits`; they never change `.env`,
+  prompts, active limits, database settings, or runtime behavior automatically.
 
 The same section is included in the Discord message (sanitized; truncated to
 Discord's length limit). Suppress it with `--no-constraint-recommendations`.
@@ -474,7 +491,8 @@ Non-secret strategy parameters live in a JSON **settings file**, never in `.env`
 
 Settings include `symbols`, `allow_shorts`, `allow_options`, `options_mode`,
 `max_order_notional`, `max_*_exposure`, `max_daily_paper_*`, `max_option_premium`,
-the `*_threshold` knobs, `interval_minutes`, `max_iterations`, and research
+the `*_threshold` knobs, `interval_minutes`, an optional debug `max_iterations`,
+and research
 focus (`scrape_target_groups`, `scrape_symbol_focus`). All values are
 validated/capped on load; secrets and `LIVE_TRADING_ENABLED` are never accepted.
 When `data/strategy-settings.json` exists, the PAPER one-shot/loop use these
@@ -499,10 +517,13 @@ node --env-file=.env scripts/updateStrategySettingsFromLearning.js --limit 100 -
 
 Other flags: `--settings-path`, `--min-sample-size`, `--include-env-recommendations`
 (also lists manual `.env` suggestions), `--format text|json`. The EOD report also
-shows a "Strategy setting recommendations" section + a next-day research-focus plan.
+shows an advisory "Strategy setting recommendations" section + a next-day
+research-focus plan when sample/data-quality rules pass.
 
-> The bot **never edits `.env`** and **never enables live trading**. It only
-> writes the non-secret strategy file, and only when you pass `--write`.
+> The bot **never edits `.env`**, **never changes active runtime constraints from
+> the EOD report**, and **never enables live trading**. The standalone learning
+> updater writes only the non-secret strategy file, and only when you pass
+> `--write`.
 
 ## Research source selection (allow-list, selection-only)
 

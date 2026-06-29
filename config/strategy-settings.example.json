@@ -17,7 +17,7 @@
     "impact_threshold": 0.5,
     "sentiment_threshold": 0.3,
     "interval_minutes": 15,
-    "max_iterations": 20,
+    "max_iterations": null,
     "scrape_target_groups": ["filings", "company_news"],
     "scrape_symbol_focus": ["AAPL", "MSFT", "NVDA"]
   },

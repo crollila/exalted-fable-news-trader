@@ -162,7 +162,7 @@ export function formatStrategySection(result) {
         `      reason: ${c.reason}`
       );
     }
-    lines.push('  Apply with: scripts/updateStrategySettingsFromLearning.js --write (.env is never edited).');
+    lines.push('  Advisory only: no runtime setting was changed by this report.');
   }
   const rf = result?.researchFocus;
   if (rf) {

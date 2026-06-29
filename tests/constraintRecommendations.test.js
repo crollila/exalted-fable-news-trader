@@ -74,15 +74,15 @@ test('excessive order frequency recommends a lower daily trade cap', () => {
   assert.equal(cap.recommendedValue, 8); // floor(10 * 0.8)
 });
 
-test('option refusals recommend keeping options plan_only', () => {
+test('option refusals recommend keeping PAPER_ENABLE_OPTIONS false', () => {
   const data = baseData({
     rejectedCount: 2, proposals: 2,
     rejectionReasons: [rej('option execution rejected: account options capability is absent/unknown', 2)],
   });
   const { recommendations } = buildConstraintRecommendations({ data });
-  const opt = find(recommendations, 'PAPER_OPTIONS_MODE');
-  assert.equal(opt.recommendedValue, 'plan_only');
-  assert.equal(opt.manualEditLine, 'PAPER_OPTIONS_MODE=plan_only');
+  const opt = find(recommendations, 'PAPER_ENABLE_OPTIONS');
+  assert.equal(opt.recommendedValue, 'false');
+  assert.equal(opt.manualEditLine, 'PAPER_ENABLE_OPTIONS=false');
 });
 
 test('short/margin refusals recommend raising the sentiment threshold', () => {

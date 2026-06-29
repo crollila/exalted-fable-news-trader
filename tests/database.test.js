@@ -3,6 +3,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig, parseDatabaseUrl } from '../src/config.js';
 import { openMemoryDatabase, closeDatabase, listTables } from '../src/database/db.js';
@@ -13,6 +14,10 @@ const REQUIRED_TABLES = [
   'sentiment_scores',
   'price_reactions',
   'paper_trades',
+  'paper_option_trades',
+  'paper_runtime_sessions',
+  'paper_recommendation_audits',
+  'paper_universe_selections',
   'risk_state',
   'rejected_trades',
 ];
@@ -63,6 +68,27 @@ test('migration is idempotent (second run applies nothing)', () => {
   const second = runMigrations(db);
   assert.equal(second.applied.length, 0, 'second run should apply nothing');
   assert.deepEqual(second.skipped.sort(), first.applied.sort());
+  closeDatabase(db);
+});
+
+test('migration 004 upgrades an existing database that already applied 001-003', () => {
+  const db = openMemoryDatabase();
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+  `);
+  for (const version of ['001_initial', '002_sentiment_scores_phase3', '003_price_reactions_event_study']) {
+    const sql = fs.readFileSync(new URL(`../src/database/migrations/${version}.sql`, import.meta.url), 'utf8');
+    db.exec(sql);
+    db.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(version);
+  }
+  const result = runMigrations(db);
+  assert.deepEqual(result.applied, ['004_paper_runtime_research']);
+  const tables = listTables(db);
+  assert.ok(tables.includes('paper_option_trades'));
+  assert.ok(tables.includes('paper_runtime_sessions'));
   closeDatabase(db);
 });
 
@@ -146,6 +172,24 @@ test('live trading defaults to disabled', () => {
   const config = loadConfig({});
   assert.equal(config.liveTradingEnabled, false);
   assert.equal(config.paperTrading, true);
+  assert.deepEqual(config.paperCapabilities, {
+    enableShorts: false,
+    enableOptions: false,
+    enableMargin: false,
+  });
+});
+
+test('paper feature flags default off and parse strict true values', () => {
+  const config = loadConfig({
+    PAPER_ENABLE_SHORTS: 'true',
+    PAPER_ENABLE_OPTIONS: 'TRUE',
+    PAPER_ENABLE_MARGIN: 'false',
+  });
+  assert.deepEqual(config.paperCapabilities, {
+    enableShorts: true,
+    enableOptions: true,
+    enableMargin: false,
+  });
 });
 
 test('live trading without explicit risk confirmation throws', () => {

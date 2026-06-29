@@ -11,6 +11,7 @@ const margin = (over = {}) => ({
 });
 const cap = (a) => deriveCapabilities(a);
 const longEquity = (over = {}) => ({ assetClass: 'equity', side: 'buy', ticker: 'AAPL', quantity: 1, ...over });
+const shortableAsset = (over = {}) => ({ symbol: 'AAPL', tradable: true, shortable: true, easyToBorrow: true, ...over });
 
 test('resolveCaps fills conservative defaults', () => {
   assert.deepEqual(resolveCaps({}), DEFAULT_CAPS);
@@ -88,6 +89,76 @@ test('rejects on insufficient buying power for a long', () => {
   assert.match(r.reason, /buying power/);
 });
 
+test('when margin is disabled, risk uses cash instead of broker buying power', () => {
+  const acct = margin({ cash: 100, buyingPower: 60000 });
+  const r = assessRisk({
+    proposal: longEquity(),
+    capabilities: cap(acct),
+    account: acct,
+    referencePrice: 200,
+    marginEnabled: false,
+  });
+  assert.equal(r.approved, false);
+  assert.match(r.reason, /buying power/);
+  assert.match(r.reason, /100 < 200/);
+});
+
+test('shorts require PAPER_ENABLE_MARGIN=true', () => {
+  const acct = margin();
+  const r = assessRisk({
+    proposal: longEquity({ side: 'sell' }),
+    capabilities: cap(acct),
+    account: acct,
+    referencePrice: 100,
+    marginEnabled: false,
+  });
+  assert.equal(r.approved, false);
+  assert.match(r.reason, /PAPER_ENABLE_MARGIN=false/);
+});
+
+test('shorts require broker asset shortability data', () => {
+  const acct = margin();
+  const noAsset = assessRisk({
+    proposal: longEquity({ side: 'sell' }),
+    capabilities: cap(acct),
+    account: acct,
+    referencePrice: 100,
+  });
+  assert.equal(noAsset.approved, false);
+  assert.match(noAsset.reason, /shortability data unavailable/);
+
+  const notShortable = assessRisk({
+    proposal: longEquity({ side: 'sell' }),
+    capabilities: cap(acct),
+    account: acct,
+    asset: shortableAsset({ shortable: false }),
+    referencePrice: 100,
+  });
+  assert.equal(notShortable.approved, false);
+  assert.match(notShortable.reason, /not shortable/);
+});
+
+test('shorts require easy_to_borrow === true; unknown/false fail closed', () => {
+  const acct = margin();
+  const base = {
+    proposal: longEquity({ side: 'sell' }),
+    capabilities: cap(acct),
+    account: acct,
+    referencePrice: 100,
+  };
+  // Explicit not-easy-to-borrow rejects.
+  const hardFalse = assessRisk({ ...base, asset: shortableAsset({ easyToBorrow: false }) });
+  assert.equal(hardFalse.approved, false);
+  assert.match(hardFalse.reason, /easy-to-borrow/);
+  // Unknown/null easy_to_borrow must ALSO reject (fail closed, not pass).
+  const unknown = assessRisk({ ...base, asset: shortableAsset({ easyToBorrow: null }) });
+  assert.equal(unknown.approved, false);
+  assert.match(unknown.reason, /easy-to-borrow/);
+  // Confirmed easy_to_borrow=true clears the borrow gate.
+  const confirmed = assessRisk({ ...base, asset: shortableAsset({ easyToBorrow: true }) });
+  assert.equal(confirmed.approved, true);
+});
+
 test('equity execute is refused when notional is unverifiable (no reference price)', () => {
   const r = assessRisk({ proposal: longEquity(), capabilities: cap(margin()), account: margin(), referencePrice: null, executePaper: true });
   assert.equal(r.approved, false);
@@ -100,10 +171,16 @@ test('equity dry-run is allowed (with caveat) when notional is unverifiable', ()
   assert.match(r.reason, /unverified/);
 });
 
-test('options without a quote are approved with an explicit unverified caveat (paper-only)', () => {
+test('options without a quote are refused because premium caps cannot be verified', () => {
   const r = assessRisk({ proposal: { assetClass: 'option', side: 'buy', ticker: 'AAPL', quantity: 1 }, capabilities: cap(margin()), account: margin(), referencePrice: null, executePaper: true });
+  assert.equal(r.approved, false);
+  assert.match(r.reason, /premium quote unavailable/);
+});
+
+test('option debit with a validated quote can pass risk caps', () => {
+  const r = assessRisk({ proposal: { assetClass: 'option', side: 'buy', ticker: 'AAPL', quantity: 1 }, capabilities: cap(margin()), account: margin(), referencePrice: 2, executePaper: true });
   assert.equal(r.approved, true);
-  assert.match(r.reason, /premium UNVERIFIED/);
+  assert.equal(r.estNotional, 200);
 });
 
 test('option execute is refused without an options-eligible account', () => {

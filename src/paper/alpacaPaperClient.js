@@ -17,7 +17,13 @@
 // Verified API surface (docs.alpaca.markets, 2026-06), all on the paper host:
 //   GET  /v2/account                -> account object
 //   GET  /v2/positions              -> [ position objects ]
+//   GET  /v2/clock                  -> market clock
+//   GET  /v2/calendar               -> market calendar days
+//   GET  /v2/assets/{symbol}        -> asset tradability/shortability
+//   GET  /v2/options/contracts      -> option contract discovery
 //   POST /v2/orders {symbol,qty,side,type,time_in_force} -> order object
+//   GET  https://data.alpaca.markets/v1beta1/options/snapshots/{underlying}
+//                                      -> option quote snapshot (read-only)
 //   headers: APCA-API-KEY-ID / APCA-API-SECRET-KEY (account-level pair)
 
 /** HARD-CODED Alpaca PAPER endpoint. There is deliberately no live URL here. */
@@ -26,12 +32,19 @@ export const PAPER_BASE_URL = 'https://paper-api.alpaca.markets';
 /** Alpaca LIVE host — referenced ONLY so tests can assert we never use it. */
 export const LIVE_BASE_URL_FORBIDDEN = 'https://api.alpaca.markets';
 
+/** Alpaca market-data host. Read-only, never used for order submission. */
+export const DATA_BASE_URL = 'https://data.alpaca.markets';
+
 /** OCC option symbol, e.g. AAPL260116C00150000 (root + YYMMDD + C/P + strike*1000). */
 export const OCC_OPTION_RE = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/;
 
 const ORDERS_PATH = '/v2/orders';
 const ACCOUNT_PATH = '/v2/account';
 const POSITIONS_PATH = '/v2/positions';
+const CLOCK_PATH = '/v2/clock';
+const CALENDAR_PATH = '/v2/calendar';
+const ASSETS_PATH = '/v2/assets';
+const OPTION_CONTRACTS_PATH = '/v2/options/contracts';
 
 const VALID_SIDES = new Set(['buy', 'sell']);
 
@@ -56,6 +69,29 @@ function boolOrNull(value) {
   if (value === 'true') return true;
   if (value === 'false') return false;
   return null;
+}
+
+function stringOrNull(value) {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function upperOrNull(value) {
+  const s = stringOrNull(value);
+  return s ? s.toUpperCase() : null;
+}
+
+function appendQuery(path, params = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params ?? {})) {
+    if (value === null || value === undefined || value === '') continue;
+    if (Array.isArray(value)) {
+      if (value.length > 0) query.set(key, value.join(','));
+    } else {
+      query.set(key, String(value));
+    }
+  }
+  const qs = query.toString();
+  return qs ? `${path}?${qs}` : path;
 }
 
 /** Map a raw Alpaca order payload to a SANITIZED whitelist (never the raw payload). */
@@ -107,6 +143,91 @@ export function sanitizePosition(payload) {
   };
 }
 
+/** Map a raw Alpaca clock payload to a SANITIZED whitelist. */
+export function sanitizeClock(payload) {
+  return {
+    timestamp: stringOrNull(payload?.timestamp),
+    isOpen: boolOrNull(payload?.is_open),
+    nextOpen: stringOrNull(payload?.next_open),
+    nextClose: stringOrNull(payload?.next_close),
+  };
+}
+
+/** Map a raw Alpaca calendar day payload to a SANITIZED whitelist. */
+export function sanitizeCalendarDay(payload) {
+  return {
+    date: stringOrNull(payload?.date),
+    open: stringOrNull(payload?.open),
+    close: stringOrNull(payload?.close),
+    sessionOpen: stringOrNull(payload?.session_open),
+    sessionClose: stringOrNull(payload?.session_close),
+  };
+}
+
+/** Map a raw Alpaca asset payload to a SANITIZED whitelist. */
+export function sanitizeAsset(payload) {
+  return {
+    id: stringOrNull(payload?.id),
+    symbol: upperOrNull(payload?.symbol),
+    name: stringOrNull(payload?.name),
+    assetClass: stringOrNull(payload?.class),
+    exchange: stringOrNull(payload?.exchange),
+    status: stringOrNull(payload?.status),
+    tradable: boolOrNull(payload?.tradable),
+    marginable: boolOrNull(payload?.marginable),
+    shortable: boolOrNull(payload?.shortable),
+    easyToBorrow: boolOrNull(payload?.easy_to_borrow),
+    fractionable: boolOrNull(payload?.fractionable),
+  };
+}
+
+/** Map a raw Alpaca option-contract payload to a SANITIZED whitelist. */
+export function sanitizeOptionContract(payload) {
+  return {
+    id: stringOrNull(payload?.id),
+    symbol: upperOrNull(payload?.symbol),
+    underlyingSymbol: upperOrNull(payload?.underlying_symbol),
+    status: stringOrNull(payload?.status),
+    tradable: boolOrNull(payload?.tradable),
+    expirationDate: stringOrNull(payload?.expiration_date),
+    strikePrice: numOrNull(payload?.strike_price),
+    type: stringOrNull(payload?.type),
+    style: stringOrNull(payload?.style),
+    openInterest: numOrNull(payload?.open_interest),
+    closePrice: numOrNull(payload?.close_price),
+  };
+}
+
+function extractLatestQuote(snapshot) {
+  return snapshot?.latestQuote ?? snapshot?.latest_quote ?? snapshot?.quote ?? null;
+}
+
+function quotePrice(quote, ...keys) {
+  for (const key of keys) {
+    const n = numOrNull(quote?.[key]);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
+/** Map a raw option snapshot to a sanitized quote for one OCC symbol. */
+export function sanitizeOptionQuote(symbol, snapshot) {
+  const quote = extractLatestQuote(snapshot);
+  const bid = quotePrice(quote, 'bp', 'bid_price', 'bidPrice');
+  const ask = quotePrice(quote, 'ap', 'ask_price', 'askPrice');
+  const mid =
+    bid !== null && ask !== null && bid > 0 && ask > 0
+      ? Math.round(((bid + ask) / 2) * 10000) / 10000
+      : null;
+  return {
+    symbol: upperOrNull(symbol),
+    bid,
+    ask,
+    mid,
+    updatedAt: stringOrNull(quote?.t ?? quote?.timestamp),
+  };
+}
+
 /**
  * Create a real Alpaca PAPER client. Explicit construction only; the endpoint is
  * paper-only and cannot be overridden (no baseUrl option, no env override).
@@ -128,9 +249,9 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
   const secrets = [keyId, secretKey];
   const doFetch = httpFetch ?? globalThis.fetch;
 
-  /** One sanitized HTTP request to the paper host. Returns parsed JSON. */
-  async function httpJson(method, path, bodyObj) {
-    const url = `${PAPER_BASE_URL}${path}`;
+  /** One sanitized HTTP request. Returns parsed JSON. */
+  async function httpJson(method, path, bodyObj, { baseUrl = PAPER_BASE_URL } = {}) {
+    const url = `${baseUrl}${path}`;
     const headers = {
       'APCA-API-KEY-ID': keyId,
       'APCA-API-SECRET-KEY': secretKey,
@@ -189,6 +310,100 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
     return payload.map(sanitizePosition);
   }
 
+  /** GET the Alpaca paper market clock (sanitized). */
+  async function getClock() {
+    const payload = await httpJson('GET', CLOCK_PATH);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error('alpacaPaperClient: unexpected clock payload shape (expected object)');
+    }
+    return sanitizeClock(payload);
+  }
+
+  /** GET Alpaca calendar days (sanitized array). */
+  async function getCalendar({ start = null, end = null } = {}) {
+    const payload = await httpJson('GET', appendQuery(CALENDAR_PATH, { start, end }));
+    if (!Array.isArray(payload)) {
+      throw new Error('alpacaPaperClient: unexpected calendar payload shape (expected array)');
+    }
+    return payload.map(sanitizeCalendarDay);
+  }
+
+  /** GET one asset by symbol (sanitized tradability/shortability fields). */
+  async function getAsset(symbol) {
+    const sym = String(symbol ?? '').trim().toUpperCase();
+    if (!sym) throw new Error('alpacaPaperClient: symbol must be a non-empty string');
+    const payload = await httpJson('GET', `${ASSETS_PATH}/${encodeURIComponent(sym)}`);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error('alpacaPaperClient: unexpected asset payload shape (expected object)');
+    }
+    return sanitizeAsset(payload);
+  }
+
+  /** GET read-only option contract discovery from the paper host. */
+  async function getOptionContracts({
+    underlyingSymbols = [],
+    expirationDateGte = null,
+    expirationDateLte = null,
+    type = null,
+    status = 'active',
+    limit = 100,
+  } = {}) {
+    const cleanSymbols = (Array.isArray(underlyingSymbols) ? underlyingSymbols : [underlyingSymbols])
+      .map((s) => String(s ?? '').trim().toUpperCase())
+      .filter(Boolean);
+    if (cleanSymbols.length === 0) {
+      throw new Error('alpacaPaperClient: underlyingSymbols must include at least one symbol');
+    }
+    const payload = await httpJson(
+      'GET',
+      appendQuery(OPTION_CONTRACTS_PATH, {
+        underlying_symbols: cleanSymbols,
+        expiration_date_gte: expirationDateGte,
+        expiration_date_lte: expirationDateLte,
+        type,
+        status,
+        limit,
+      })
+    );
+    const contracts = Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.option_contracts)
+        ? payload.option_contracts
+        : null;
+    if (!contracts) {
+      throw new Error('alpacaPaperClient: unexpected option contracts payload shape (expected array)');
+    }
+    return {
+      contracts: contracts.map(sanitizeOptionContract),
+      nextPageToken: stringOrNull(payload?.next_page_token),
+    };
+  }
+
+  /** GET a sanitized option quote snapshot for one OCC symbol (read-only data host). */
+  async function getOptionQuote({ underlyingSymbol, optionSymbol, feed = null } = {}) {
+    const underlying = String(underlyingSymbol ?? '').trim().toUpperCase();
+    const symbol = String(optionSymbol ?? '').trim().toUpperCase();
+    if (!underlying) throw new Error('alpacaPaperClient: underlyingSymbol must be a non-empty string');
+    if (!OCC_OPTION_RE.test(symbol)) {
+      throw new Error('alpacaPaperClient: optionSymbol must be a valid OCC option symbol');
+    }
+    const payload = await httpJson(
+      'GET',
+      appendQuery(`/v1beta1/options/snapshots/${encodeURIComponent(underlying)}`, {
+        symbols: symbol,
+        feed,
+      }),
+      null,
+      { baseUrl: DATA_BASE_URL }
+    );
+    const snapshots = payload?.snapshots ?? payload;
+    const snapshot = snapshots?.[symbol] ?? null;
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      throw new Error('alpacaPaperClient: option quote snapshot missing requested contract');
+    }
+    return sanitizeOptionQuote(symbol, snapshot);
+  }
+
   /** Submit a single equity PAPER market order (buy=long, sell=short/close). */
   async function submitMarketOrder({ symbol, qty, side = 'buy' } = {}) {
     const sym = String(symbol ?? '').trim().toUpperCase();
@@ -204,10 +419,9 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
   }
 
   /**
-   * Submit a single-leg option PAPER market order by OCC symbol. side 'buy'
-   * opens a long call/put; 'sell' is permitted only to CLOSE an existing option
-   * position (the caller enforces that — this client is a faucet). No spreads,
-   * no multi-leg, no uncovered writing initiated here.
+   * Option order submission is intentionally disabled until tested paper exit
+   * monitoring and sell-to-close reporting exist. Keep the method as an explicit
+   * guard so callers fail closed instead of inventing their own order path.
    */
   async function submitOptionMarketOrder({ optionSymbol, qty, side = 'buy' } = {}) {
     const sym = String(optionSymbol ?? '').trim().toUpperCase();
@@ -221,7 +435,7 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
     if (!VALID_SIDES.has(side)) {
       throw new Error(`alpacaPaperClient: side must be buy/sell, got "${side}"`);
     }
-    return postOrder({ symbol: sym, qty: quantity, side, type: 'market', time_in_force: 'day' });
+    throw new Error('alpacaPaperClient: PAPER option order submission disabled until tested option exit monitoring is implemented');
   }
 
   return {
@@ -229,6 +443,11 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
     baseUrl: PAPER_BASE_URL,
     getAccount,
     getPositions,
+    getClock,
+    getCalendar,
+    getAsset,
+    getOptionContracts,
+    getOptionQuote,
     submitMarketOrder,
     submitOptionMarketOrder,
   };

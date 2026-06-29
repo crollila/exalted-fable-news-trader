@@ -11,6 +11,7 @@ import {
   createAlpacaPaperClient,
   sanitizeOrder,
   PAPER_BASE_URL,
+  DATA_BASE_URL,
   LIVE_BASE_URL_FORBIDDEN,
 } from '../src/paper/alpacaPaperClient.js';
 
@@ -245,6 +246,130 @@ test('getPositions parses a sanitized array', async () => {
   assert.equal(pos[0].unrealizedPl, 100);
 });
 
+test('getClock and getCalendar use the paper endpoint and sanitize market-session data', async () => {
+  const { fetchFn, calls } = fakeFetch((url) => {
+    if (url.includes('/v2/clock')) {
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          timestamp: '2026-06-18T14:00:00.000Z',
+          is_open: true,
+          next_open: '2026-06-19T13:30:00.000Z',
+          next_close: '2026-06-18T20:00:00.000Z',
+          raw_secret: 'RAW-MUST-NOT-APPEAR',
+        }),
+      };
+    }
+    return {
+      ok: true, status: 200,
+      json: async () => ([{ date: '2026-06-18', open: '09:30', close: '16:00', extra: 'hidden' }]),
+    };
+  });
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  const clock = await client.getClock();
+  const calendar = await client.getCalendar({ start: '2026-06-18', end: '2026-06-18' });
+  assert.ok(calls[0].url.startsWith(`${PAPER_BASE_URL}/v2/clock`));
+  assert.ok(calls[1].url.startsWith(`${PAPER_BASE_URL}/v2/calendar`));
+  assert.ok(!calls[0].url.startsWith(LIVE_BASE_URL_FORBIDDEN));
+  assert.equal(clock.isOpen, true);
+  assert.equal(clock.nextClose, '2026-06-18T20:00:00.000Z');
+  assert.ok(!Object.prototype.hasOwnProperty.call(clock, 'raw_secret'));
+  assert.deepEqual(calendar[0], {
+    date: '2026-06-18',
+    open: '09:30',
+    close: '16:00',
+    sessionOpen: null,
+    sessionClose: null,
+  });
+});
+
+test('getAsset exposes tradability and shortability without raw payload leakage', async () => {
+  const { fetchFn, calls } = fakeFetch(() => ({
+    ok: true, status: 200,
+    json: async () => ({
+      id: 'asset-1', symbol: 'aapl', name: 'Apple Inc.', class: 'us_equity',
+      exchange: 'NASDAQ', status: 'active', tradable: true, marginable: true,
+      shortable: true, easy_to_borrow: true, fractionable: true, raw: 'hide',
+    }),
+  }));
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  const asset = await client.getAsset('aapl');
+  assert.ok(calls[0].url.startsWith(`${PAPER_BASE_URL}/v2/assets/AAPL`));
+  assert.equal(asset.symbol, 'AAPL');
+  assert.equal(asset.tradable, true);
+  assert.equal(asset.shortable, true);
+  assert.ok(!Object.prototype.hasOwnProperty.call(asset, 'raw'));
+});
+
+test('getOptionContracts discovers sanitized tradable contracts from the paper endpoint', async () => {
+  const { fetchFn, calls } = fakeFetch(() => ({
+    ok: true, status: 200,
+    json: async () => ({
+      option_contracts: [
+        {
+          id: 'c1', symbol: 'AAPL260116C00150000', underlying_symbol: 'AAPL',
+          status: 'active', tradable: true, expiration_date: '2026-01-16',
+          strike_price: '150', type: 'call', style: 'american',
+          open_interest: '1234', secret: 'RAW-MUST-NOT-APPEAR',
+        },
+      ],
+      next_page_token: 'NEXT',
+    }),
+  }));
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  const result = await client.getOptionContracts({
+    underlyingSymbols: ['aapl'],
+    expirationDateGte: '2026-01-01',
+    expirationDateLte: '2026-02-01',
+    type: 'call',
+    limit: 50,
+  });
+  assert.ok(calls[0].url.startsWith(`${PAPER_BASE_URL}/v2/options/contracts`));
+  assert.ok(!calls[0].url.startsWith(LIVE_BASE_URL_FORBIDDEN));
+  assert.match(decodeURIComponent(calls[0].url), /underlying_symbols=AAPL/);
+  assert.equal(result.nextPageToken, 'NEXT');
+  assert.deepEqual(result.contracts[0], {
+    id: 'c1',
+    symbol: 'AAPL260116C00150000',
+    underlyingSymbol: 'AAPL',
+    status: 'active',
+    tradable: true,
+    expirationDate: '2026-01-16',
+    strikePrice: 150,
+    type: 'call',
+    style: 'american',
+    openInterest: 1234,
+    closePrice: null,
+  });
+});
+
+test('getOptionQuote uses the read-only data endpoint and sanitizes bid/ask/mid', async () => {
+  const { fetchFn, calls } = fakeFetch(() => ({
+    ok: true, status: 200,
+    json: async () => ({
+      snapshots: {
+        AAPL260116C00150000: {
+          latestQuote: { bp: 2.4, ap: 2.6, t: '2026-06-18T14:00:01.000Z', raw: 'hide' },
+        },
+      },
+    }),
+  }));
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  const quote = await client.getOptionQuote({
+    underlyingSymbol: 'aapl',
+    optionSymbol: 'AAPL260116C00150000',
+  });
+  assert.ok(calls[0].url.startsWith(`${DATA_BASE_URL}/v1beta1/options/snapshots/AAPL`));
+  assert.ok(!calls[0].url.startsWith(LIVE_BASE_URL_FORBIDDEN));
+  assert.deepEqual(quote, {
+    symbol: 'AAPL260116C00150000',
+    bid: 2.4,
+    ask: 2.6,
+    mid: 2.5,
+    updatedAt: '2026-06-18T14:00:01.000Z',
+  });
+});
+
 // --- equity short + option orders ------------------------------------------
 
 test('submitMarketOrder sends a short (sell) equity order', async () => {
@@ -255,16 +380,16 @@ test('submitMarketOrder sends a short (sell) equity order', async () => {
   assert.ok(calls[0].url.startsWith(PAPER_BASE_URL));
 });
 
-test('submitOptionMarketOrder posts an OCC option order and validates the symbol', async () => {
+test('submitOptionMarketOrder validates inputs but refuses option submission until exits are implemented', async () => {
   const { fetchFn, calls } = fakeFetch(() => okOrder({ symbol: 'AAPL260116C00150000', asset_class: 'us_option' }));
   const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
-  const order = await client.submitOptionMarketOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'buy' });
-  const body = JSON.parse(calls[0].init.body);
-  assert.equal(body.symbol, 'AAPL260116C00150000');
-  assert.equal(body.type, 'market');
-  assert.equal(order.assetClass, 'us_option');
   await assert.rejects(() => client.submitOptionMarketOrder({ optionSymbol: 'NOTANOCC', qty: 1 }), /OCC option symbol/);
   await assert.rejects(() => client.submitOptionMarketOrder({ optionSymbol: 'AAPL260116C00150000', qty: 0 }), /positive integer/);
+  await assert.rejects(
+    () => client.submitOptionMarketOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'buy' }),
+    /PAPER option order submission disabled/
+  );
+  assert.equal(calls.length, 0);
 });
 
 test('importing the client module performs no network and requires no credentials', () => {

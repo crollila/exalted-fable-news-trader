@@ -3,10 +3,10 @@
 // (NO model, NO network, NO keys). Phase B step.
 //
 //   Run:  node --env-file=.env scripts/classifyNewsOnce.js [--limit 1] \
-//           [--ids 1,2,3] [--classifier manual_baseline|real_model]
+//           [--ids 1,2,3] [--classifier manual_baseline|openai|anthropic|real_model]
 //   (with the default classifier the .env is only used to resolve
-//   DATABASE_URL; NO credentials needed. --classifier real_model additionally
-//   needs ANTHROPIC_API_KEY in .env.)
+//   DATABASE_URL; NO credentials needed. --classifier openai additionally
+//   needs OPENAI_API_KEY and OPENAI_MODEL in .env.)
 //
 // - MANUAL ONLY: never part of npm test, app startup, schedulers, or CI.
 //   One human-invoked selection + classification, then exit. No polling, no
@@ -20,10 +20,12 @@
 //   (sentiment/impact/confidence = 0, direction = "unclear"). It exists to
 //   prove the loop carries a score alongside the price reaction — it is a
 //   placeholder, NOT trading signal.
-// - --classifier real_model is the EXPLICIT, opt-in real model-backed
-//   classifier (Anthropic Messages API via createModelClassifier). It is
-//   constructed only when requested, reads its key from config only, and is
-//   NEVER exercised by npm test. Without ANTHROPIC_API_KEY it fails clearly.
+// - --classifier openai is the EXPLICIT, opt-in production model-backed
+//   classifier (OpenAI Responses API via createModelClassifier). It is
+//   constructed only when requested, reads its key/model from config only, and
+//   is NEVER exercised by npm test. Without OPENAI_API_KEY/OPENAI_MODEL it
+//   fails clearly. --classifier real_model is a deprecated alias for openai.
+//   Anthropic remains available only as --classifier anthropic.
 // - SANITIZED OUTPUT ONLY: selected/classified/stored/skipped/failed counts,
 //   parser_status counts, model, and prompt_version. Never raw news payloads,
 //   raw model responses, keys, headers, or request objects.
@@ -33,7 +35,7 @@ import { loadConfig } from '../src/config.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { createFixtureClassifier } from '../src/sentiment/fixtureClassifier.js';
-import { createModelClassifier } from '../src/sentiment/modelClassifier.js';
+import { createAnthropicModelClassifier, createModelClassifier } from '../src/sentiment/modelClassifier.js';
 import { NEWS_TYPES } from '../src/sentiment/classifierContract.js';
 import { classifyAndStore } from '../src/ingestion/classifyNews.js';
 
@@ -46,7 +48,7 @@ export const MANUAL_MODEL_NAME = 'manual_baseline';
 export const MANUAL_PROMPT_VERSION = 'manual_v1';
 
 /** Explicit classifier selection. Default stays the safe, model-free baseline. */
-export const CLASSIFIERS = Object.freeze(['manual_baseline', 'real_model']);
+export const CLASSIFIERS = Object.freeze(['manual_baseline', 'openai', 'anthropic', 'real_model']);
 export const DEFAULT_CLASSIFIER = 'manual_baseline';
 
 /**
@@ -91,19 +93,27 @@ export function buildManualClassifier({
 
 /**
  * Build the requested classifier. The default (manual_baseline) needs no
- * credentials or network. real_model explicitly constructs the real
+ * credentials or network. openai explicitly constructs the production
  * model-backed classifier, which throws a clear "not configured" error if the
- * API key is absent (config-only credentials). Both go through the identical
- * contract/parser/storage path; the only difference is where the score comes
- * from. Exported and reused by the MVP pipeline script.
+ * key/model are absent (config-only credentials). real_model is a deprecated
+ * alias for openai; anthropic is explicit legacy provider access. All go
+ * through the identical contract/parser/storage path; the only difference is
+ * where the score comes from. Exported and reused by the MVP pipeline script.
  *
  * @param {string} name   one of CLASSIFIERS
- * @param {object} config result of loadConfig() (needed for real_model)
+ * @param {object} config result of loadConfig() (needed for model providers)
  * @returns {import('../src/sentiment/classifierContract.js').Classifier}
  */
-export function buildClassifier(name = DEFAULT_CLASSIFIER, config) {
+export function buildClassifier(name = DEFAULT_CLASSIFIER, config, { onWarning = null } = {}) {
   if (name === 'manual_baseline') return buildManualClassifier();
-  if (name === 'real_model') return createModelClassifier(config);
+  if (name === 'openai') return createModelClassifier(config);
+  if (name === 'anthropic') return createAnthropicModelClassifier(config);
+  if (name === 'real_model') {
+    if (typeof onWarning === 'function') {
+      onWarning('DEPRECATED: --classifier real_model now resolves to --classifier openai. Use --classifier openai.');
+    }
+    return createModelClassifier(config);
+  }
   throw new Error(`unknown classifier "${name}" (choose: ${CLASSIFIERS.join(', ')})`);
 }
 
@@ -229,9 +239,9 @@ async function main() {
     db = openDatabase(config.databasePath);
     runMigrations(db); // idempotent; ensures news_events + sentiment_scores exist
 
-    // Default is the model-free baseline; real_model is explicit + opt-in and
-    // throws a clear "not configured" error when ANTHROPIC_API_KEY is absent.
-    const classifier = buildClassifier(classifierName, config);
+    const classifier = buildClassifier(classifierName, config, {
+      onWarning: (msg) => console.error(msg),
+    });
     const events = selectUnscoredEvents(db, {
       limit,
       ids,

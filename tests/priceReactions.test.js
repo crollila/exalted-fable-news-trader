@@ -58,17 +58,19 @@ function measuredReaction(overrides = {}) {
 
 // --- migration ------------------------------------------------------------
 
-test('migration 003 applies cleanly and is idempotent with the runner', () => {
+test('migrations through 004 apply cleanly and are idempotent with the runner', () => {
   const db = openMemoryDatabase();
   const first = runMigrations(db);
   assert.deepEqual(first.applied, [
     '001_initial',
     '002_sentiment_scores_phase3',
     '003_price_reactions_event_study',
+    '004_paper_runtime_research',
   ]);
   const second = runMigrations(db);
   assert.equal(second.applied.length, 0);
   assert.ok(second.skipped.includes('003_price_reactions_event_study'));
+  assert.ok(second.skipped.includes('004_paper_runtime_research'));
   closeDatabase(db);
 });
 

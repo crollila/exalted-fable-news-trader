@@ -9,7 +9,7 @@
 //   Run:  node --env-file=.env scripts/runMvpPipelineOnce.js \
 //           [--symbols AAPL] [--ingest-limit 5] [--classify-limit 1] \
 //           [--measure-limit 1] [--measure-ids 6,7,8] [--skip-ingest] \
-//           [--classifier manual_baseline|real_model] \
+//           [--classifier manual_baseline|openai|anthropic|real_model] \
 //           [--baseline-lookback-minutes 60]
 //
 // MEASUREMENT TARGETING: the measure stage prefers FRESH/current-run events so
@@ -22,9 +22,9 @@
 //   One run, then exit. No polling, no scheduling, no background jobs.
 // - RESEARCH/MEASUREMENT ONLY. It NEVER trades, submits orders, or calls any
 //   trading API. The classifier defaults to the deterministic manual baseline
-//   (no model, no network, no keys); --classifier real_model opts in to the
-//   real model-backed classifier (needs ANTHROPIC_API_KEY, fails clearly
-//   without it — see scripts/classifyNewsOnce.js).
+//   (no model, no network, no keys); --classifier openai opts in to the
+//   production model-backed classifier (needs OPENAI_API_KEY and OPENAI_MODEL,
+//   fails clearly without them; see scripts/classifyNewsOnce.js).
 // - REUSES EXISTING PATHS ONLY: ingestNews, the manual classifier +
 //   classifyAndStore, the measurement engine via measureEvents +
 //   insertPriceReaction, and the read-only report's collectSummary. No new
@@ -98,7 +98,8 @@ function clampInt(value, fallback, lo, hi) {
  * hard cap, so the caps can never be exceeded regardless of input.
  *   --symbols A,B   --ingest-limit N   --classify-limit N
  *   --measure-limit N   --measure-ids 6,7,8   --skip-ingest
- *   --classifier manual_baseline|real_model   --baseline-lookback-minutes N
+ *   --classifier manual_baseline|openai|anthropic|real_model
+ *   --baseline-lookback-minutes N
  */
 export function parseArgs(argv) {
   const args = {
@@ -362,9 +363,9 @@ async function main() {
       priceSource = createAlpacaTradesPriceSource(config);
     }
 
-    // Default is the model-free baseline; --classifier real_model is explicit
-    // opt-in and fails clearly if ANTHROPIC_API_KEY is absent (config-only).
-    const classifier = buildClassifier(classifierName, config);
+    const classifier = buildClassifier(classifierName, config, {
+      onWarning: (msg) => console.error(msg),
+    });
     const result = await runPipeline(
       db,
       { provider, providerSkipReason, classifier, priceSource, priceSkipReason },

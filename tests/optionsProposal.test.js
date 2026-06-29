@@ -36,19 +36,27 @@ test('disabled when --allow-options is absent', () => {
   assert.equal(p.enabled, false);
 });
 
-test('plan_only without a symbol produces an executable-later PLAN', () => {
+test('rejected when PAPER_ENABLE_OPTIONS is false even if --allow-options is set', () => {
+  const p = proposeOption({ event: EVENT, score: upScore(), allowOptions: true, optionsEnabled: false });
+  assert.equal(p.enabled, true);
+  assert.equal(p.accepted, false);
+  assert.match(p.reason, /PAPER_ENABLE_OPTIONS=false/);
+});
+
+test('plan_only without a symbol produces a discovery-needed PLAN', () => {
   const p = proposeOption({ event: EVENT, score: upScore(), allowOptions: true, optionsMode: 'plan_only', allowedSymbols: ['AAPL'], nowMs: NOW });
   assert.equal(p.enabled, true);
   assert.equal(p.accepted, true);
   assert.equal(p.planOnly, true);
   assert.equal(p.intent, 'bullish_call');
-  assert.match(p.reason, /provide --option-symbol to execute/);
+  assert.match(p.reason, /contract discovery and quote validation required/);
 });
 
-test('execute_paper without a symbol is refused (no contract discovery)', () => {
+test('execute_paper without a symbol is allowed to continue to contract discovery', () => {
   const p = proposeOption({ event: EVENT, score: upScore(), allowOptions: true, optionsMode: 'execute_paper', allowedSymbols: ['AAPL'], nowMs: NOW });
-  assert.equal(p.accepted, false);
-  assert.match(p.reason, /requires --option-symbol/);
+  assert.equal(p.accepted, true);
+  assert.equal(p.planOnly, false);
+  assert.match(p.reason, /contract discovery and quote validation required/);
 });
 
 test('a bullish_call accepts a matching call symbol', () => {

@@ -62,7 +62,9 @@ test('parseArgs defaults to a single event and the safe manual classifier', () =
 });
 
 test('parseArgs reads --classifier', () => {
+  assert.equal(parseArgs(['--classifier', 'openai']).classifier, 'openai');
   assert.equal(parseArgs(['--classifier', 'real_model']).classifier, 'real_model');
+  assert.equal(parseArgs(['--classifier', 'anthropic']).classifier, 'anthropic');
   assert.equal(parseArgs(['--classifier', 'manual_baseline']).classifier, 'manual_baseline');
 });
 
@@ -123,21 +125,45 @@ test('buildClassifier rejects an unknown classifier name clearly', () => {
   assert.throws(() => buildClassifier('nope'), /unknown classifier/i);
 });
 
-test('buildClassifier real_model fails clearly when the API key is not configured', () => {
-  // No key in config → the real model classifier must refuse to construct.
+test('buildClassifier openai fails clearly when key/model are not configured', () => {
   assert.throws(
-    () => buildClassifier('real_model', { model: { anthropicApiKey: null } }),
+    () => buildClassifier('openai', { model: { openaiApiKey: null, openaiModel: 'model' } }),
     /not configured/i
+  );
+  assert.throws(
+    () => buildClassifier('openai', { model: { openaiApiKey: 'TEST-KEY', openaiModel: null } }),
+    /OPENAI_MODEL/i
   );
 });
 
-test('buildClassifier real_model constructs with a configured key (no network at build)', () => {
-  const classifier = buildClassifier('real_model', {
-    model: { anthropicApiKey: 'TEST-KEY', classifierModel: 'claude-opus-4-8' },
+test('buildClassifier openai constructs with configured key/model (no network at build)', () => {
+  const classifier = buildClassifier('openai', {
+    model: { openaiApiKey: 'TEST-KEY', openaiModel: 'configured-openai-model' },
   });
-  assert.equal(classifier.name, 'model');
-  assert.equal(classifier.modelName, 'claude-opus-4-8');
+  assert.equal(classifier.name, 'openai');
+  assert.equal(classifier.modelName, 'configured-openai-model');
   assert.equal(classifier.promptVersion, 'model_v1');
+});
+
+test('buildClassifier real_model is a visible deprecated alias for openai', () => {
+  const warnings = [];
+  const classifier = buildClassifier(
+    'real_model',
+    { model: { openaiApiKey: 'TEST-KEY', openaiModel: 'configured-openai-model' } },
+    { onWarning: (msg) => warnings.push(msg) }
+  );
+  assert.equal(classifier.name, 'openai');
+  assert.equal(classifier.modelName, 'configured-openai-model');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /DEPRECATED/);
+});
+
+test('buildClassifier anthropic is explicit and separate from openai', () => {
+  const classifier = buildClassifier('anthropic', {
+    model: { anthropicApiKey: 'TEST-KEY', anthropicModel: 'anthropic-test-model' },
+  });
+  assert.equal(classifier.name, 'anthropic');
+  assert.equal(classifier.modelName, 'anthropic-test-model');
 });
 
 // --- selection -------------------------------------------------------------

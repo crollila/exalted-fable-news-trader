@@ -72,13 +72,16 @@ export function loadConfig(env = process.env) {
     }),
     // Model-backed classifier credentials/config. Read ONLY here; held in
     // memory only; never logged, printed, persisted, or normalized.
-    // anthropicApiKey is null by default — the real model classifier must
-    // throw "not configured" rather than auto-enabling when a key exists.
-    // classifierModel is just an identifier (not a secret); it defaults to the
-    // latest Opus and can be overridden to trade cost/quality.
+    // OpenAI is the production classifier. The OpenAI model id is intentionally
+    // not defaulted in code: set OPENAI_MODEL locally so startup can show the
+    // configured model name without guessing. Anthropic remains optional only
+    // through an explicit --classifier anthropic request.
     model: Object.freeze({
+      openaiApiKey: env.OPENAI_API_KEY || null,
+      openaiModel: env.OPENAI_MODEL || null,
       anthropicApiKey: env.ANTHROPIC_API_KEY || null,
-      classifierModel: env.MODEL_CLASSIFIER_MODEL || 'claude-opus-4-8',
+      anthropicModel: env.ANTHROPIC_MODEL || env.MODEL_CLASSIFIER_MODEL || null,
+      classifierModel: env.ANTHROPIC_MODEL || env.MODEL_CLASSIFIER_MODEL || null,
     }),
     // Alpaca PAPER-trading credentials. Reuses the account-level Alpaca key
     // pair (the SAME ALPACA_API_KEY_ID/SECRET env vars the news + trades
@@ -93,6 +96,11 @@ export function loadConfig(env = process.env) {
     alpacaPaper: Object.freeze({
       keyId: env.ALPACA_API_KEY_ID || null,
       secretKey: env.ALPACA_API_SECRET_KEY || null,
+    }),
+    paperCapabilities: Object.freeze({
+      enableShorts: envBool(env.PAPER_ENABLE_SHORTS, false),
+      enableOptions: envBool(env.PAPER_ENABLE_OPTIONS, false),
+      enableMargin: envBool(env.PAPER_ENABLE_MARGIN, false),
     }),
     // Discord delivery for end-of-day PAPER reports. The webhook URL is
     // SECRET-ish (it embeds a token) — read ONLY here, held in memory only,

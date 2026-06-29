@@ -21,6 +21,22 @@ function envBool(value, defaultValue = false) {
   return String(value).trim().toLowerCase() === 'true';
 }
 
+/** Parse a float env var, clamped to [min,max]; junk/empty -> default. */
+function envNum(value, defaultValue, { min = -Infinity, max = Infinity } = {}) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return defaultValue;
+  return Math.min(Math.max(n, min), max);
+}
+
+/** Parse an integer env var, clamped to [min,max]; junk/empty -> default. */
+function envInt(value, defaultValue, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  const n = Number.parseInt(value, 10);
+  if (!Number.isInteger(n)) return defaultValue;
+  return Math.min(Math.max(n, min), max);
+}
+
 /** Parse a sqlite:// URL (or plain path) into an absolute filesystem path. */
 export function parseDatabaseUrl(databaseUrl, baseDir = process.cwd()) {
   if (!databaseUrl || typeof databaseUrl !== 'string') {
@@ -101,6 +117,20 @@ export function loadConfig(env = process.env) {
       enableShorts: envBool(env.PAPER_ENABLE_SHORTS, false),
       enableOptions: envBool(env.PAPER_ENABLE_OPTIONS, false),
       enableMargin: envBool(env.PAPER_ENABLE_MARGIN, false),
+    }),
+    // Monitored PAPER option execution knobs (entry/exit risk + timing), all
+    // conservative, bounded, and overridable via .env. These do NOT enable
+    // options — PAPER_ENABLE_OPTIONS + CLI gates + --execute-paper still apply.
+    // Percentages are fractions (0.5 = 50%); minutes are whole minutes.
+    optionExecution: Object.freeze({
+      takeProfitPct: envNum(env.PAPER_OPTION_TP_PCT, 0.5, { min: 0.05, max: 5 }),
+      stopLossPct: envNum(env.PAPER_OPTION_SL_PCT, 0.5, { min: 0.05, max: 1 }),
+      maxHoldMinutes: envInt(env.PAPER_OPTION_MAX_HOLD_MIN, 240, { min: 5, max: 390 }),
+      entryTimeoutMinutes: envInt(env.PAPER_OPTION_ENTRY_TIMEOUT_MIN, 10, { min: 1, max: 120 }),
+      exitRetryMinutes: envInt(env.PAPER_OPTION_EXIT_RETRY_MIN, 5, { min: 1, max: 60 }),
+      noEntryBeforeCloseMinutes: envInt(env.PAPER_OPTION_NO_ENTRY_BEFORE_CLOSE_MIN, 30, { min: 0, max: 180 }),
+      forceCloseBeforeCloseMinutes: envInt(env.PAPER_OPTION_FORCE_CLOSE_BEFORE_CLOSE_MIN, 15, { min: 1, max: 120 }),
+      limitSlippagePct: envNum(env.PAPER_OPTION_LIMIT_SLIPPAGE_PCT, 0.05, { min: 0, max: 0.5 }),
     }),
     // Discord delivery for end-of-day PAPER reports. The webhook URL is
     // SECRET-ish (it embeds a token) — read ONLY here, held in memory only,

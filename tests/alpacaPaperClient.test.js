@@ -380,16 +380,48 @@ test('submitMarketOrder sends a short (sell) equity order', async () => {
   assert.ok(calls[0].url.startsWith(PAPER_BASE_URL));
 });
 
-test('submitOptionMarketOrder validates inputs but refuses option submission until exits are implemented', async () => {
-  const { fetchFn, calls } = fakeFetch(() => okOrder({ symbol: 'AAPL260116C00150000', asset_class: 'us_option' }));
+test('submitOptionLimitOrder sends a bounded BUY limit/day option order on the paper endpoint', async () => {
+  const { fetchFn, calls } = fakeFetch(() => okOrder({ symbol: 'AAPL260116C00150000', asset_class: 'us_option', type: 'limit' }));
   const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
-  await assert.rejects(() => client.submitOptionMarketOrder({ optionSymbol: 'NOTANOCC', qty: 1 }), /OCC option symbol/);
-  await assert.rejects(() => client.submitOptionMarketOrder({ optionSymbol: 'AAPL260116C00150000', qty: 0 }), /positive integer/);
-  await assert.rejects(
-    () => client.submitOptionMarketOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'buy' }),
-    /PAPER option order submission disabled/
-  );
-  assert.equal(calls.length, 0);
+  const order = await client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'buy', limitPrice: 2.21 });
+  assert.ok(calls[0].url.startsWith(`${PAPER_BASE_URL}/v2/orders`));
+  assert.ok(!calls[0].url.startsWith(LIVE_BASE_URL_FORBIDDEN));
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    symbol: 'AAPL260116C00150000', qty: 1, side: 'buy', type: 'limit', time_in_force: 'day', limit_price: 2.21,
+  });
+  assert.equal(order.id, 'ord_123');
+});
+
+test('submitOptionLimitOrder supports sell-to-close and refuses bad OCC/qty/side/limit (never a market order)', async () => {
+  const { fetchFn, calls } = fakeFetch(() => okOrder({ side: 'sell', type: 'limit' }));
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  await client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 2, side: 'sell', limitPrice: 1.85 });
+  assert.equal(JSON.parse(calls[0].init.body).side, 'sell');
+  await assert.rejects(() => client.submitOptionLimitOrder({ optionSymbol: 'NOTANOCC', qty: 1, limitPrice: 1 }), /OCC option symbol/);
+  await assert.rejects(() => client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 0, limitPrice: 1 }), /positive integer/);
+  await assert.rejects(() => client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'short', limitPrice: 1 }), /buy\/sell/);
+  await assert.rejects(() => client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'buy', limitPrice: 0 }), /positive number/);
+  assert.equal(calls.length, 1); // only the valid sell-to-close was sent
+});
+
+test('getOrder polls (GET) and cancelOrder deletes (DELETE, 204 no-body) on the paper endpoint', async () => {
+  const { fetchFn, calls } = fakeFetch((url, init) => {
+    if (init.method === 'DELETE') {
+      return { ok: true, status: 204, statusText: 'No Content', json: async () => { throw new Error('no body'); } };
+    }
+    return okOrder({ status: 'filled', filled_avg_price: '2.05' });
+  });
+  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
+  const order = await client.getOrder('ord_123');
+  assert.ok(calls[0].url.startsWith(`${PAPER_BASE_URL}/v2/orders/ord_123`));
+  assert.equal(calls[0].init.method, 'GET');
+  assert.equal(order.status, 'filled');
+  assert.equal(order.filledAvgPrice, 2.05);
+  const res = await client.cancelOrder('ord_123');
+  assert.equal(calls[1].init.method, 'DELETE');
+  assert.ok(calls[1].url.startsWith(`${PAPER_BASE_URL}/v2/orders/ord_123`));
+  assert.ok(!calls[1].url.startsWith(LIVE_BASE_URL_FORBIDDEN));
+  assert.deepEqual(res, { ok: true, status: 204 });
 });
 
 test('importing the client module performs no network and requires no credentials', () => {

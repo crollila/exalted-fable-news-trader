@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { openMemoryDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { insertPaperTrade, insertRejectedTrade } from '../src/paper/paperTradeProposal.js';
+import { insertPaperOptionTrade, updatePaperOptionTrade } from '../src/database/paperRuntime.js';
 import {
   parseArgs,
   collectEodData,
@@ -176,6 +177,35 @@ test('buildEodReport prints a safe placeholder when there is no activity', () =>
   const text = buildEodReport(collectEodData(db, { day: null }), {}).join('\n');
   assert.match(text, /No paper-trading records for this day yet/);
   assert.match(text, /proves Discord delivery/);
+  closeDatabase(db);
+});
+
+test('the EOD report shows the options-execution section (opened/closed/realized P&L) with a loud unresolved warning', () => {
+  const db = freshDb();
+  const closed = insertPaperOptionTrade(db, {
+    underlying: 'AAPL', optionSymbol: 'AAPL260116C00150000', expiry: '2026-01-16', strike: 150,
+    right: 'call', quantity: 1, premiumEntry: 2.0, notionalEntry: 200, strategy: 'long_call',
+    exitPolicy: 'test', status: 'open', lifecycleState: 'pending_entry',
+  }).id;
+  updatePaperOptionTrade(db, closed, {
+    lifecycleState: 'closed', status: 'closed', premiumExit: 2.5, realizedPnlUsd: 50,
+    exitReason: 'take_profit', closedAt: '2026-06-18T19:00:00.000Z',
+  });
+  const unresolved = insertPaperOptionTrade(db, {
+    underlying: 'MSFT', optionSymbol: 'MSFT260116P00400000', expiry: '2026-01-16', strike: 400,
+    right: 'put', quantity: 1, premiumEntry: 3.0, notionalEntry: 300, strategy: 'long_put',
+    exitPolicy: 'test', status: 'open', lifecycleState: 'unresolved',
+  }).id;
+  updatePaperOptionTrade(db, unresolved, { exitReason: 'unfilled after 6 attempts past close' });
+
+  const text = buildEodReport(collectEodData(db, { day: null }), {}).join('\n');
+  assert.match(text, /Options execution \(PAPER, long calls\/puts only\)/);
+  assert.match(text, /opened:\s+2/);
+  assert.match(text, /closed:\s+1/);
+  assert.match(text, /realized option P&L: 50/);
+  assert.match(text, /take_profit=1/);
+  assert.match(text, /⚠ WARNING: 1 UNRESOLVED option position/);
+  assert.match(text, /MSFT260116P00400000/);
   closeDatabase(db);
 });
 

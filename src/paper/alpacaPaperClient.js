@@ -249,8 +249,8 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
   const secrets = [keyId, secretKey];
   const doFetch = httpFetch ?? globalThis.fetch;
 
-  /** One sanitized HTTP request. Returns parsed JSON. */
-  async function httpJson(method, path, bodyObj, { baseUrl = PAPER_BASE_URL } = {}) {
+  /** One sanitized HTTP request. Returns parsed JSON (or {status} when parseJson=false). */
+  async function httpJson(method, path, bodyObj, { baseUrl = PAPER_BASE_URL, parseJson = true } = {}) {
     const url = `${baseUrl}${path}`;
     const headers = {
       'APCA-API-KEY-ID': keyId,
@@ -276,6 +276,8 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
         `alpacaPaperClient: HTTP ${response.status} ${redact(response.statusText ?? '', secrets)}`
       );
     }
+    // Some endpoints (order cancel) return 204 No Content — no body to parse.
+    if (!parseJson) return { status: response.status };
     try {
       return await response.json();
     } catch {
@@ -419,11 +421,12 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
   }
 
   /**
-   * Option order submission is intentionally disabled until tested paper exit
-   * monitoring and sell-to-close reporting exist. Keep the method as an explicit
-   * guard so callers fail closed instead of inventing their own order path.
+   * Submit ONE single-leg PAPER option order as a bounded LIMIT/day order.
+   * buy = open/add a long call/put; sell = close (sell-to-close) a long the bot
+   * already holds. Callers enforce long-only / close-only semantics; this
+   * primitive never sends an unbounded market order (limit_price is required).
    */
-  async function submitOptionMarketOrder({ optionSymbol, qty, side = 'buy' } = {}) {
+  async function submitOptionLimitOrder({ optionSymbol, qty, side = 'buy', limitPrice } = {}) {
     const sym = String(optionSymbol ?? '').trim().toUpperCase();
     if (!OCC_OPTION_RE.test(sym)) {
       throw new Error('alpacaPaperClient: optionSymbol must be a valid OCC option symbol');
@@ -435,7 +438,37 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
     if (!VALID_SIDES.has(side)) {
       throw new Error(`alpacaPaperClient: side must be buy/sell, got "${side}"`);
     }
-    throw new Error('alpacaPaperClient: PAPER option order submission disabled until tested option exit monitoring is implemented');
+    const limit = Number(limitPrice);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new Error('alpacaPaperClient: option limit_price must be a positive number (no market orders)');
+    }
+    return postOrder({
+      symbol: sym,
+      qty: quantity,
+      side,
+      type: 'limit',
+      time_in_force: 'day',
+      limit_price: Math.round(limit * 100) / 100,
+    });
+  }
+
+  /** GET one order by broker id (sanitized) — used to poll/reconcile fills. */
+  async function getOrder(orderId) {
+    const id = String(orderId ?? '').trim();
+    if (!id) throw new Error('alpacaPaperClient: orderId must be a non-empty string');
+    const payload = await httpJson('GET', `${ORDERS_PATH}/${encodeURIComponent(id)}`);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error('alpacaPaperClient: unexpected order payload shape (expected object)');
+    }
+    return sanitizeOrder(payload);
+  }
+
+  /** DELETE (cancel) one open order by broker id. Returns { ok, status }. */
+  async function cancelOrder(orderId) {
+    const id = String(orderId ?? '').trim();
+    if (!id) throw new Error('alpacaPaperClient: orderId must be a non-empty string');
+    const res = await httpJson('DELETE', `${ORDERS_PATH}/${encodeURIComponent(id)}`, null, { parseJson: false });
+    return { ok: true, status: res?.status ?? null };
   }
 
   return {
@@ -449,6 +482,8 @@ export function createAlpacaPaperClient(config, { httpFetch } = {}) {
     getOptionContracts,
     getOptionQuote,
     submitMarketOrder,
-    submitOptionMarketOrder,
+    submitOptionLimitOrder,
+    getOrder,
+    cancelOrder,
   };
 }

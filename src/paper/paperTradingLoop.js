@@ -201,7 +201,7 @@ export async function runPaperLoop({
     let summary;
     if (session.isOpen) {
       try {
-        summary = await runOnce({ iteration: i, nowMs });
+        summary = await runOnce({ iteration: i, nowMs, session });
       } catch (err) {
         // Never leak the raw error object; runOnce/clients already sanitize.
         summary = `iteration error: ${err.message}`;

@@ -85,10 +85,15 @@ test('migration 004 upgrades an existing database that already applied 001-003',
     db.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(version);
   }
   const result = runMigrations(db);
-  assert.deepEqual(result.applied, ['004_paper_runtime_research']);
+  assert.deepEqual(result.applied, ['004_paper_runtime_research', '005_paper_option_execution']);
   const tables = listTables(db);
   assert.ok(tables.includes('paper_option_trades'));
   assert.ok(tables.includes('paper_runtime_sessions'));
+  // migration 005 adds the option-execution lifecycle columns additively.
+  const optionCols = db.prepare("PRAGMA table_info('paper_option_trades')").all().map((c) => c.name);
+  assert.ok(optionCols.includes('lifecycle_state'));
+  assert.ok(optionCols.includes('entry_order_id'));
+  assert.ok(optionCols.includes('realized_pnl_usd'));
   closeDatabase(db);
 });
 

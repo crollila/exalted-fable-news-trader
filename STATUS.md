@@ -4,9 +4,8 @@ Purpose: the latest safe state of the project, for AI assistants and future me.
 Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
-- Current working tree is an UNCOMMITTED PAPER-only implementation slice on top
-  of `e2ee6d6` (`fix(paper): run fresh news decision cycle in paper loop`).
-  It is not staged, committed, or pushed.
+- Committed PAPER-only continuous-runtime slice (`8dca6cf`) plus this slice that
+  adds MONITORED PAPER OPTION EXECUTION on top of it.
 - Implemented in the working tree: OpenAI classifier provider via central
   `OPENAI_API_KEY`/`OPENAI_MODEL`; `real_model` is a visible deprecated alias
   for OpenAI; Anthropic is explicit-only; continuous market-aware PAPER loop
@@ -15,14 +14,23 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   Discord reports; advisory-only recommendation audits; controlled candidate
   universe selection; PAPER capability gates for shorts/options/margin; Alpaca
   read-only clock/calendar/asset/option-contract/option-quote helpers; and
-  migration 004 for runtime/research audit records.
-- Option scope in this working tree is deliberately limited to long call/put
-  contract discovery and quote validation for PAPER research. PAPER option order
-  submission is disabled until tested exit monitoring and sell-to-close
-  reporting are implemented.
-- Verification in this uncommitted tree: report-focused tests, affected focused
-  suites, and full `npm test` pass. Latest full suite result: 499/499 passing
-  with no network calls in tests.
+  migrations 004 (runtime/research audit) + 005 (option-execution lifecycle).
+- Monitored PAPER option execution (long calls/puts only) is IMPLEMENTED and
+  ENABLED. Entries are bounded `buy`/`limit`/`day` orders gated by
+  `PAPER_ENABLE_OPTIONS=true` + `--allow-options --options-mode execute_paper` +
+  `--execute-paper` + broker options eligibility + a valid regular session + the
+  pre-close cutoff. The option monitor (`src/paper/optionMonitor.js` +
+  `src/paper/optionExits.js`) reconciles bot-owned rows each open cycle: confirms
+  fills, cancels stale unfilled entries, and applies deterministic exits
+  (take-profit / stop-loss / max-hold / mandatory same-day flatten) as
+  `sell`/`limit`/`day` sell-to-close orders with bounded requote/retry.
+  Thresholds/timing are `PAPER_OPTION_*` in `.env` (conservative defaults).
+  Sell-to-open, naked options, covered calls, spreads, assignment/exercise, and
+  multi-leg are out of scope. The bot only manages positions it recorded;
+  unresolved positions are reported loudly (console + Discord EOD).
+- All order submission stays hard-wired to `https://paper-api.alpaca.markets`;
+  `--execute-paper` is required; live trading remains impossible by construction.
+- Verification: full `npm test` passes — 542/542, zero network calls in tests.
 - Phase 1 (database foundation) and Phase 2 skeleton (provider abstraction) committed.
 - Published to GitHub (public): https://github.com/crollila/exalted-fable-news-trader
 - Phase 5 (PAPER trading) FIRST VERTICAL SLICE is COMMITTED (`df1931f`): a

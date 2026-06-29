@@ -105,10 +105,15 @@ function fakePaperClient({
       };
     },
     getOptionQuote: async (query) => { calls.quote.push(query); return optionQuote; },
+    getOrder: async (id) => { (calls.getOrder ??= []).push(id); return { id, status: 'filled', submittedAt: '2026-06-18T14:30:02.000Z', filledAvgPrice: 2.1 }; },
+    cancelOrder: async (id) => { (calls.cancel ??= []).push(id); return { ok: true, status: 204 }; },
     submitMarketOrder: async (o) => { calls.equity.push(o); return { id: 'ord_eq', status: 'accepted', submittedAt: '2026-06-18T14:30:01.000Z', filledAvgPrice: null }; },
-    submitOptionMarketOrder: async (o) => { calls.option.push(o); return { id: 'ord_op', status: 'accepted', submittedAt: '2026-06-18T14:30:02.000Z', filledAvgPrice: null }; },
+    submitOptionLimitOrder: async (o) => { calls.option.push(o); return { id: 'ord_op', status: 'accepted', submittedAt: '2026-06-18T14:30:02.000Z', filledAvgPrice: null }; },
   };
 }
+
+/** An "option entry allowed" context for tests that exercise execution. */
+const OPTION_ENTRY_OK = { blocked: false, reason: 'allowed (test)' };
 
 function throwingPaperClient(message = 'sanitized submit failure') {
   const client = fakePaperClient();
@@ -579,7 +584,34 @@ test('options default to plan_only and never execute, even with --execute-paper'
   closeDatabase(db);
 });
 
-test('option execute_paper validates contract/quote/risk but refuses submission until exit monitoring exists', async () => {
+test('option execute_paper submits a bounded BUY/limit/day and persists a pending_entry row', async () => {
+  const db = freshDb();
+  seedScoredEvent(db, { direction: 'up' });
+  const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
+  const client = fakePaperClient();
+  const account = marginAccount();
+  const result = await runPaperTradeOnce(db, selected, {
+    allowedSymbols: ['AAPL'], allowOptions: true, optionsMode: 'execute_paper', optionSymbol: OCC,
+    executePaper: true, paperClient: client, account, capabilities: deriveCapabilities(account), nowMs: NOW_MS,
+    paperFeatures: ALL_PAPER_FEATURES, optionEntry: OPTION_ENTRY_OK, optionConfig: { limitSlippagePct: 0.05 },
+  });
+  assert.equal(result.option.decision, 'accepted');
+  assert.equal(result.option.risk.approved, true);
+  assert.equal(client.calls.option.length, 1);
+  // A bounded LONG buy/limit order — never a market order, never sell-to-open.
+  assert.equal(client.calls.option[0].side, 'buy');
+  assert.equal(client.calls.option[0].optionSymbol, OCC);
+  assert.ok(client.calls.option[0].limitPrice > 0);
+  assert.ok(result.option.paperOptionTradeId > 0);
+  const row = db.prepare('SELECT * FROM paper_option_trades WHERE id = ?').get(result.option.paperOptionTradeId);
+  assert.equal(row.lifecycle_state, 'pending_entry');
+  assert.equal(row.entry_order_id, 'ord_op');
+  assert.equal(row.right, 'call');
+  assert.equal(row.strategy, 'long_call');
+  closeDatabase(db);
+});
+
+test('option entry is BLOCKED outside a valid session / inside the pre-close cutoff', async () => {
   const db = freshDb();
   seedScoredEvent(db, { direction: 'up' });
   const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
@@ -589,16 +621,14 @@ test('option execute_paper validates contract/quote/risk but refuses submission 
     allowedSymbols: ['AAPL'], allowOptions: true, optionsMode: 'execute_paper', optionSymbol: OCC,
     executePaper: true, paperClient: client, account, capabilities: deriveCapabilities(account), nowMs: NOW_MS,
     paperFeatures: ALL_PAPER_FEATURES,
+    optionEntry: { blocked: true, reason: 'option entry blocked: within 30m pre-close cutoff' },
   });
   assert.equal(result.option.decision, 'rejected');
-  assert.equal(client.calls.option.length, 0);
-  assert.equal(result.option.paperTradeId, null);
-  assert.equal(result.option.paperOptionTradeId, null);
-  assert.equal(result.option.risk.approved, true);
-  assert.equal(result.option.proposal.optionSymbol, OCC);
+  assert.equal(client.calls.option.length, 0); // nothing submitted
+  assert.ok(result.option.rejectedTradeId > 0);
   assert.match(
     db.prepare('SELECT reason FROM rejected_trades WHERE id = ?').get(result.option.rejectedTradeId).reason,
-    /exit monitoring/
+    /pre-close cutoff/
   );
   closeDatabase(db);
 });
@@ -618,7 +648,7 @@ test('option execution is refused when the account lacks options capability', as
   closeDatabase(db);
 });
 
-test('option execute_paper without --option-symbol discovers a contract then refuses submission pending exits', async () => {
+test('option execute_paper without --option-symbol discovers a contract then submits a long entry', async () => {
   const db = freshDb();
   seedScoredEvent(db, { direction: 'up' });
   const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
@@ -627,13 +657,14 @@ test('option execute_paper without --option-symbol discovers a contract then ref
   const result = await runPaperTradeOnce(db, selected, {
     allowedSymbols: ['AAPL'], allowOptions: true, optionsMode: 'execute_paper', optionSymbol: null,
     executePaper: true, paperClient: client, account, capabilities: deriveCapabilities(account), nowMs: NOW_MS,
-    paperFeatures: ALL_PAPER_FEATURES,
+    paperFeatures: ALL_PAPER_FEATURES, optionEntry: OPTION_ENTRY_OK,
   });
-  assert.equal(result.option.decision, 'rejected');
-  assert.equal(result.option.proposal.optionSymbol, OCC);
+  assert.equal(result.option.decision, 'accepted');
+  assert.equal(result.option.proposal.optionSymbol, OCC); // discovered
   assert.equal(client.calls.contracts.length, 1);
   assert.equal(client.calls.quote[0].optionSymbol, OCC);
-  assert.equal(client.calls.option.length, 0);
+  assert.equal(client.calls.option.length, 1);
+  assert.equal(client.calls.option[0].side, 'buy');
   assert.match(result.option.proposal.reason, /premium/);
   closeDatabase(db);
 });

@@ -45,6 +45,11 @@ export function insertPaperOptionTrade(
     exitPolicy,
     exitReason = null,
     status = 'open',
+    lifecycleState = null,
+    entryOrderId = null,
+    entryOrderStatus = null,
+    entryLimitPrice = null,
+    openedAt = null,
   } = {}
 ) {
   const run = db
@@ -52,11 +57,13 @@ export function insertPaperOptionTrade(
       `INSERT INTO paper_option_trades
          (paper_trade_id, news_event_id, underlying, option_symbol, expiry,
           strike, right, quantity, premium_entry, notional_entry, strategy,
-          strategy_rationale, exit_policy, exit_reason, status)
+          strategy_rationale, exit_policy, exit_reason, status,
+          lifecycle_state, entry_order_id, entry_order_status, entry_limit_price, opened_at)
        VALUES
          (@paperTradeId, @newsEventId, @underlying, @optionSymbol, @expiry,
           @strike, @right, @quantity, @premiumEntry, @notionalEntry, @strategy,
-          @strategyRationale, @exitPolicy, @exitReason, @status)`
+          @strategyRationale, @exitPolicy, @exitReason, @status,
+          @lifecycleState, @entryOrderId, @entryOrderStatus, @entryLimitPrice, @openedAt)`
     )
     .run({
       paperTradeId,
@@ -74,8 +81,69 @@ export function insertPaperOptionTrade(
       exitPolicy: requiredString('exitPolicy', exitPolicy),
       exitReason,
       status,
+      lifecycleState: lifecycleState ?? null,
+      entryOrderId: entryOrderId ?? null,
+      entryOrderStatus: entryOrderStatus ?? null,
+      entryLimitPrice: finiteOrNull(entryLimitPrice),
+      openedAt: openedAt ?? null,
     });
   return { id: Number(run.lastInsertRowid) };
+}
+
+/** Whitelisted lifecycle columns for updatePaperOptionTrade. */
+const OPTION_UPDATE_COLUMNS = Object.freeze({
+  status: 'status',
+  lifecycleState: 'lifecycle_state',
+  entryOrderId: 'entry_order_id',
+  entryOrderStatus: 'entry_order_status',
+  entryLimitPrice: 'entry_limit_price',
+  openedAt: 'opened_at',
+  premiumEntry: 'premium_entry',
+  notionalEntry: 'notional_entry',
+  exitOrderId: 'exit_order_id',
+  exitOrderStatus: 'exit_order_status',
+  exitLimitPrice: 'exit_limit_price',
+  premiumExit: 'premium_exit',
+  notionalExit: 'notional_exit',
+  realizedPnlUsd: 'realized_pnl_usd',
+  exitReason: 'exit_reason',
+  exitAttempts: 'exit_attempts',
+  closedAt: 'closed_at',
+  lastCheckedAt: 'last_checked_at',
+});
+
+/** Generic whitelisted update for one bot option row's lifecycle fields. */
+export function updatePaperOptionTrade(db, id, updates = {}) {
+  const rowId = positiveInt('id', id);
+  const sets = [];
+  const values = {};
+  for (const [key, column] of Object.entries(OPTION_UPDATE_COLUMNS)) {
+    if (!Object.prototype.hasOwnProperty.call(updates, key)) continue;
+    sets.push(`${column} = @${key}`);
+    values[key] = updates[key] === undefined ? null : updates[key];
+  }
+  if (sets.length === 0) return { changes: 0 };
+  values.id = rowId;
+  const run = db.prepare(`UPDATE paper_option_trades SET ${sets.join(', ')} WHERE id = @id`).run(values);
+  return { changes: run.changes };
+}
+
+/** One bot option row by id (or null). */
+export function getPaperOptionTradeById(db, id) {
+  return db.prepare('SELECT * FROM paper_option_trades WHERE id = ?').get(positiveInt('id', id)) ?? null;
+}
+
+/** Active (still-monitored) bot-owned option rows: pending_entry/open/pending_exit/unresolved. */
+export function listActiveBotOptionTrades(db, { limit = 200 } = {}) {
+  return db
+    .prepare(
+      `SELECT * FROM paper_option_trades
+        WHERE lifecycle_state IN ('pending_entry','open','pending_exit','unresolved')
+           OR (lifecycle_state IS NULL AND status = 'open')
+        ORDER BY id ASC
+        LIMIT ?`
+    )
+    .all(Number.parseInt(limit, 10) || 200);
 }
 
 export function closePaperOptionTrade(

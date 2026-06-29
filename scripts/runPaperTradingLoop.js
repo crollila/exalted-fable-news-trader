@@ -31,6 +31,8 @@ import {
 import { createAlpacaNewsHttpTransport } from '../src/providers/alpacaNewsHttpTransport.js';
 import { createAlpacaNewsProvider } from '../src/providers/alpacaNewsProvider.js';
 import { createAlpacaPaperClient } from '../src/paper/alpacaPaperClient.js';
+import { reconcileBotOptions } from '../src/paper/optionMonitor.js';
+import { optionEntryBlocked } from '../src/paper/optionExits.js';
 import { createAlpacaTradesPriceSource } from '../src/prices/alpacaTradesPriceSource.js';
 import { createDiscordWebhookClient } from '../src/notifications/discordWebhookClient.js';
 import { isMarketOpen, marketStatusLabel, HOLIDAY_LIMITATION_NOTE } from '../src/paper/marketHours.js';
@@ -291,13 +293,30 @@ async function main() {
       return currentStats;
     };
 
-    const runOnce = async ({ nowMs }) => {
+    const runOnce = async ({ nowMs, session }) => {
       const stats = ensureSession(nowMs);
+      const sessionCloseMs = session?.nextCloseMs ?? null;
+      // Monitor bot-owned options FIRST (reconcile fills/exits/forced flatten),
+      // then consider new entries. Non-fatal: never throws out of the monitor.
+      if (paperClient) {
+        const mon = await reconcileBotOptions(db, {
+          paperClient, config, nowMs,
+          session: { isOpen: true, sessionCloseMs },
+          onLog: (line) => console.log(`  [option-monitor] ${line}`),
+        });
+        if (mon.unresolved > 0) {
+          console.error(`  [option-monitor] WARNING: ${mon.unresolved} UNRESOLVED option position(s) — see EOD report.`);
+        }
+      }
+      const optionEntry = optionEntryBlocked({
+        nowMs, sessionOpen: true, sessionCloseMs,
+        noEntryBeforeCloseMinutes: config.optionExecution.noEntryBeforeCloseMinutes,
+      });
       const cycle = await runPaperDecisionCycle(
         db,
         { provider, classifier, paperClient, priceSource, providerSkipReason },
         args,
-        { nowMs }
+        { nowMs, optionEntry, optionConfig: config.optionExecution }
       );
       applyCycleStats(stats, cycle, args);
       persistSessionStats(db, stats, 'open');

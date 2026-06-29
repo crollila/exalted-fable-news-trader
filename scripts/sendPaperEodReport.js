@@ -194,11 +194,21 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
   const optionRows = db
     .prepare(
       `SELECT news_event_id, underlying, option_symbol, right, quantity, premium_entry, notional_entry,
-              strategy, exit_reason, status, created_at
+              premium_exit, notional_exit, realized_pnl_usd, strategy, exit_reason,
+              lifecycle_state, status, opened_at, closed_at, created_at
          FROM paper_option_trades ${dayClause}
         ORDER BY id DESC`
     )
     .all(...dayParams);
+
+  const optionLifecycle = (o) =>
+    o.lifecycle_state || (o.status === 'closed' ? 'closed' : o.status === 'canceled' ? 'canceled' : 'open');
+  const OPTION_OPEN_STATES = new Set(['pending_entry', 'open', 'pending_exit', 'unresolved']);
+  const optionsClosed = optionRows.filter((o) => optionLifecycle(o) === 'closed').length;
+  const optionsCanceled = optionRows.filter((o) => optionLifecycle(o) === 'canceled').length;
+  const optionsOpenRows = optionRows.filter((o) => OPTION_OPEN_STATES.has(optionLifecycle(o)));
+  const optionsUnresolvedRows = optionRows.filter((o) => optionLifecycle(o) === 'unresolved');
+  const optionsRealizedPnl = round2(optionRows.reduce((s, o) => s + (Number(o.realized_pnl_usd) || 0), 0));
 
   const rejections = db
     .prepare(
@@ -294,6 +304,11 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     fills,
     orderStatus,
     optionsCount: optionRows.length,
+    optionsOpened: optionRows.length,
+    optionsClosed,
+    optionsCanceled,
+    optionsOpenUnresolved: optionsOpenRows.length,
+    optionsRealizedPnl,
     openPositions,
     openExposure,
     unrealizedPnl: null,
@@ -320,11 +335,63 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
       qty: o.quantity,
       premiumEntry: o.premium_entry,
       notionalEntry: o.notional_entry,
+      premiumExit: o.premium_exit,
+      realizedPnl: o.realized_pnl_usd,
       strategy: o.strategy,
       status: o.status,
+      lifecycleState: optionLifecycle(o),
+      exitReason: o.exit_reason,
+    })),
+    optionsUnresolved: optionsUnresolvedRows.map((o) => ({
+      optionSymbol: o.option_symbol,
+      qty: o.quantity,
+      lifecycleState: optionLifecycle(o),
       exitReason: o.exit_reason,
     })),
   };
+}
+
+/**
+ * Sanitized options-execution section: opened/closed/open/unresolved counts,
+ * realized option P&L, exit reasons, a per-position sample, and a LOUD warning
+ * for any unresolved position. Appears in EVERY report (long calls/puts only).
+ */
+function optionExecutionSection(data = {}) {
+  const lines = ['— Options execution (PAPER, long calls/puts only) —'];
+  const opened = data.optionsOpened ?? 0;
+  if (opened === 0) {
+    lines.push('  No bot option entries in this window. Option execution is monitored and flattened before close.');
+    return lines;
+  }
+  lines.push(
+    `  opened:              ${opened}`,
+    `  closed:              ${data.optionsClosed ?? 0}`,
+    `  canceled (no fill):  ${data.optionsCanceled ?? 0}`,
+    `  open / unresolved:   ${data.optionsOpenUnresolved ?? 0}`,
+    `  realized option P&L: ${data.optionsRealizedPnl ?? 0}`,
+  );
+  const exitReasons = {};
+  for (const o of data.options ?? []) if (o.exitReason) exitReasons[o.exitReason] = (exitReasons[o.exitReason] ?? 0) + 1;
+  const reasonStr = Object.entries(exitReasons).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(' ') || '(none yet)';
+  lines.push(`  exit reasons:        ${reasonStr}`);
+  for (const o of (data.options ?? []).slice(0, LIST_CAP)) {
+    lines.push(
+      `  ${o.optionSymbol} ${o.strategy ?? '?'} ${o.right ?? '?'} qty=${o.qty} ${o.lifecycleState ?? o.status} ` +
+        `entry=${o.premiumEntry ?? '?'} exit=${o.premiumExit ?? '—'} pnl=${o.realizedPnl ?? '—'}` +
+        `${o.exitReason ? ` reason=${o.exitReason}` : ''}`
+    );
+  }
+  const unresolved = data.optionsUnresolved ?? [];
+  if (unresolved.length > 0) {
+    lines.push('', `  ⚠ WARNING: ${unresolved.length} UNRESOLVED option position(s) NOT confirmed closed:`);
+    for (const o of unresolved.slice(0, LIST_CAP)) {
+      lines.push(`    ${o.optionSymbol} qty=${o.qty} state=${o.lifecycleState} reason=${o.exitReason ?? '(none)'}`);
+    }
+    lines.push('    These remain OPEN/uncertain at the broker — review and flatten manually.');
+  } else if ((data.optionsOpenUnresolved ?? 0) > 0) {
+    lines.push(`  Note: ${data.optionsOpenUnresolved} option position(s) still open/pending; monitored next session.`);
+  }
+  return lines;
 }
 
 /**
@@ -350,12 +417,13 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     '',
   ];
 
-  if (data.proposals === 0 && (session.cycles ?? 0) === 0) {
+  if (data.proposals === 0 && (session.cycles ?? 0) === 0 && (data.optionsOpened ?? 0) === 0) {
     lines.push(
       'No paper-trading records for this day yet.',
       'This report still proves Discord delivery; once the paper loop runs and',
       'writes paper_trades / rejected_trades, the full narrative appears here.',
     );
+    lines.push('', ...optionExecutionSection(data));
     if (strategy) lines.push('', ...formatStrategySection(strategy));
     if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
     return lines;
@@ -443,16 +511,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
       lines.push(`  ${p.ticker} ${p.side} qty=${p.qty} approxExposure=${p.exposure}`);
     }
   }
-  if ((data.options ?? []).length > 0) {
-    lines.push('', '— Options audit sample —');
-    for (const o of data.options.slice(0, LIST_CAP)) {
-      lines.push(
-        `  ${o.optionSymbol} ${o.strategy} ${o.right} qty=${o.qty} ` +
-        `premium=${o.premiumEntry ?? '?'} notional=${o.notionalEntry ?? '?'} status=${o.status}` +
-        `${o.exitReason ? ` exit=${o.exitReason}` : ''}`
-      );
-    }
-  }
+  lines.push('', ...optionExecutionSection(data));
   if (strategy) lines.push('', ...formatStrategySection(strategy));
   if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
   return lines;

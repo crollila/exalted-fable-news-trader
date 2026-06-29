@@ -332,11 +332,24 @@ Risk caps (all conservative by default): `--max-order-notional`,
 `--option-expiry-days-min/-max`. Margin-aware risk rejects blocked accounts,
 shorts without broker-confirmed margin/equity eligibility, insufficient buying
 power, and any cap breach (each logged to `rejected_trades` with a reason).
-Options require broker contract discovery/tradability and quote validation, but
-PAPER option order submission is intentionally disabled until tested option exit
-monitoring and sell-to-close reporting are implemented. Current options scope is
-plan/validation only; naked options, covered calls, spreads, assignment/exercise,
-and complex multi-leg strategies are out of scope.
+**Monitored PAPER option execution is enabled (long calls/puts only).** Options
+require broker contract discovery/tradability and quote validation. With
+`PAPER_ENABLE_OPTIONS=true`, `--allow-options --options-mode execute_paper`,
+`--execute-paper`, a broker options-eligible account, and a valid regular session,
+the bot enters a long call (bullish) or long put (bearish) as a bounded
+`buy`/`limit`/`day` order (never a market order), persists a `pending_entry`
+audit row, and the loop's **option monitor** reconciles it on each open-market
+cycle: it confirms fills, cancels stale unfilled entries after a timeout, and
+applies deterministic exits — **take-profit, stop-loss, max-hold, and a mandatory
+same-day flatten before the close** — by submitting `sell`/`limit`/`day`
+sell-to-close orders (requoted/retried within a bounded window). Exit thresholds
+and timing are configurable in `.env` (`PAPER_OPTION_*`, conservative defaults);
+no new entries are taken within the pre-close cutoff. The monitor only manages
+positions the bot recorded itself (never manual/untracked positions), and any
+unresolved/unflattened position is reported **loudly** in console output and the
+Discord EOD report. Out of scope and never done: selling options to open, naked
+options, covered calls, spreads, assignment/exercise, and multi-leg strategies.
+All order submission remains hard-wired to the Alpaca paper endpoint.
 
 ## Market-hours PAPER loop
 

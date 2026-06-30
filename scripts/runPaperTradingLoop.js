@@ -33,6 +33,7 @@ import { createAlpacaNewsProvider } from '../src/providers/alpacaNewsProvider.js
 import { createAlpacaPaperClient } from '../src/paper/alpacaPaperClient.js';
 import { reconcileBotOptions } from '../src/paper/optionMonitor.js';
 import { optionEntryBlocked } from '../src/paper/optionExits.js';
+import { formatBrokerTruthLines, recordPerformanceSnapshot } from '../src/paper/brokerTruth.js';
 import { createAlpacaTradesPriceSource } from '../src/prices/alpacaTradesPriceSource.js';
 import { createDiscordWebhookClient } from '../src/notifications/discordWebhookClient.js';
 import { isMarketOpen, marketStatusLabel, HOLIDAY_LIMITATION_NOTE } from '../src/paper/marketHours.js';
@@ -319,9 +320,26 @@ async function main() {
         { nowMs, optionEntry, optionConfig: config.optionExecution }
       );
       applyCycleStats(stats, cycle, args);
+      let performance = null;
+      if (paperClient) {
+        performance = await recordPerformanceSnapshot(db, {
+          paperClient,
+          priceSource,
+          runtimeSessionId: stats.sessionId,
+          nowMs,
+          snapshotKind: 'loop',
+        });
+      }
       persistSessionStats(db, stats, 'open');
       for (const line of buildDecisionCycleReport(cycle, nowMs)) console.log(line);
-      return oneLineDecisionSummary(cycle, nowMs);
+      if (performance) {
+        for (const line of formatBrokerTruthLines(performance)) console.log(`  ${line}`);
+      }
+      const perfTail = performance
+        ? `; broker fills=${performance.broker.orders.filled}/${performance.broker.orders.submitted} ` +
+          `exposure=${performance.exposure.grossExposure ?? 'unavailable'}`
+        : '';
+      return `${oneLineDecisionSummary(cycle, nowMs)}${perfTail}`;
     };
 
     const sendSessionEod = async ({ nowMs }) => {
@@ -337,6 +355,20 @@ async function main() {
       stats.eodSent = true;
       const endedAt = new Date(nowMs).toISOString();
       persistSessionStats(db, stats, 'closed', { endedAt });
+      if (paperClient) {
+        try {
+          const performance = await recordPerformanceSnapshot(db, {
+            paperClient,
+            priceSource,
+            runtimeSessionId: stats.sessionId,
+            nowMs,
+            snapshotKind: 'eod',
+          });
+          for (const line of formatBrokerTruthLines(performance)) console.log(line);
+        } catch (err) {
+          console.error(`Broker-truth EOD snapshot failed (non-fatal): ${err.message}`);
+        }
+      }
       if (!args.sendDiscordEod) {
         persistSessionStats(db, stats, 'closed', { eodReportStatus: 'skipped' });
         console.log(`EOD report skipped for ${stats.sessionDate} (--send-discord-eod-report not set).`);

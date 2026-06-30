@@ -37,6 +37,11 @@ import { classifyAndStore } from '../src/ingestion/classifyNews.js';
 import { createAlpacaPaperClient } from '../src/paper/alpacaPaperClient.js';
 import { createAlpacaTradesPriceSource } from '../src/prices/alpacaTradesPriceSource.js';
 import {
+  classifyBrokerOrderState,
+  formatBrokerTruthLines,
+  recordPerformanceSnapshot,
+} from '../src/paper/brokerTruth.js';
+import {
   assessProposal,
   insertPaperTrade,
   insertRejectedTrade,
@@ -323,6 +328,7 @@ async function processProposal(db, proposal, ctx) {
     kind, capabilities, account, positions, caps, daily, referencePrice,
     executePaper, paperClient, planOnly = false, paperFeatures = DEFAULT_PAPER_FEATURES,
     asset = null, optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
+    nowMs = Date.now(),
   } = ctx;
   const sub = {
     kind, proposal, risk: null, decision: 'rejected',
@@ -428,15 +434,32 @@ async function processProposal(db, proposal, ctx) {
   try {
     const order = await paperClient.submitMarketOrder({ symbol: proposal.ticker, qty: proposal.quantity, side: proposal.side });
     sub.order = order;
+    const brokerState = classifyBrokerOrderState(order);
+    const filledQty = Number(order.filledQty);
+    const filledAvgPrice = Number(order.filledAvgPrice);
+    const hasBrokerFill = Number.isFinite(filledQty) && filledQty > 0 && Number.isFinite(filledAvgPrice);
+    const localStatus =
+      ['canceled', 'rejected', 'expired'].includes(brokerState) && !hasBrokerFill ? 'canceled' : 'open';
     sub.paperTradeId = insertPaperTrade(db, {
       newsEventId: proposal.eventId,
       ticker: proposal.ticker,
       side: proposal.side,
       quantity: proposal.quantity,
-      fillPrice: order.filledAvgPrice ?? null,
-      entryAt: order.submittedAt ?? new Date().toISOString(),
+      fillPrice: hasBrokerFill ? order.filledAvgPrice : null,
+      entryAt: hasBrokerFill ? (order.filledAt ?? order.submittedAt ?? new Date(nowMs).toISOString()) : null,
       tradeReason: `${proposal.reason}; paper order ${order.id ?? '?'} status ${order.status ?? '?'}`,
-      status: 'open',
+      status: localStatus,
+      brokerOrderId: order.id ?? null,
+      brokerClientOrderId: order.clientOrderId ?? null,
+      brokerOrderStatus: order.status ?? null,
+      brokerOrderType: order.type ?? null,
+      brokerSubmittedAt: order.submittedAt ?? null,
+      brokerFilledQty: order.filledQty ?? null,
+      brokerFilledAvgPrice: order.filledAvgPrice ?? null,
+      brokerFilledAt: order.filledAt ?? null,
+      brokerUpdatedAt: order.updatedAt ?? null,
+      brokerReconciledAt: new Date(nowMs).toISOString(),
+      brokerTruthState: brokerState,
     }).id;
   } catch (err) {
     sub.orderError = err.message; // already sanitized by the client
@@ -975,6 +998,15 @@ async function main() {
 
     const { lines, result } = await executeOneShot(db, { args, paperClient, priceSource, nowMs, optionEntry, optionConfig });
     for (const line of lines) console.log(line);
+    if (paperClient) {
+      const performance = await recordPerformanceSnapshot(db, {
+        paperClient,
+        priceSource,
+        nowMs,
+        snapshotKind: 'one_shot',
+      });
+      for (const line of formatBrokerTruthLines(performance)) console.log(line);
+    }
     if (!result) return;
 
     const orderErr = result.equity?.orderError || result.option?.orderError;

@@ -108,6 +108,11 @@ export function sanitizeOrder(payload) {
     submittedAt: typeof payload?.submitted_at === 'string' ? payload.submitted_at : null,
     filledQty: numOrNull(payload?.filled_qty),
     filledAvgPrice: numOrNull(payload?.filled_avg_price),
+    filledAt: typeof payload?.filled_at === 'string' ? payload.filled_at : null,
+    canceledAt: typeof payload?.canceled_at === 'string' ? payload.canceled_at : null,
+    expiredAt: typeof payload?.expired_at === 'string' ? payload.expired_at : null,
+    updatedAt: typeof payload?.updated_at === 'string' ? payload.updated_at : null,
+    replacedAt: typeof payload?.replaced_at === 'string' ? payload.replaced_at : null,
   };
 }
 

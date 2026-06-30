@@ -8,7 +8,12 @@ import assert from 'node:assert/strict';
 import { openMemoryDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { insertPaperTrade, insertRejectedTrade } from '../src/paper/paperTradeProposal.js';
-import { insertPaperOptionTrade, updatePaperOptionTrade } from '../src/database/paperRuntime.js';
+import {
+  insertBrokerAccountSnapshot,
+  insertPaperOptionTrade,
+  insertStrategyPerformanceSnapshot,
+  updatePaperOptionTrade,
+} from '../src/database/paperRuntime.js';
 import {
   parseArgs,
   collectEodData,
@@ -68,6 +73,44 @@ function seedSufficientLosingSession(db) {
     db.prepare('UPDATE paper_trades SET pnl_usd = -10, created_at = ? WHERE id = ?')
       .run(`2026-06-18T14:${String(i).padStart(2, '0')}:00.000Z`, trade.id);
   }
+  const baseline = insertBrokerAccountSnapshot(db, {
+    runtimeSessionId: sessionId,
+    snapshotAt: '2026-06-18T13:30:00.000Z',
+    snapshotKind: 'session_start',
+    accountStatus: 'ACTIVE',
+    equity: 10000,
+    portfolioValue: 10000,
+    dataQuality: 'complete',
+  });
+  const current = insertBrokerAccountSnapshot(db, {
+    runtimeSessionId: sessionId,
+    snapshotAt: '2026-06-18T20:00:00.000Z',
+    snapshotKind: 'eod',
+    accountStatus: 'ACTIVE',
+    equity: 9900,
+    portfolioValue: 9900,
+    dataQuality: 'complete',
+  });
+  insertStrategyPerformanceSnapshot(db, {
+    runtimeSessionId: sessionId,
+    accountSnapshotId: current.id,
+    baselineAccountSnapshotId: baseline.id,
+    snapshotAt: '2026-06-18T20:00:00.000Z',
+    snapshotKind: 'eod',
+    brokerEquityBaseline: 10000,
+    brokerEquityCurrent: 9900,
+    brokerAccountReturnPct: -0.01,
+    spyBaselinePrice: 500,
+    spyCurrentPrice: 505,
+    spyReturnPct: 0.01,
+    brokerAccountExcessReturnPct: -0.02,
+    botGrossExposure: 0,
+    botRealizedPnlUsd: -100,
+    botOpenPositionCount: 0,
+    botOrdersSubmitted: 10,
+    botOrdersFilled: 10,
+    dataQuality: 'complete',
+  });
   return sessionId;
 }
 
@@ -167,6 +210,8 @@ test('buildEodReport includes the required narrative sections and figures', () =
   assert.match(text, /Mistakes \/ lessons/);
   assert.match(text, /Ideas for next trading day/);
   assert.match(text, /orders submitted:                2/);
+  assert.match(text, /broker-confirmed fills:\s+unavailable/);
+  assert.match(text, /Broker truth \/ benchmark \(PAPER\)/);
   assert.match(text, /rejected:                        3/);
   assert.ok(!text.includes('sparse qualifying signals (expected outside active hours)'));
   closeDatabase(db);
@@ -177,6 +222,70 @@ test('buildEodReport prints a safe placeholder when there is no activity', () =>
   const text = buildEodReport(collectEodData(db, { day: null }), {}).join('\n');
   assert.match(text, /No paper-trading records for this day yet/);
   assert.match(text, /proves Discord delivery/);
+  assert.match(text, /Broker-truth snapshot: unavailable/);
+  closeDatabase(db);
+});
+
+test('buildEodReport renders persisted broker-truth performance and SPY benchmark values', () => {
+  const db = freshDb();
+  seedActivity(db);
+  insertStrategyPerformanceSnapshot(db, {
+    snapshotAt: '2026-06-18T20:00:00.000Z',
+    snapshotKind: 'eod',
+    brokerEquityBaseline: 10000,
+    brokerEquityCurrent: 10100,
+    brokerAccountReturnPct: 0.01,
+    spyBaselinePrice: 500,
+    spyCurrentPrice: 502.5,
+    spyReturnPct: 0.005,
+    brokerAccountExcessReturnPct: 0.005,
+    botGrossExposure: 201.5,
+    botRealizedPnlUsd: 12.25,
+    botOpenPositionCount: 1,
+    botOrdersSubmitted: 2,
+    botOrdersFilled: 1,
+    botOrdersOpen: 1,
+    dataQuality: 'complete',
+  });
+  const text = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
+  assert.match(text, /submitted vs fills:\s+2 submitted \/ 1 broker-confirmed fill/);
+  assert.match(text, /owned gross exposure:\s+\$201\.50/);
+  assert.match(text, /broker-confirmed owned P&L:\s+\$12\.25/);
+  assert.match(text, /broker account return:\s+1\.00%/);
+  assert.match(text, /owned return:\s+unavailable/);
+  assert.match(text, /SPY session return:\s+0\.50%/);
+  assert.match(text, /account excess vs SPY:\s+0\.50%/);
+  closeDatabase(db);
+});
+
+test('buildEodReport keeps missing broker exposure and benchmark values unavailable', () => {
+  const db = freshDb();
+  seedActivity(db);
+  insertStrategyPerformanceSnapshot(db, {
+    snapshotAt: '2026-06-18T20:00:00.000Z',
+    snapshotKind: 'eod',
+    brokerEquityBaseline: 10000,
+    brokerEquityCurrent: 10050,
+    brokerAccountReturnPct: 0.005,
+    spyBaselinePrice: null,
+    spyCurrentPrice: null,
+    spyReturnPct: null,
+    brokerAccountExcessReturnPct: null,
+    botGrossExposure: null,
+    botRealizedPnlUsd: null,
+    botOpenPositionCount: 0,
+    botOrdersSubmitted: 2,
+    botOrdersFilled: 1,
+    dataQuality: 'limited',
+    warnings: ['positions unavailable: positions offline', 'SPY benchmark unavailable at baseline/current timestamp'],
+  });
+  const text = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
+  assert.match(text, /owned gross exposure:\s+unavailable/);
+  assert.match(text, /broker-confirmed owned P&L:\s+unavailable/);
+  assert.match(text, /SPY session return:\s+unavailable/);
+  assert.match(text, /account excess vs SPY:\s+unavailable/);
+  assert.match(text, /positions unavailable: positions offline/);
+  assert.match(text, /SPY benchmark unavailable at baseline\/current timestamp/);
   closeDatabase(db);
 });
 
@@ -222,7 +331,7 @@ test('every EOD report carries the exact options-execution disclosure (active AN
   // The exact wording is locked.
   assert.equal(
     OPTIONS_DISCLOSURE,
-    'Options contract discovery and PAPER plans are available. Options order execution is disabled pending tested exit monitoring and sell-to-close reporting.'
+    'Monitored PAPER option execution is available for gated long calls/puts only: bounded buy-limit entries, monitored exits, and sell-to-close only.'
   );
   closeDatabase(db);
 });

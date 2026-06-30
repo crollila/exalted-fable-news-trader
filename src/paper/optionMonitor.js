@@ -151,7 +151,10 @@ async function reconcileOne(db, row, ctx) {
       const notional = fillPx !== null ? round2(Number(fillPx) * 100 * Number(row.quantity)) : row.notional_entry;
       touch({
         lifecycleState: 'open', status: 'open', entryOrderStatus: 'filled',
-        openedAt: order.submittedAt ?? nowIso, premiumEntry: fillPx, notionalEntry: notional ?? null,
+        entryFilledQty: order.filledQty ?? row.quantity ?? null,
+        entryFilledAvgPrice: order.filledAvgPrice ?? null,
+        entryFilledAt: order.filledAt ?? null,
+        openedAt: order.filledAt ?? order.submittedAt ?? nowIso, premiumEntry: fillPx, notionalEntry: notional ?? null,
       });
       summary.entriesFilled += 1;
       log(`option ${symbol}: entry FILLED @ ${fillPx ?? '?'} -> open`);
@@ -248,7 +251,10 @@ async function reconcileOne(db, row, ctx) {
       const pnl = realizedOptionPnl({ premiumEntry: row.premium_entry, premiumExit: exitPx, contracts: row.quantity });
       touch({
         lifecycleState: 'closed', status: 'closed', exitOrderStatus: 'filled',
-        premiumExit: exitPx, notionalExit, realizedPnlUsd: pnl, closedAt: nowIso,
+        exitFilledQty: order.filledQty ?? row.quantity ?? null,
+        exitFilledAvgPrice: order.filledAvgPrice ?? null,
+        exitFilledAt: order.filledAt ?? null,
+        premiumExit: exitPx, notionalExit, realizedPnlUsd: pnl, closedAt: order.filledAt ?? nowIso,
       });
       summary.exitsFilled += 1;
       log(`option ${symbol}: exit FILLED @ ${exitPx ?? '?'} pnl ${pnl ?? '?'} -> closed`);

@@ -292,11 +292,15 @@ confidence `0.55`, impact `0.35`, and sentiment magnitude `0.2` (previously
 `classifyNewsOnce.js` with `--classifier openai`.
 
 Output is sanitized — event id, ticker, model/prompt, numeric scores, proposed
-side/qty, the risk decision, and (only if an order was sent) the order id/status.
+side/qty, the risk decision, and (only if an order was sent) the broker order
+id/status. When paper credentials are available, the script also records a
+broker-truth/performance snapshot and prints broker-confirmed fills, owned
+exposure, broker account return, SPY return, account excess return, and any data-quality
+warnings.
 Never raw model responses, raw payloads, API keys, auth headers, or request
-configs. No options, no shorts, no margin logic, no scheduling, no background
-jobs; never part of `npm test`. The neutral `manual_baseline` score always fails
-the gate, so only real-model `up` signals can ever propose a trade. With the
+configs. No scheduling or background jobs; never part of `npm test`. The neutral
+`manual_baseline` score always fails the gate, so only real-model signals can
+ever propose a trade. With the
 advanced flags below it also proposes **shorts** (direction down) and **options**.
 
 ## Advanced PAPER trading (long/short + options + margin)
@@ -351,6 +355,36 @@ Discord EOD report. Out of scope and never done: selling options to open, naked
 options, covered calls, spreads, assignment/exercise, and multi-leg strategies.
 All order submission remains hard-wired to the Alpaca paper endpoint.
 
+## Broker truth and SPY benchmark reporting
+
+The PAPER runtime now has a reconciliation/performance layer that is still
+read-only with respect to broker state: it never submits or cancels orders. It
+polls only Alpaca PAPER order ids already recorded by ExaltedFable:
+
+- equity rows in `paper_trades` with `broker_order_id`, plus legacy rows whose
+  `trade_reason` contains the existing `paper order <id>` marker;
+- option rows in `paper_option_trades` with recorded entry/exit order ids.
+
+Manual Alpaca account activity is not considered ExaltedFable-owned strategy
+exposure. Broker-wide account snapshots are stored and labeled separately from
+owned exposure. Current owned gross exposure and open-position count require a
+current positions snapshot; if positions are unavailable, exposure is reported
+as `unavailable` rather than inferred from old fills.
+
+Each reconciliation can persist broker order status, filled quantity, average
+fill price, fill/submission/update timestamps, coarse open/closed/canceled
+state, PAPER account equity/portfolio-value snapshots, broker account return,
+ExaltedFable-owned exposure, broker-confirmed realized P&L when available, and
+data-quality warnings. Supported broker states include pending, partially
+filled, filled, canceled, rejected, expired, replaced, and unknown.
+
+SPY benchmark prices are captured through the existing `PriceSource`
+abstraction, not a new provider path. For the strategy baseline and each later
+snapshot, the system asks for SPY trades in a lookback window ending exactly at
+the account snapshot timestamp and uses the latest trade at or before that
+timestamp. If either aligned SPY price is missing, SPY return and excess return
+are reported as `unavailable`.
+
 ## Market-hours PAPER loop
 
 The loop runs continuously by default until Ctrl+C and performs a fresh decision
@@ -366,9 +400,10 @@ Alpaca news for the selected capped symbols, classifies newly inserted events
 when `--classifier openai` is requested, selects a fresh unprocessed `model_v1`
 score, and then reuses the one-shot PAPER proposal/risk/order path. It is
 **dry-run by default**, enforces a **>= 5-minute** interval, prints sanitized
-state transitions and cycle outcomes, sends one idempotent EOD report per
-completed session when requested, and exits cleanly on Ctrl+C. `--max-iterations`
-exists only as an explicit debug/test cap.
+state transitions, cycle outcomes, and broker-truth/performance snapshots when
+paper credentials are available, sends one idempotent EOD report per completed
+session when requested, and exits cleanly on Ctrl+C. `--max-iterations` exists
+only as an explicit debug/test cap.
 
 Loop dry-run:
 
@@ -439,15 +474,18 @@ node --env-file=.env scripts/sendPaperEodReport.js --send-discord
 The report summarizes one completed runtime session when `--session-id` is
 provided, or the requested trading day (`--day YYYY-MM-DD`, default today UTC):
 cycles, fresh news, classification outcomes, skipped/rejected reason counts,
-orders submitted, fills/statuses, shorts/options/margin usage, open exposure,
-approximate realized/unrealized paper P&L when available, notable wins/losses,
-data-quality warnings, and advisory-only next-session observations. Output is
+local order/rejection evidence, broker-confirmed submitted-vs-filled counts,
+open/canceled/rejected/expired broker status counts, ExaltedFable-owned
+exposure, broker-confirmed owned P&L when available, broker-wide PAPER account
+return, aligned SPY return, account excess return versus SPY, shorts/options/
+margin usage, data-quality warnings, and advisory-only next-session
+observations. Output is
 sanitized — counts, tickers, sides, statuses, our own rejection reasons, and
 rounded P&L only; never raw model responses, raw payloads, headlines, API keys,
 headers, raw request URLs, or the webhook URL. **Dry run is the default**; an
-actual send happens only with `--send-discord` (or `--test-message`), and missing
-the webhook fails clearly when a send is requested. Never part of `npm test`
-(tests use fake HTTP only).
+actual send happens only with `--send-discord` (or `--test-message`), and
+missing the webhook fails clearly when a send is requested. Never part of
+`npm test` (tests use fake HTTP only).
 
 > Non-secret strategy parameters live in a separate settings file, **not** in
 > `.env` — the bot never edits `.env`. Live trading remains disabled.

@@ -13,6 +13,11 @@ import {
   updatePaperRuntimeSession,
   getPaperRuntimeSession,
   findOpenPaperRuntimeSession,
+  insertBrokerAccountSnapshot,
+  findBaselineBrokerAccountSnapshot,
+  insertStrategyPerformanceSnapshot,
+  getLatestStrategyPerformanceSnapshot,
+  updatePaperTradeBrokerTruth,
   insertRecommendationAudit,
   listRecommendationAudits,
   insertUniverseSelections,
@@ -100,6 +105,73 @@ test('findOpenPaperRuntimeSession returns latest open session and ignores closed
   updatePaperRuntimeSession(db, second.id, { status: 'closed', eodReportStatus: 'sent' });
   assert.equal(findOpenPaperRuntimeSession(db, '2026-06-18'), null);
   assert.equal(getPaperRuntimeSession(db, second.id).eod_report_status, 'sent');
+  closeDatabase(db);
+});
+
+test('broker account and performance snapshot helpers persist additive truth fields', () => {
+  const db = freshDb();
+  const session = startPaperRuntimeSession(db, {
+    sessionDate: '2026-06-18',
+    startedAt: '2026-06-18T13:30:00.000Z',
+  });
+  const trade = db
+    .prepare(
+      `INSERT INTO paper_trades (ticker, side, quantity, status, broker_order_id)
+       VALUES ('AAPL', 'buy', 1, 'open', 'ord_1')`
+    )
+    .run();
+  assert.equal(updatePaperTradeBrokerTruth(db, trade.lastInsertRowid, {
+    brokerOrderStatus: 'filled',
+    brokerFilledQty: 1,
+    brokerFilledAvgPrice: 200,
+    brokerTruthState: 'filled',
+  }).changes, 1);
+  const tradeRow = db.prepare('SELECT * FROM paper_trades WHERE id = ?').get(trade.lastInsertRowid);
+  assert.equal(tradeRow.broker_order_status, 'filled');
+  assert.equal(tradeRow.broker_filled_avg_price, 200);
+
+  const first = insertBrokerAccountSnapshot(db, {
+    runtimeSessionId: session.id,
+    snapshotAt: '2026-06-18T13:30:00.000Z',
+    snapshotKind: 'session_start',
+    accountStatus: 'ACTIVE',
+    equity: 10000,
+    portfolioValue: 10000,
+    dataQuality: 'complete',
+  });
+  const second = insertBrokerAccountSnapshot(db, {
+    runtimeSessionId: session.id,
+    snapshotAt: '2026-06-18T14:30:00.000Z',
+    snapshotKind: 'loop',
+    accountStatus: 'ACTIVE',
+    equity: 10100,
+    portfolioValue: 10100,
+    dataQuality: 'complete',
+  });
+  assert.equal(findBaselineBrokerAccountSnapshot(db, { runtimeSessionId: session.id }).id, first.id);
+
+  const perf = insertStrategyPerformanceSnapshot(db, {
+    runtimeSessionId: session.id,
+    accountSnapshotId: second.id,
+    baselineAccountSnapshotId: first.id,
+    snapshotAt: '2026-06-18T14:30:00.000Z',
+    brokerEquityBaseline: 10000,
+    brokerEquityCurrent: 10100,
+    brokerAccountReturnPct: 0.01,
+    spyBaselinePrice: 500,
+    spyCurrentPrice: 502,
+    spyReturnPct: 0.004,
+    brokerAccountExcessReturnPct: 0.006,
+    botGrossExposure: 200,
+    botOpenPositionCount: 1,
+    botOrdersSubmitted: 1,
+    botOrdersFilled: 1,
+    dataQuality: 'complete',
+  });
+  const latest = getLatestStrategyPerformanceSnapshot(db, { runtimeSessionId: session.id });
+  assert.equal(latest.id, perf.id);
+  assert.equal(latest.bot_gross_exposure, 200);
+  assert.equal(latest.broker_account_return_pct, 0.01);
   closeDatabase(db);
 });
 

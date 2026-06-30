@@ -5,53 +5,50 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
 
-- Latest confirmed commit: `576e83b` - `feat(paper): add monitored paper options execution`.
-- Verification: full `npm test` passes at 543/543 with zero live network calls in tests.
+- Latest confirmed commit: `879950f` - `docs(status): repair current checkpoint for monitored paper options`.
+- Current working tree: broker-truth reconciliation and aligned SPY benchmark performance reporting are implemented but not yet committed.
+- Verification: full `npm test` passes at 552/552 with zero live network calls in tests.
 - Current system is a PAPER-only AI news event-study and Alpaca paper-trading research system.
 - Live trading remains disabled by default and impossible through the current paper client: order submission is hard-wired to `https://paper-api.alpaca.markets`; there is no live endpoint override.
-- `AGENTS.md` is intentionally untracked and was not included in commit `576e83b`.
+- `AGENTS.md` is intentionally untracked and must remain untracked unless a later prompt explicitly changes that.
 
-## Latest Confirmed Commit
+## Working Tree Implementation
 
-`576e83b` adds monitored PAPER option execution on top of the existing paper runtime:
+The uncommitted broker-truth layer adds:
 
-- Adds migration `005_paper_option_execution.sql` with additive lifecycle fields on `paper_option_trades`: entry/exit order ids and statuses, entry/exit limit prices, opened/closed timing, realized option P&L, exit attempts, last checked time, and a lifecycle-state index.
-- Adds `src/paper/optionExits.js` for pure option entry/exit decisions: bounded entry/exit limit prices, pending-entry classification, take-profit, stop-loss, max-hold, mandatory same-day flatten, stale-exit requote, and realized P&L math.
-- Adds `src/paper/optionMonitor.js` to reconcile only bot-owned option rows from `paper_option_trades`; it polls broker orders, reads broker positions, confirms entry fills, cancels stale unfilled entries, submits sell-to-close exits, requotes stale exits, and records unresolved states without throwing.
-- Extends `src/paper/alpacaPaperClient.js` with sanitized PAPER `getOrder`, `cancelOrder`, and single-leg `submitOptionLimitOrder`; option orders are limit/day only, never market orders.
-- Wires the one-shot and loop scripts so bot-owned option monitoring runs before new entries when a paper client is available.
-- Extends the EOD report with an options-execution section covering opened, closed, canceled, open/unresolved counts, realized option P&L when known, exit reasons, and loud unresolved-position warnings.
+- Additive migration `006_paper_broker_truth_performance.sql` for broker order/fill fields on `paper_trades`, broker fill/position fields on `paper_option_trades`, broker account snapshots, and strategy performance snapshots.
+- `src/paper/brokerTruth.js` for PAPER-only reconciliation of ExaltedFable-owned equity/option orders, broker-confirmed exposure/P&L calculation when available, account-equity snapshots, and SPY-aligned benchmark return calculation through the existing `PriceSource` path.
+- One-shot and loop wiring that records broker-truth/performance snapshots when PAPER credentials are available.
+- EOD report updates for submitted-vs-filled counts, open/canceled/rejected/expired/replaced counts, owned exposure, broker-confirmed owned P&L when available, broker account return, SPY return, account excess return, unavailable owned return, and data-quality warnings.
+- Offline tests for reconciliation, benchmark alignment, missing-data behavior, migration coverage, report rendering, and sanitized PAPER client fields.
 
-## Verified Option Execution Scope
+## Broker Truth Rules
 
-- Long calls and long puts only.
-- Option entries require all gates: `PAPER_ENABLE_OPTIONS=true`, `--allow-options`, `--options-mode execute_paper`, `--execute-paper`, broker options eligibility, contract/quote validation, regular-session availability, and no pre-close entry cutoff breach.
-- Entries are bounded `buy` / `limit` / `day` orders and are persisted as bot-owned `pending_entry` rows before later reconciliation.
-- Exits are bounded `sell` / `limit` / `day` sell-to-close orders. The monitor sells only after confirming a broker long position for the recorded bot-owned OCC symbol.
-- The monitor does not manage manual or untracked account positions.
-- If broker truth is unavailable, the system defers or records unresolved state; it does not claim fills, exposure, closure, or P&L from guesses.
-- Out of scope: sell-to-open, naked options, covered calls, spreads, assignment/exercise handling, multi-leg strategies, autonomous sizing, and live trading.
+- Reconcile only bot-owned records: `paper_trades.broker_order_id`, legacy `paper_trades.trade_reason` markers containing `paper order <id>`, and `paper_option_trades` entry/exit order ids.
+- Manual Alpaca positions/orders are never counted as ExaltedFable-owned exposure.
+- Broker-wide account equity is stored separately from ExaltedFable-owned exposure; account returns can be affected by manual Alpaca account activity and are labeled accordingly.
+- Current owned exposure requires a current broker positions snapshot. If positions are unavailable, exposure is reported as unavailable rather than inferred from old fills.
+- SPY benchmark prices use the existing market-data abstraction and the latest SPY trade at or before the exact baseline/current snapshot timestamp. Missing aligned SPY data makes SPY and excess return unavailable.
 
 ## Current Architecture Notes
 
 - Provider abstraction is in place for Alpaca News, Benzinga, Alpha Vantage, Polygon/Massive, and future providers.
 - Classification supports the offline/manual baseline plus explicit model-backed classifiers; provider-supplied sentiment remains provider metadata unless a reviewed sentiment task changes that.
 - Event-study storage and measurement are implemented with unavailable-price outcomes recorded as data.
-- Paper trading supports dry-run-default equities, shorts when gated, and monitored long-option paper execution when explicitly gated.
+- Paper trading supports dry-run-default equities, shorts when gated, monitored long-option paper execution when explicitly gated, broker-truth reconciliation, and benchmark-aware reporting.
 - Runtime sessions, candidate-universe selection, advisory-only recommendations, strategy-settings learning, and Discord EOD reporting are implemented.
 - `.env` remains manual-only; the bot does not edit `.env` and must not expose secrets.
 
 ## Known Warnings / Technical Debt
 
-- The current paper-trading report is still not a full broker-truth portfolio-performance layer. Broker dashboard state can diverge from local fills/exposure until the next reconciliation slice lands.
-- Equity orders and account-level strategy performance still need broker-confirmed reconciliation before any learning-driven position sizing.
-- SPY benchmark comparison over the same session window is not implemented yet.
-- Realized option P&L is only recorded when broker-confirmed exit information is available; unresolved rows must be reviewed manually.
-- Live paper-account verification should still be performed carefully during market hours with dry-run first.
+- The broker-truth layer is PAPER-only and has not yet been validated against a live Alpaca paper session after this patch.
+- Realized equity P&L is unavailable unless broker/local data provides a confirmed realized value; option realized P&L is recorded only when broker-confirmed exit information is available.
+- Broker-wide account return is truthful account data, not proof that every dollar of account movement came from ExaltedFable.
+- Learning-driven sizing is still not implemented and should not be added until broker-truth data has been reviewed over real paper sessions.
 
 ## Next Recommended Task
 
-Broker-truth reconciliation and aligned SPY benchmark performance reporting, before any learning-driven position sizing.
+Review and commit the broker-truth reconciliation and aligned SPY benchmark reporting layer, then validate it during a real PAPER market-hours session before any learning-driven position sizing.
 
 ## Maintenance Rule
 

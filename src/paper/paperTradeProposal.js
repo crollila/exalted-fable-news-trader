@@ -200,6 +200,17 @@ export function insertPaperTrade(
     entryAt = null,
     tradeReason = null,
     status = 'open',
+    brokerOrderId = null,
+    brokerClientOrderId = null,
+    brokerOrderStatus = null,
+    brokerOrderType = null,
+    brokerSubmittedAt = null,
+    brokerFilledQty = null,
+    brokerFilledAvgPrice = null,
+    brokerFilledAt = null,
+    brokerUpdatedAt = null,
+    brokerReconciledAt = null,
+    brokerTruthState = null,
   } = {}
 ) {
   if (!ticker || String(ticker).trim() === '') {
@@ -216,19 +227,40 @@ export function insertPaperTrade(
     .prepare(
       `INSERT INTO paper_trades
          (news_event_id, ticker, side, quantity, theoretical_entry_price,
-          fill_price, entry_at, trade_reason, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          fill_price, entry_at, trade_reason, status,
+          broker_order_id, broker_client_order_id, broker_order_status,
+          broker_order_type, broker_submitted_at, broker_filled_qty,
+          broker_filled_avg_price, broker_filled_at, broker_updated_at,
+          broker_reconciled_at, broker_truth_state)
+       VALUES
+         (@newsEventId, @ticker, @side, @qty, @theoreticalEntryPrice,
+          @fillPrice, @entryAt, @tradeReason, @status,
+          @brokerOrderId, @brokerClientOrderId, @brokerOrderStatus,
+          @brokerOrderType, @brokerSubmittedAt, @brokerFilledQty,
+          @brokerFilledAvgPrice, @brokerFilledAt, @brokerUpdatedAt,
+          @brokerReconciledAt, @brokerTruthState)`
     )
-    .run(
+    .run({
       newsEventId,
-      ticker,
+      ticker: String(ticker).trim().toUpperCase(),
       side,
       qty,
-      theoreticalEntryPrice,
-      fillPrice,
+      theoreticalEntryPrice: numOrNull(theoreticalEntryPrice),
+      fillPrice: numOrNull(fillPrice),
       entryAt,
       tradeReason,
-      status
-    );
+      status,
+      brokerOrderId,
+      brokerClientOrderId,
+      brokerOrderStatus,
+      brokerOrderType,
+      brokerSubmittedAt,
+      brokerFilledQty: numOrNull(brokerFilledQty),
+      brokerFilledAvgPrice: numOrNull(brokerFilledAvgPrice),
+      brokerFilledAt,
+      brokerUpdatedAt,
+      brokerReconciledAt,
+      brokerTruthState,
+    });
   return { id: Number(run.lastInsertRowid) };
 }

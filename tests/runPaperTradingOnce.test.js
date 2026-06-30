@@ -304,6 +304,11 @@ test('equity long EXECUTE submits a buy and writes paper_trades (margin account,
   assert.equal(result.equity.risk.approved, true);
   assert.deepEqual(client.calls.equity[0], { symbol: 'AAPL', qty: 1, side: 'buy' });
   assert.ok(result.equity.paperTradeId > 0);
+  const row = db.prepare('SELECT * FROM paper_trades WHERE id = ?').get(result.equity.paperTradeId);
+  assert.equal(row.broker_order_id, 'ord_eq');
+  assert.equal(row.broker_order_status, 'accepted');
+  assert.equal(row.broker_truth_state, 'pending');
+  assert.equal(row.fill_price, null);
   closeDatabase(db);
 });
 

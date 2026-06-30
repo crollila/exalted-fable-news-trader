@@ -135,6 +135,11 @@ test('submitMarketOrder returns a sanitized order (no raw payload leakage)', asy
     submittedAt: '2026-06-18T14:30:00.000Z',
     filledQty: 1,
     filledAvgPrice: 201.5,
+    filledAt: null,
+    canceledAt: null,
+    expiredAt: null,
+    updatedAt: null,
+    replacedAt: null,
   });
   // The extra raw field is not carried through.
   assert.ok(!Object.prototype.hasOwnProperty.call(order, 'secret_field'));
@@ -203,6 +208,7 @@ test('sanitizeOrder tolerates missing fields and never throws', () => {
   assert.deepEqual(sanitizeOrder({}), {
     id: null, clientOrderId: null, symbol: null, side: null, qty: null,
     type: null, assetClass: null, status: null, submittedAt: null, filledQty: null, filledAvgPrice: null,
+    filledAt: null, canceledAt: null, expiredAt: null, updatedAt: null, replacedAt: null,
   });
 });
 

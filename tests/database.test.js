@@ -16,6 +16,8 @@ const REQUIRED_TABLES = [
   'paper_trades',
   'paper_option_trades',
   'paper_runtime_sessions',
+  'paper_broker_account_snapshots',
+  'paper_strategy_performance_snapshots',
   'paper_recommendation_audits',
   'paper_universe_selections',
   'risk_state',
@@ -85,15 +87,25 @@ test('migration 004 upgrades an existing database that already applied 001-003',
     db.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(version);
   }
   const result = runMigrations(db);
-  assert.deepEqual(result.applied, ['004_paper_runtime_research', '005_paper_option_execution']);
+  assert.deepEqual(result.applied, [
+    '004_paper_runtime_research',
+    '005_paper_option_execution',
+    '006_paper_broker_truth_performance',
+  ]);
   const tables = listTables(db);
   assert.ok(tables.includes('paper_option_trades'));
   assert.ok(tables.includes('paper_runtime_sessions'));
+  assert.ok(tables.includes('paper_broker_account_snapshots'));
+  assert.ok(tables.includes('paper_strategy_performance_snapshots'));
   // migration 005 adds the option-execution lifecycle columns additively.
   const optionCols = db.prepare("PRAGMA table_info('paper_option_trades')").all().map((c) => c.name);
   assert.ok(optionCols.includes('lifecycle_state'));
   assert.ok(optionCols.includes('entry_order_id'));
   assert.ok(optionCols.includes('realized_pnl_usd'));
+  assert.ok(optionCols.includes('entry_filled_avg_price'));
+  const tradeCols = db.prepare("PRAGMA table_info('paper_trades')").all().map((c) => c.name);
+  assert.ok(tradeCols.includes('broker_order_id'));
+  assert.ok(tradeCols.includes('broker_truth_state'));
   closeDatabase(db);
 });
 

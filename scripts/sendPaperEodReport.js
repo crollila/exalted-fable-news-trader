@@ -25,7 +25,14 @@ import { loadConfig } from '../src/config.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { createDiscordWebhookClient } from '../src/notifications/discordWebhookClient.js';
-import { insertRecommendationAudit } from '../src/database/paperRuntime.js';
+import {
+  getLatestStrategyPerformanceSnapshot,
+  insertRecommendationAudit,
+} from '../src/database/paperRuntime.js';
+import {
+  formatReturn,
+  hydratePerformanceSnapshotRow,
+} from '../src/paper/brokerTruth.js';
 import {
   buildConstraintRecommendations,
   formatRecommendationsSection,
@@ -39,11 +46,10 @@ export const EOD_TEST_MESSAGE =
 
 /**
  * Standing options-status disclosure. Appears in EVERY EOD report (active and
- * no-trade) and in the paper-loop startup banner. Options remain plan/discovery
- * only; order submission is hard-disabled.
+ * no-trade) and in the paper-loop startup banner.
  */
 export const OPTIONS_DISCLOSURE =
-  'Options contract discovery and PAPER plans are available. Options order execution is disabled pending tested exit monitoring and sell-to-close reporting.';
+  'Monitored PAPER option execution is available for gated long calls/puts only: bounded buy-limit entries, monitored exits, and sell-to-close only.';
 
 /** Cap on the per-list samples rendered in the report. */
 const LIST_CAP = 10;
@@ -91,6 +97,12 @@ export function parseArgs(argv) {
 
 function round2(n) {
   return Math.round(Number(n) * 100) / 100;
+}
+
+function moneyOrUnavailable(value) {
+  if (value === null || value === undefined || value === '') return 'unavailable';
+  const n = Number(value);
+  return Number.isFinite(n) ? `$${round2(n).toFixed(2)}` : 'unavailable';
 }
 
 function parseJsonMap(text) {
@@ -153,6 +165,11 @@ export function assessEodDataQuality(data, { minSampleSize = 10 } = {}) {
   if (!data.session || Number(data.session.cycles ?? 0) <= 0) {
     warnings.push('Session metrics are missing or empty; report conclusions are unreliable.');
   }
+  if (!data.brokerTruth?.available) {
+    warnings.push('Broker-truth performance snapshot unavailable; broker-confirmed fills, exposure, broker account return, and benchmark comparison are unavailable.');
+  } else {
+    for (const warning of data.brokerTruth.warnings ?? []) warnings.push(`Broker truth: ${warning}`);
+  }
   return {
     status: warnings.length === 0 ? 'sufficient' : 'limited',
     canRecommend: warnings.length === 0,
@@ -182,6 +199,12 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
   const filter = activityFilter({ day, session });
   const dayClause = filter.clause;
   const dayParams = filter.params;
+  const brokerPerformanceRow = getLatestStrategyPerformanceSnapshot(db, {
+    runtimeSessionId: session ? Number(session.id) : null,
+    day,
+  });
+  const brokerPerformance = hydratePerformanceSnapshotRow(brokerPerformanceRow);
+  const brokerExposure = brokerPerformance?.exposure ?? null;
 
   const trades = db
     .prepare(
@@ -311,6 +334,12 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     optionsRealizedPnl,
     openPositions,
     openExposure,
+    brokerTruth: {
+      available: Boolean(brokerPerformance),
+      performance: brokerPerformance,
+      exposure: brokerExposure,
+      warnings: brokerPerformance?.warnings ?? ['Broker-truth performance snapshot unavailable.'],
+    },
     unrealizedPnl: null,
     realizedPnl: round2(realizedPnl),
     winningTrades,
@@ -394,6 +423,49 @@ function optionExecutionSection(data = {}) {
   return lines;
 }
 
+function brokerTruthSection(data = {}) {
+  const brokerTruth = data.brokerTruth ?? {};
+  const performance = brokerTruth.performance ?? null;
+  const exposure = brokerTruth.exposure ?? performance?.exposure ?? null;
+  const lines = ['- Broker truth / benchmark (PAPER) -'];
+  if (!performance) {
+    lines.push(
+      '  Broker-truth snapshot: unavailable',
+      '  submitted vs fills:     unavailable',
+      '  owned exposure:         unavailable',
+      '  broker account return:  unavailable',
+      '  owned return:           unavailable',
+      '  SPY session return:     unavailable',
+      '  account excess vs SPY:  unavailable',
+    );
+    return lines;
+  }
+
+  const orders = performance.broker?.orders ?? {};
+  const realizedPnl = exposure?.realizedPnlUsd ?? null;
+  lines.push(
+    `  snapshot:               ${performance.snapshotAt ?? 'unavailable'} (${performance.dataQuality ?? 'limited'})`,
+    `  submitted vs fills:     ${orders.submitted ?? 0} submitted / ${orders.filled ?? 0} broker-confirmed fill(s)`,
+    `  open/canceled/rejected/expired: ${orders.open ?? 0} / ${orders.canceled ?? 0} / ${orders.rejected ?? 0} / ${orders.expired ?? 0}`,
+    `  replaced:               ${orders.replaced ?? 0}`,
+    `  owned gross exposure:   ${moneyOrUnavailable(exposure?.grossExposure)}`,
+    `  owned open positions:   ${exposure?.openPositionCount ?? 0}`,
+    `  broker-confirmed owned P&L: ${moneyOrUnavailable(realizedPnl)}`,
+    `  broker-wide equity:     baseline=${moneyOrUnavailable(performance.brokerEquityBaseline)} current=${moneyOrUnavailable(performance.brokerEquityCurrent)}`,
+    `  broker account return:  ${formatReturn(performance.brokerAccountReturn)}`,
+    `  owned return:           ${performance.botReturnUnavailableReason ?? 'unavailable'}`,
+    `  SPY session return:     ${formatReturn(performance.spyReturn)}`,
+    `  account excess vs SPY:  ${formatReturn(performance.brokerAccountExcessReturn)}`,
+    '  note: broker-wide equity may include manual Alpaca activity; owned exposure counts only ExaltedFable-recorded orders.',
+  );
+  const warnings = brokerTruth.warnings ?? performance.warnings ?? [];
+  if (warnings.length > 0) {
+    lines.push('  data-quality warnings:');
+    for (const warning of warnings.slice(0, LIST_CAP)) lines.push(`    ${warning}`);
+  }
+  return lines;
+}
+
 /**
  * Build the sanitized EOD report as printable lines. Includes the required
  * narrative sections (what / why / went well / went poorly / mistakes-lessons /
@@ -424,6 +496,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
       'writes paper_trades / rejected_trades, the full narrative appears here.',
     );
     lines.push('', ...optionExecutionSection(data));
+    lines.push('', ...brokerTruthSection(data));
     if (strategy) lines.push('', ...formatStrategySection(strategy));
     if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
     return lines;
@@ -438,14 +511,20 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     `  skipped reasons:                 ${fmtMap(session.skippedReasons)}`,
     `  proposals (orders + rejections): ${data.proposals}`,
     `  orders submitted:                ${data.ordersSubmitted}`,
+    `  broker-confirmed fills:          ${data.brokerTruth?.performance?.broker?.orders?.filled ?? 'unavailable'}`,
     `  order statuses:                  ${fmtMap(data.orderStatus)}`,
-    `  fills (known):                   ${data.fills}`,
+    `  local fills (legacy/approx):      ${data.fills}`,
     `  equity long / short:             ${data.longCount} / ${data.shortCount}`,
     `  options plans / orders:          ${data.optionsCount}`,
     `  rejected:                        ${data.rejectedCount}`,
-    `  realized P&L (approx, USD):      ${data.realizedPnl}`,
+    `  realized P&L (local approx, USD): ${data.realizedPnl}`,
+    `  broker-confirmed owned P&L:      ${moneyOrUnavailable(data.brokerTruth?.exposure?.realizedPnlUsd)}`,
     `  unrealized P&L (if available):   ${data.unrealizedPnl ?? 'unavailable'}`,
-    `  open exposure (approx, USD):     ${data.openExposure ?? 0}`,
+    `  owned exposure (broker truth):    ${moneyOrUnavailable(data.brokerTruth?.exposure?.grossExposure)}`,
+    `  broker account return:           ${formatReturn(data.brokerTruth?.performance?.brokerAccountReturn)}`,
+    `  ExaltedFable-owned return:       ${data.brokerTruth?.performance?.botReturnUnavailableReason ?? 'unavailable'}`,
+    `  SPY session return:              ${formatReturn(data.brokerTruth?.performance?.spyReturn)}`,
+    `  broker account excess vs SPY:    ${formatReturn(data.brokerTruth?.performance?.brokerAccountExcessReturn)}`,
     `  shorts/options/margin usage:     ${session.shortsUsed ?? 0} / ${session.optionsUsed ?? 0} / ${session.marginUsed ?? 0}`,
     `  model requests/tokens:           ${session.modelRequestCount ?? 0} request(s); token usage unavailable`,
     `  data quality:                    ${dataQuality.status}`,
@@ -512,6 +591,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     }
   }
   lines.push('', ...optionExecutionSection(data));
+  lines.push('', ...brokerTruthSection(data));
   if (strategy) lines.push('', ...formatStrategySection(strategy));
   if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
   return lines;

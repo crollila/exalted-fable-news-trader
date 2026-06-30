@@ -2,7 +2,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assessRisk, resolveCaps, estimateNotional, DEFAULT_CAPS } from '../src/paper/paperRisk.js';
+import { assessRisk, clampEquityQuantityToCaps, resolveCaps, estimateNotional, DEFAULT_CAPS } from '../src/paper/paperRisk.js';
 import { deriveCapabilities } from '../src/paper/accountCapabilities.js';
 
 const margin = (over = {}) => ({
@@ -54,6 +54,30 @@ test('rejects over --max-order-notional', () => {
   const r = assessRisk({ proposal: longEquity(), capabilities: cap(margin()), account: margin(), referencePrice: 1000, caps: { maxOrderNotional: 500 } });
   assert.equal(r.approved, false);
   assert.match(r.reason, /max-order-notional/);
+});
+
+test('learned equity clamp lowers requested quantity before final risk approval', () => {
+  const clamped = clampEquityQuantityToCaps({
+    proposal: longEquity({ quantity: 10 }),
+    account: margin(),
+    referencePrice: 100,
+    caps: { maxOrderNotional: 500 },
+  });
+  assert.equal(clamped.requestedQuantity, 10);
+  assert.equal(clamped.quantity, 5);
+  assert.equal(clamped.clamped, true);
+  assert.match(clamped.reason, /clamped to 5/);
+
+  const approved = assessRisk({
+    proposal: longEquity({ quantity: clamped.quantity }),
+    capabilities: cap(margin()),
+    account: margin(),
+    referencePrice: 100,
+    caps: { maxOrderNotional: 500 },
+    executePaper: true,
+  });
+  assert.equal(approved.approved, true);
+  assert.equal(approved.estNotional, 500);
 });
 
 test('rejects over --max-symbol-exposure given existing positions', () => {

@@ -10,6 +10,7 @@ import { runMigrations } from '../src/database/migrations.js';
 import { insertPaperTrade, insertRejectedTrade } from '../src/paper/paperTradeProposal.js';
 import {
   insertBrokerAccountSnapshot,
+  insertEquitySizingDecision,
   insertPaperOptionTrade,
   insertStrategyPerformanceSnapshot,
   updatePaperOptionTrade,
@@ -286,6 +287,140 @@ test('buildEodReport keeps missing broker exposure and benchmark values unavaila
   assert.match(text, /account excess vs SPY:\s+unavailable/);
   assert.match(text, /positions unavailable: positions offline/);
   assert.match(text, /SPY benchmark unavailable at baseline\/current timestamp/);
+  closeDatabase(db);
+});
+
+test('buildEodReport renders equity sizing decisions and cold-start warnings', () => {
+  const db = freshDb();
+  seedActivity(db);
+  insertEquitySizingDecision(db, {
+    ticker: 'AAPL',
+    side: 'buy',
+    sizingMode: 'cold_start',
+    evidenceTier: 'none',
+    evidenceCount: 0,
+    evidenceQuality: 'limited',
+    requestedTargetWeight: 0.0075,
+    requestedNotional: 500,
+    requestedQuantity: 5,
+    approvedTargetWeight: 0.005,
+    approvedNotional: 500,
+    approvedQuantity: 5,
+    referencePrice: 100,
+    accountEquity: 100000,
+    currentOwnedExposure: 0,
+    riskApproved: true,
+    riskReason: 'approved: notional 500 within all caps',
+    explanation: 'cold-start sizing: no comparable broker-confirmed outcomes yet',
+    warnings: ['cold-start allocation used'],
+  });
+  const text = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
+  assert.match(text, /Equity sizing decisions \(PAPER equities only\)/);
+  assert.match(text, /cold\/evidence\/abstain:\s+1 \/ 0 \/ 0/);
+  assert.match(text, /AAPL buy cold_start/);
+  assert.match(text, /requested=5 \(\$500\.00, 0\.75%\)/);
+  assert.match(text, /cold-start allocation used/);
+  closeDatabase(db);
+});
+
+test('buildEodReport renders sanitized sizing fixture variants truthfully', () => {
+  const db = freshDb();
+  seedActivity(db);
+  insertEquitySizingDecision(db, {
+    ticker: 'AAPL',
+    side: 'buy',
+    sizingMode: 'cold_start',
+    evidenceTier: 'none',
+    evidenceCount: 0,
+    evidenceQuality: 'limited',
+    requestedTargetWeight: 0.0075,
+    requestedNotional: 500,
+    requestedQuantity: 5,
+    approvedTargetWeight: 0.005,
+    approvedNotional: 500,
+    approvedQuantity: 5,
+    riskApproved: true,
+    riskReason: 'approved: notional 500 within all caps',
+    explanation: 'cold-start sizing: no comparable broker-confirmed outcomes yet',
+    warnings: ['cold-start allocation used'],
+  });
+  insertEquitySizingDecision(db, {
+    ticker: 'MSFT',
+    side: 'buy',
+    sizingMode: 'evidence_weighted',
+    evidenceTier: 'news_type_direction_score',
+    evidenceCount: 12,
+    evidenceQuality: 'sufficient',
+    requestedTargetWeight: 0.01,
+    requestedNotional: 1000,
+    requestedQuantity: 10,
+    approvedTargetWeight: 0.005,
+    approvedNotional: 500,
+    approvedQuantity: 5,
+    riskApproved: true,
+    riskReason: 'approved: notional 500 within all caps',
+    explanation: 'evidence-weighted sizing from 12 broker-confirmed outcomes',
+    warnings: ['learned equity quantity 10 clamped to 5 by deterministic risk caps'],
+  });
+  insertEquitySizingDecision(db, {
+    ticker: 'TSLA',
+    side: 'buy',
+    sizingMode: 'abstain',
+    evidenceTier: 'direction_score',
+    evidenceCount: 3,
+    evidenceQuality: 'limited',
+    requestedQuantity: 0,
+    approvedQuantity: 0,
+    riskApproved: false,
+    riskReason: 'abstain: sparse comparable direction_score outcomes are losing or uncertain',
+    explanation: 'abstain: sparse comparable direction_score outcomes are losing or uncertain',
+    warnings: ['insufficient/negative comparable evidence'],
+  });
+  insertEquitySizingDecision(db, {
+    ticker: 'NVDA',
+    side: 'buy',
+    manualOverride: true,
+    sizingMode: 'abstain',
+    evidenceTier: 'manual_override',
+    evidenceCount: 0,
+    evidenceQuality: 'manual_override',
+    requestedTargetWeight: 0.002,
+    requestedNotional: 200,
+    requestedQuantity: 2,
+    approvedTargetWeight: 0.002,
+    approvedNotional: 200,
+    approvedQuantity: 2,
+    riskApproved: true,
+    riskReason: 'approved: notional 200 within all caps',
+    explanation: 'manual --qty override: learned sizing not applied',
+    warnings: ['manual --qty override bypassed learned equity sizing'],
+  });
+  insertEquitySizingDecision(db, {
+    ticker: 'AMZN',
+    side: 'buy',
+    sizingMode: 'abstain',
+    evidenceTier: 'none',
+    evidenceCount: 0,
+    evidenceQuality: 'none',
+    requestedQuantity: 0,
+    approvedQuantity: 0,
+    riskApproved: false,
+    riskReason: 'abstain: valid reference price unavailable for learned equity sizing',
+    explanation: 'abstain: valid reference price unavailable for learned equity sizing',
+    warnings: ['missing reference price blocked learned sizing'],
+  });
+
+  const text = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
+  assert.match(text, /cold\/evidence\/abstain:\s+1 \/ 1 \/ 3/);
+  assert.match(text, /manual --qty override:\s+1/);
+  assert.match(text, /AAPL buy cold_start .*requested=5 \(\$500\.00, 0\.75%\).*approved=5 \(\$500\.00\)/);
+  assert.match(text, /MSFT buy evidence_weighted .*requested=10 \(\$1000\.00, 1\.00%\).*approved=5 \(\$500\.00\)/);
+  assert.match(text, /TSLA buy abstain .*requested=0 \(unavailable, unavailable\).*approved=0 \(unavailable\)/);
+  assert.match(text, /NVDA buy manual_override .*requested=2 \(\$200\.00, 0\.20%\).*approved=2 \(\$200\.00\)/);
+  assert.match(text, /AMZN buy abstain .*reference price unavailable/);
+  assert.match(text, /learned equity quantity 10 clamped to 5 by deterministic risk caps/);
+  assert.match(text, /manual --qty override bypassed learned equity sizing/);
+  assert.doesNotMatch(text, /RAW-MODEL-RESPONSE|SECRET-HEADLINE|api[_-]?key|request object/i);
   closeDatabase(db);
 });
 

@@ -53,9 +53,21 @@ import { proposeOption, DEFAULT_OPTION_CONTRACT_LIMIT } from '../src/paper/optio
 import { enrichOptionProposal } from '../src/paper/optionContracts.js';
 import { entryLimitPrice, optionEntryBlocked } from '../src/paper/optionExits.js';
 import { reconcileBotOptions } from '../src/paper/optionMonitor.js';
-import { assessRisk, resolveCaps, DEFAULT_CAPS } from '../src/paper/paperRisk.js';
+import { assessRisk, clampEquityQuantityToCaps, resolveCaps, DEFAULT_CAPS } from '../src/paper/paperRisk.js';
 import { deriveCapabilities, summarizeCapabilities } from '../src/paper/accountCapabilities.js';
-import { insertPaperOptionTrade } from '../src/database/paperRuntime.js';
+import {
+  getOwnedEquityExposureSnapshot,
+  getPaperEventAttemptStats,
+  insertEquitySizingDecision,
+  insertPaperOptionTrade,
+  listBrokerConfirmedEquityOutcomes,
+} from '../src/database/paperRuntime.js';
+import {
+  decideEquitySizing,
+  formatSizingDecision,
+  scoreBucket,
+  SIZING_MODES,
+} from '../src/paper/equitySizing.js';
 import {
   selectCandidateUniverse,
   DEFAULT_MAX_SYMBOLS_PER_CYCLE,
@@ -145,6 +157,17 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
     defaults.optionMaxPremium = Number(settings.max_option_premium);
   }
   if (Object.keys(defaults.caps).length === 0) delete defaults.caps;
+  defaults.sizingSettings = {};
+  for (const key of [
+    'sizing_min_comparable_sample_size',
+    'sizing_cold_start_target_weight',
+    'sizing_max_target_weight',
+    'sizing_enable_confidence_scaling',
+    'sizing_enable_impact_scaling',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(settings, key)) defaults.sizingSettings[key] = settings[key];
+  }
+  if (Object.keys(defaults.sizingSettings).length === 0) delete defaults.sizingSettings;
   return defaults;
 }
 
@@ -172,6 +195,7 @@ export function parseArgs(argv, defaults = {}) {
   const args = {
     symbols: cleanSymbols(defaults.symbols),
     qty: Math.min(parsePosInt(defaults.qty) ?? DEFAULT_QTY, MAX_QTY),
+    qtyExplicit: false,
     eventId: null,
     executePaper: false,
     classifier: defaults.classifier ?? null,
@@ -189,6 +213,7 @@ export function parseArgs(argv, defaults = {}) {
     optionContractLimit: parsePosInt(defaults.optionContractLimit) ?? DEFAULT_OPTION_CONTRACT_LIMIT,
     thresholds: { ...(defaults.thresholds ?? {}) },
     caps: { ...(defaults.caps ?? {}) },
+    sizingSettings: { ...(defaults.sizingSettings ?? {}) },
     paperFeatures: resolvePaperFeatures(defaults.paperFeatures ?? DEFAULT_PAPER_FEATURES),
   };
   const setThresh = (key, v) => { const f = parseUnitFloat(v); if (f !== null) args.thresholds[key] = f; };
@@ -201,7 +226,7 @@ export function parseArgs(argv, defaults = {}) {
       args.symbols = next.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
       i += 1;
     } else if (flag === '--qty' && next) {
-      args.qty = Math.min(parsePosInt(next) ?? DEFAULT_QTY, MAX_QTY); i += 1;
+      args.qty = Math.min(parsePosInt(next) ?? DEFAULT_QTY, MAX_QTY); args.qtyExplicit = true; i += 1;
     } else if (flag === '--event-id' && next) {
       args.eventId = parsePosInt(next); i += 1;
     } else if (flag === '--confidence-threshold' && next) { setThresh('minConfidence', next); i += 1; }
@@ -319,6 +344,188 @@ function riskShape(proposal, kind) {
     : { assetClass: 'equity', side: proposal.side, ticker: proposal.ticker, quantity: proposal.quantity };
 }
 
+function finiteNum(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function round2(value) {
+  const n = finiteNum(value);
+  return n === null ? null : Math.round(n * 100) / 100;
+}
+
+function equitySignalFromProposal(proposal) {
+  const score = proposal?.score ?? {};
+  return {
+    ticker: proposal?.ticker,
+    side: proposal?.side,
+    direction: score.direction,
+    confidence: score.confidence,
+    impact: score.impact,
+    sentiment: score.sentiment,
+    newsType: score.newsType,
+    model: score.model,
+    promptVersion: score.promptVersion,
+  };
+}
+
+function currentExposureForProposal(snapshot, proposal) {
+  const ticker = String(proposal?.ticker ?? '').trim().toUpperCase();
+  const side = String(proposal?.side ?? '').trim();
+  return finiteNum(snapshot?.byTickerSide?.[`${ticker}|${side}`]) ?? 0;
+}
+
+function manualSizingDecision({ proposal, qty, referencePrice, account, currentOwnedExposure }) {
+  const ref = finiteNum(referencePrice);
+  const equity = finiteNum(account?.equity ?? account?.portfolioValue);
+  const requestedNotional = ref !== null ? round2(ref * qty) : null;
+  const requestedTargetWeight = requestedNotional !== null && equity !== null && equity > 0
+    ? requestedNotional / equity
+    : null;
+  return {
+    mode: SIZING_MODES.ABSTAIN,
+    requestedTargetWeight,
+    requestedNotional,
+    requestedQuantity: qty,
+    evidenceCount: 0,
+    evidenceQuality: 'manual_override',
+    evidenceTier: 'manual_override',
+    reason: 'manual --qty override; learned equity sizing not applied',
+    warnings: ['manual --qty override bypassed learned equity sizing'],
+    diagnostics: {
+      referencePrice: ref,
+      accountEquity: equity,
+      currentExposure: currentOwnedExposure,
+    },
+  };
+}
+
+function withSizingDecision(
+  proposal,
+  sizingDecision,
+  {
+    account = null,
+    positions = [],
+    caps = {},
+    daily = { orders: 0, notional: 0 },
+    referencePrice = null,
+    paperFeatures = DEFAULT_PAPER_FEATURES,
+    maxQty = MAX_QTY,
+  } = {}
+) {
+  if (!proposal.accepted || !sizingDecision) return proposal;
+  if (sizingDecision.mode === SIZING_MODES.ABSTAIN || !(Number(sizingDecision.requestedQuantity) > 0)) {
+    return {
+      ...proposal,
+      accepted: false,
+      quantity: null,
+      reason: `learned equity sizing rejected: ${sizingDecision.reason}`,
+    };
+  }
+  const requestedQty = Math.floor(Number(sizingDecision.requestedQuantity));
+  const cappedQty = Math.min(Math.max(1, requestedQty), maxQty);
+  const clamp = clampEquityQuantityToCaps({
+    proposal: { ...proposal, assetClass: 'equity', quantity: cappedQty },
+    account,
+    positions,
+    caps,
+    daily,
+    referencePrice,
+    marginEnabled: resolvePaperFeatures(paperFeatures).enableMargin,
+  });
+  const qty = clamp.quantity;
+  const clampWarnings = [];
+  if (cappedQty < requestedQty) {
+    clampWarnings.push(`learned quantity ${requestedQty} clamped to hard quantity cap ${maxQty}`);
+  }
+  if (qty < cappedQty) clampWarnings.push(clamp.reason);
+  if (clampWarnings.length > 0) {
+    sizingDecision.warnings = [
+      ...(sizingDecision.warnings ?? []),
+      ...clampWarnings,
+    ];
+  }
+  if (qty <= 0) {
+    return {
+      ...proposal,
+      accepted: false,
+      quantity: null,
+      reason: `learned equity sizing rejected: ${clamp.reason}`,
+    };
+  }
+  return {
+    ...proposal,
+    quantity: qty,
+    reason: `${proposal.reason}; sizing ${formatSizingDecision(sizingDecision)}; approved qty=${qty}`,
+  };
+}
+
+function insertSizingAuditIfPresent(db, sub, ctx) {
+  if (sub.kind !== 'equity' || !sub.sizingDecision) return;
+  const proposal = sub.proposal ?? {};
+  const decision = sub.sizingDecision;
+  const accountEquity = finiteNum(ctx.account?.equity ?? ctx.account?.portfolioValue);
+  const brokerRejectedNoFill =
+    ['canceled', 'rejected', 'expired'].includes(sub.brokerTruthState) && sub.brokerHasFill !== true;
+  const executionFailureReason =
+    sub.orderError ??
+    (brokerRejectedNoFill ? `broker ${sub.brokerTruthState} with no confirmed fill` : null);
+  const approved =
+    sub.decision === 'accepted' &&
+    (!sub.risk || sub.risk.approved) &&
+    !executionFailureReason;
+  const approvedQuantity = approved ? Number(proposal.quantity) || null : 0;
+  const approvedNotional =
+    approved && sub.risk?.estNotional !== null && sub.risk?.estNotional !== undefined
+      ? finiteNum(sub.risk.estNotional)
+      : approved && ctx.referencePrice !== null && ctx.referencePrice !== undefined
+        ? round2((Number(proposal.quantity) || 0) * Number(ctx.referencePrice))
+        : null;
+  const approvedTargetWeight = approvedNotional !== null && accountEquity !== null && accountEquity > 0
+    ? approvedNotional / accountEquity
+    : null;
+  const signal = equitySignalFromProposal(proposal);
+  const warnings = [
+    ...(decision.warnings ?? []),
+    ...(ctx.dataQualityWarnings ?? []),
+  ];
+  const riskReason = executionFailureReason ?? sub.risk?.reason ?? (sub.decision === 'rejected' ? proposal.reason : 'accepted');
+  const explanation = ctx.manualQtyOverride
+    ? `manual --qty override: requested qty ${proposal.quantity}; learned sizing not applied`
+    : formatSizingDecision(decision);
+  sub.sizingAuditId = insertEquitySizingDecision(db, {
+    paperTradeId: sub.paperTradeId,
+    rejectedTradeId: sub.rejectedTradeId,
+    newsEventId: proposal.eventId,
+    ticker: proposal.ticker,
+    side: proposal.side,
+    manualOverride: ctx.manualQtyOverride === true,
+    sizingMode: decision.mode,
+    evidenceTier: decision.evidenceTier,
+    evidenceCount: decision.evidenceCount,
+    evidenceQuality: decision.evidenceQuality,
+    model: signal.model,
+    promptVersion: signal.promptVersion,
+    newsType: signal.newsType,
+    direction: signal.direction,
+    scoreBucket: scoreBucket(signal),
+    requestedTargetWeight: decision.requestedTargetWeight,
+    requestedNotional: decision.requestedNotional,
+    requestedQuantity: decision.requestedQuantity,
+    approvedTargetWeight,
+    approvedNotional,
+    approvedQuantity,
+    referencePrice: ctx.referencePrice,
+    accountEquity,
+    currentOwnedExposure: ctx.currentOwnedExposure,
+    riskApproved: executionFailureReason ? false : sub.risk ? sub.risk.approved === true : approved ? true : false,
+    riskReason,
+    explanation,
+    warnings,
+  }).id;
+}
+
 /**
  * Process ONE proposal through risk + (dry-run|execute) + persistence. Never
  * throws on a submit failure — records a sanitized orderError instead.
@@ -328,12 +535,15 @@ async function processProposal(db, proposal, ctx) {
     kind, capabilities, account, positions, caps, daily, referencePrice,
     executePaper, paperClient, planOnly = false, paperFeatures = DEFAULT_PAPER_FEATURES,
     asset = null, optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
-    nowMs = Date.now(),
+    nowMs = Date.now(), sizingDecision = null, manualQtyOverride = false,
+    currentOwnedExposure = 0, dataQualityWarnings = [],
   } = ctx;
   const sub = {
     kind, proposal, risk: null, decision: 'rejected',
     rejectedTradeId: null, paperTradeId: null, paperOptionTradeId: null,
     order: null, orderError: null,
+    brokerTruthState: null, brokerHasFill: false,
+    sizingDecision, manualQtyOverride, sizingAuditId: null,
   };
 
   // Score/intent gate already decided acceptance.
@@ -345,6 +555,9 @@ async function processProposal(db, proposal, ctx) {
       quantity: proposal.contracts ?? proposal.quantity ?? null,
       reason: proposal.reason,
     }).id;
+    insertSizingAuditIfPresent(db, sub, {
+      account, referencePrice, currentOwnedExposure, dataQualityWarnings, manualQtyOverride,
+    });
     return sub;
   }
 
@@ -368,14 +581,28 @@ async function processProposal(db, proposal, ctx) {
         quantity: proposal.contracts ?? proposal.quantity ?? null,
         reason: sub.risk.reason,
       }).id;
+      insertSizingAuditIfPresent(db, sub, {
+        account, referencePrice, currentOwnedExposure, dataQualityWarnings, manualQtyOverride,
+      });
       return sub;
     }
   }
 
   sub.decision = 'accepted';
   if (planOnly) { sub.decision = 'plan'; return sub; } // options plan_only never executes
-  if (!executePaper) return sub; // dry run: nothing sent or stored
-  if (!paperClient) { sub.orderError = 'paper client not configured — no order sent'; return sub; }
+  if (!executePaper) {
+    insertSizingAuditIfPresent(db, sub, {
+      account, referencePrice, currentOwnedExposure, dataQualityWarnings, manualQtyOverride,
+    });
+    return sub;
+  } // dry run: no order sent
+  if (!paperClient) {
+    sub.orderError = 'paper client not configured — no order sent';
+    insertSizingAuditIfPresent(db, sub, {
+      account, referencePrice, currentOwnedExposure, dataQualityWarnings, manualQtyOverride,
+    });
+    return sub;
+  }
 
   // OPTION entry: a bounded LONG buy/limit/day, persisted as `pending_entry` for
   // the monitor to reconcile (fills, stale-cancel, deterministic exits). It is
@@ -438,6 +665,8 @@ async function processProposal(db, proposal, ctx) {
     const filledQty = Number(order.filledQty);
     const filledAvgPrice = Number(order.filledAvgPrice);
     const hasBrokerFill = Number.isFinite(filledQty) && filledQty > 0 && Number.isFinite(filledAvgPrice);
+    sub.brokerTruthState = brokerState;
+    sub.brokerHasFill = hasBrokerFill;
     const localStatus =
       ['canceled', 'rejected', 'expired'].includes(brokerState) && !hasBrokerFill ? 'canceled' : 'open';
     sub.paperTradeId = insertPaperTrade(db, {
@@ -464,6 +693,9 @@ async function processProposal(db, proposal, ctx) {
   } catch (err) {
     sub.orderError = err.message; // already sanitized by the client
   }
+  insertSizingAuditIfPresent(db, sub, {
+    account, referencePrice, currentOwnedExposure, dataQualityWarnings, manualQtyOverride,
+  });
   return sub;
 }
 
@@ -475,12 +707,14 @@ async function processProposal(db, proposal, ctx) {
 export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
   const {
     paperClient = null, qty = DEFAULT_QTY, allowedSymbols = [], thresholds = {}, allowShorts = false,
+    qtyExplicit = false, sizingSettings = {},
     allowOptions = false, optionsMode = 'plan_only', optionSymbol = null, optionMaxPremium = null,
     optionContractLimit = DEFAULT_OPTION_CONTRACT_LIMIT, optionExpiryDaysMin = null, optionExpiryDaysMax = null,
     caps = {}, account = null, positions = [], capabilities = null, referencePrice = null,
     optionReferencePrice = null, daily = { orders: 0, notional: 0 }, executePaper = false,
     nowMs = Date.now(), paperFeatures = DEFAULT_PAPER_FEATURES, asset = null,
     optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
+    historicalEquityOutcomes = [], ownedEquityExposure = null, eventAttemptStats = null,
   } = deps;
   const features = resolvePaperFeatures(paperFeatures);
   const effectiveCaps =
@@ -497,7 +731,7 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
     option: null,
   };
 
-  const equityProposal = assessProposal({
+  let equityProposal = assessProposal({
     event,
     score,
     qty,
@@ -506,12 +740,56 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
     allowShorts,
     shortsEnabled: features.enableShorts,
   });
+  let equitySizingDecision = null;
+  let currentOwnedExposure = 0;
+  const dataQualityWarnings = [];
+  if (equityProposal.accepted) {
+    const exposureSnapshot = ownedEquityExposure ?? { byTickerSide: {}, dataQuality: 'unavailable' };
+    currentOwnedExposure = currentExposureForProposal(exposureSnapshot, equityProposal);
+    if (exposureSnapshot.dataQuality && exposureSnapshot.dataQuality !== 'broker_confirmed') {
+      dataQualityWarnings.push(`owned exposure snapshot quality: ${exposureSnapshot.dataQuality}`);
+    }
+    if (qtyExplicit) {
+      equitySizingDecision = manualSizingDecision({
+        proposal: equityProposal,
+        qty: equityProposal.quantity,
+        referencePrice,
+        account,
+        currentOwnedExposure,
+      });
+    } else {
+      equitySizingDecision = decideEquitySizing({
+        signal: equitySignalFromProposal(equityProposal),
+        referencePrice,
+        account,
+        caps: resolveCaps(effectiveCaps),
+        daily,
+        settings: sizingSettings,
+        currentOwnedExposure,
+        historicalOutcomes: historicalEquityOutcomes,
+        duplicateAttempt: eventAttemptStats?.duplicateAttempt === true,
+        dataQualityWarnings,
+      });
+      equityProposal = withSizingDecision(equityProposal, equitySizingDecision, {
+        account,
+        positions,
+        caps: effectiveCaps,
+        daily,
+        referencePrice,
+        paperFeatures: features,
+      });
+    }
+  }
   if (!resolvedAsset && paperClient && equityProposal.side === 'sell') {
     resolvedAsset = await fetchAssetState(paperClient, event?.ticker);
   }
   result.equity = await processProposal(db, equityProposal, {
     kind: 'equity', capabilities, account, positions, caps: effectiveCaps, daily, referencePrice,
     executePaper, paperClient, paperFeatures: features, asset: resolvedAsset,
+    sizingDecision: equitySizingDecision,
+    manualQtyOverride: qtyExplicit,
+    currentOwnedExposure,
+    dataQualityWarnings,
   });
 
   let optionProposal = proposeOption({
@@ -596,14 +874,19 @@ export async function executeSelectedPaperTrade(
   const asset = await fetchAssetState(paperClient, selected.event.ticker);
   const referencePrice = await fetchReferencePrice(priceSource, selected.event.ticker, nowMs);
   const daily = getDailyCounters(db);
+  const historicalEquityOutcomes = listBrokerConfirmedEquityOutcomes(db);
+  const ownedEquityExposure = getOwnedEquityExposureSnapshot(db);
+  const eventAttemptStats = getPaperEventAttemptStats(db, selected.event.id);
   const result = await runPaperTradeOnce(db, selected, {
     paperClient, account, positions, capabilities, referencePrice,
     daily, nowMs,
-    qty: args.qty, allowedSymbols: args.symbols, thresholds: args.thresholds, allowShorts: args.allowShorts,
+    qty: args.qty, qtyExplicit: args.qtyExplicit, sizingSettings: args.sizingSettings,
+    allowedSymbols: args.symbols, thresholds: args.thresholds, allowShorts: args.allowShorts,
     allowOptions: args.allowOptions, optionsMode: args.optionsMode, optionSymbol: args.optionSymbol,
     optionMaxPremium: args.optionMaxPremium, optionContractLimit: args.optionContractLimit,
     optionExpiryDaysMin: args.optionExpiryDaysMin, optionExpiryDaysMax: args.optionExpiryDaysMax,
     caps: args.caps, executePaper: args.executePaper,
+    historicalEquityOutcomes, ownedEquityExposure, eventAttemptStats,
     asset,
     paperFeatures: args.paperFeatures ?? DEFAULT_PAPER_FEATURES,
     optionEntry, optionConfig,
@@ -645,6 +928,9 @@ function tradeOutcome(result) {
   const subs = [result?.equity, result?.option].filter(Boolean);
   if (subs.some((s) => s.orderError)) return PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR;
   if (subs.some((s) => s.decision === 'rejected' && s.risk && !s.risk.approved)) {
+    return PAPER_DECISION_OUTCOMES.RISK_REJECTION;
+  }
+  if (subs.some((s) => s.decision === 'rejected' && s.sizingDecision?.mode === SIZING_MODES.ABSTAIN)) {
     return PAPER_DECISION_OUTCOMES.RISK_REJECTION;
   }
   return PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED;
@@ -862,7 +1148,12 @@ export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
 /** One short sanitized summary line per asset class, for loop heartbeats. */
 export function oneLineSummary(result) {
   const e = result.equity;
-  const eqTxt = `equity ${e?.proposal?.side ?? '?'} ${e?.decision ?? '?'}`;
+  const sizeTxt = e?.manualQtyOverride
+    ? ` manual-qty=${e?.proposal?.quantity ?? '?'}`
+    : e?.sizingDecision
+      ? ` size=${e.sizingDecision.mode} qty=${e.proposal?.quantity ?? e.sizingDecision.requestedQuantity ?? '?'}`
+      : '';
+  const eqTxt = `equity ${e?.proposal?.side ?? '?'} ${e?.decision ?? '?'}${sizeTxt}`;
   let opTxt = 'option off';
   if (result.option && result.option.decision !== 'disabled') {
     opTxt = `option ${result.option.proposal?.intent ?? '?'} ${result.option.decision}`;
@@ -883,6 +1174,16 @@ function subLines(label, sub) {
       `    premium:    entry=${p.premiumEntry ?? '?'} notional=${p.notionalEntry ?? '?'} bid=${p.quoteBid ?? '?'} ask=${p.quoteAsk ?? '?'}`,
       `    exit:       ${p.exitPolicy ?? '(none)'}`
     );
+  }
+  if (label === 'equity' && sub.sizingDecision) {
+    const approvedQty = sub.decision === 'accepted' ? p.quantity : 0;
+    lines.push(
+      `    sizing:    ${sub.manualQtyOverride ? 'manual --qty override' : formatSizingDecision(sub.sizingDecision)}`,
+      `    approved:  qty=${approvedQty} audit=${sub.sizingAuditId ?? 'pending'}`
+    );
+    if (sub.sizingDecision.warnings?.length > 0) {
+      lines.push(`    sizing warnings: ${sub.sizingDecision.warnings.slice(0, 3).join('; ')}`);
+    }
   }
   if (sub.risk) lines.push(`    risk:       ${sub.risk.approved ? 'approved' : 'REJECTED'} — ${sub.risk.reason} (est notional ${sub.risk.estNotional ?? 'n/a'})`);
   if (sub.rejectedTradeId !== null) lines.push(`    logged:     rejected_trades id ${sub.rejectedTradeId}`);

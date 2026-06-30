@@ -28,6 +28,7 @@ import { createDiscordWebhookClient } from '../src/notifications/discordWebhookC
 import {
   getLatestStrategyPerformanceSnapshot,
   insertRecommendationAudit,
+  listEquitySizingDecisions,
 } from '../src/database/paperRuntime.js';
 import {
   formatReturn,
@@ -114,6 +115,15 @@ function parseJsonMap(text) {
   }
 }
 
+function parseJsonArray(text) {
+  try {
+    const parsed = JSON.parse(text ?? '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function mergeCounts(target, source = {}) {
   for (const [key, value] of Object.entries(source ?? {})) {
     target[key] = (target[key] ?? 0) + (Number(value) || 0);
@@ -169,6 +179,15 @@ export function assessEodDataQuality(data, { minSampleSize = 10 } = {}) {
     warnings.push('Broker-truth performance snapshot unavailable; broker-confirmed fills, exposure, broker account return, and benchmark comparison are unavailable.');
   } else {
     for (const warning of data.brokerTruth.warnings ?? []) warnings.push(`Broker truth: ${warning}`);
+  }
+  if ((data.sizing?.coldStartCount ?? 0) > 0) {
+    warnings.push(`${data.sizing.coldStartCount} equity sizing decision(s) used conservative cold-start allocation.`);
+  }
+  if ((data.sizing?.abstainCount ?? 0) > 0) {
+    warnings.push(`${data.sizing.abstainCount} equity sizing decision(s) abstained because evidence or required broker/price data was insufficient.`);
+  }
+  if ((data.sizing?.limitedEvidenceCount ?? 0) > 0) {
+    warnings.push(`${data.sizing.limitedEvidenceCount} equity sizing decision(s) had limited comparable broker-confirmed evidence.`);
   }
   return {
     status: warnings.length === 0 ? 'sufficient' : 'limited',
@@ -240,6 +259,34 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
         ORDER BY id DESC`
     )
     .all(...dayParams);
+
+  const sizingRows = listEquitySizingDecisions(db, {
+    day: session ? null : day,
+    session,
+    limit: 500,
+  });
+  const sizingModeCounts = countRows(sizingRows, 'sizing_mode');
+  const sizingWarnings = [];
+  for (const row of sizingRows) {
+    sizingWarnings.push(...parseJsonArray(row.warnings_json));
+  }
+  const sizingSamples = sizingRows.slice(0, LIST_CAP).map((row) => ({
+    ticker: row.ticker,
+    side: row.side,
+    mode: row.sizing_mode,
+    manualOverride: row.manual_override === 1,
+    evidenceTier: row.evidence_tier,
+    evidenceCount: row.evidence_count,
+    evidenceQuality: row.evidence_quality,
+    requestedTargetWeight: row.requested_target_weight,
+    requestedNotional: row.requested_notional,
+    requestedQuantity: row.requested_quantity,
+    approvedNotional: row.approved_notional,
+    approvedQuantity: row.approved_quantity,
+    riskApproved: row.risk_approved,
+    riskReason: row.risk_reason,
+    explanation: row.explanation,
+  }));
 
   const sessions = db
     .prepare(
@@ -377,6 +424,17 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
       lifecycleState: optionLifecycle(o),
       exitReason: o.exit_reason,
     })),
+    sizing: {
+      decisions: sizingRows.length,
+      modeCounts: sizingModeCounts,
+      coldStartCount: sizingModeCounts.cold_start ?? 0,
+      evidenceWeightedCount: sizingModeCounts.evidence_weighted ?? 0,
+      abstainCount: sizingModeCounts.abstain ?? 0,
+      manualOverrideCount: sizingRows.filter((r) => r.manual_override === 1).length,
+      limitedEvidenceCount: sizingRows.filter((r) => r.evidence_quality !== 'sufficient' && r.manual_override !== 1).length,
+      warnings: [...new Set(sizingWarnings)].slice(0, LIST_CAP),
+      samples: sizingSamples,
+    },
   };
 }
 
@@ -466,6 +524,41 @@ function brokerTruthSection(data = {}) {
   return lines;
 }
 
+function pctOrUnavailable(value) {
+  if (value === null || value === undefined || value === '') return 'unavailable';
+  const n = Number(value);
+  return Number.isFinite(n) ? `${(n * 100).toFixed(2)}%` : 'unavailable';
+}
+
+function equitySizingSection(data = {}) {
+  const sizing = data.sizing ?? {};
+  const lines = ['- Equity sizing decisions (PAPER equities only) -'];
+  if ((sizing.decisions ?? 0) === 0) {
+    lines.push('  No learned equity sizing decisions recorded in this window.');
+    return lines;
+  }
+  const modes = sizing.modeCounts ?? {};
+  lines.push(
+    `  decisions:             ${sizing.decisions}`,
+    `  cold/evidence/abstain: ${modes.cold_start ?? 0} / ${modes.evidence_weighted ?? 0} / ${modes.abstain ?? 0}`,
+    `  manual --qty override: ${sizing.manualOverrideCount ?? 0}`,
+  );
+  for (const s of sizing.samples ?? []) {
+    lines.push(
+      `  ${s.ticker} ${s.side} ${s.manualOverride ? 'manual_override' : s.mode} ` +
+        `evidence=${s.evidenceCount ?? 0}/${s.evidenceQuality ?? 'unknown'} ` +
+        `requested=${s.requestedQuantity ?? 0} (${moneyOrUnavailable(s.requestedNotional)}, ${pctOrUnavailable(s.requestedTargetWeight)}) ` +
+        `approved=${s.approvedQuantity ?? 0} (${moneyOrUnavailable(s.approvedNotional)}) ` +
+        `reason=${s.riskReason ?? s.explanation ?? 'unavailable'}`
+    );
+  }
+  if ((sizing.warnings ?? []).length > 0) {
+    lines.push('  sizing warnings:');
+    for (const warning of sizing.warnings.slice(0, LIST_CAP)) lines.push(`    ${warning}`);
+  }
+  return lines;
+}
+
 /**
  * Build the sanitized EOD report as printable lines. Includes the required
  * narrative sections (what / why / went well / went poorly / mistakes-lessons /
@@ -489,7 +582,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     '',
   ];
 
-  if (data.proposals === 0 && (session.cycles ?? 0) === 0 && (data.optionsOpened ?? 0) === 0) {
+  if (data.proposals === 0 && (session.cycles ?? 0) === 0 && (data.optionsOpened ?? 0) === 0 && (data.sizing?.decisions ?? 0) === 0) {
     lines.push(
       'No paper-trading records for this day yet.',
       'This report still proves Discord delivery; once the paper loop runs and',
@@ -497,6 +590,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     );
     lines.push('', ...optionExecutionSection(data));
     lines.push('', ...brokerTruthSection(data));
+    lines.push('', ...equitySizingSection(data));
     if (strategy) lines.push('', ...formatStrategySection(strategy));
     if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
     return lines;
@@ -525,6 +619,8 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     `  ExaltedFable-owned return:       ${data.brokerTruth?.performance?.botReturnUnavailableReason ?? 'unavailable'}`,
     `  SPY session return:              ${formatReturn(data.brokerTruth?.performance?.spyReturn)}`,
     `  broker account excess vs SPY:    ${formatReturn(data.brokerTruth?.performance?.brokerAccountExcessReturn)}`,
+    `  equity sizing decisions:         ${data.sizing?.decisions ?? 0}`,
+    `  sizing cold/evidence/abstain:    ${data.sizing?.coldStartCount ?? 0} / ${data.sizing?.evidenceWeightedCount ?? 0} / ${data.sizing?.abstainCount ?? 0}`,
     `  shorts/options/margin usage:     ${session.shortsUsed ?? 0} / ${session.optionsUsed ?? 0} / ${session.marginUsed ?? 0}`,
     `  model requests/tokens:           ${session.modelRequestCount ?? 0} request(s); token usage unavailable`,
     `  data quality:                    ${dataQuality.status}`,
@@ -592,6 +688,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
   }
   lines.push('', ...optionExecutionSection(data));
   lines.push('', ...brokerTruthSection(data));
+  lines.push('', ...equitySizingSection(data));
   if (strategy) lines.push('', ...formatStrategySection(strategy));
   if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
   return lines;

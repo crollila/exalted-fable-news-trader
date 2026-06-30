@@ -86,7 +86,7 @@ function fakePaperClient({
   const calls = { equity: [], option: [], asset: [], contracts: [], quote: [] };
   return {
     calls,
-    getAccount: async () => marginAccount(),
+    getAccount: async () => marginAccount({ equity: 100000, portfolioValue: 100000, cash: 50000, buyingPower: 100000 }),
     getPositions: async () => [],
     getAsset: async (symbol) => { calls.asset.push(symbol); return asset; },
     getOptionContracts: async (query) => {
@@ -190,6 +190,7 @@ const ALL_PAPER_FEATURES = { enableShorts: true, enableOptions: true, enableMarg
 test('parseArgs defaults are conservative, dry-run, no shorts/options', () => {
   const a = parseArgs([]);
   assert.deepEqual(a.symbols, ['AAPL']);
+  assert.equal(a.qtyExplicit, false);
   assert.equal(a.executePaper, false);
   assert.equal(a.allowShorts, false);
   assert.equal(a.allowOptions, false);
@@ -205,6 +206,7 @@ test('parseArgs reads advanced flags + caps and clamps qty', () => {
   ]);
   assert.deepEqual(a.symbols, ['AAPL', 'MSFT']);
   assert.equal(a.qty, MAX_QTY);
+  assert.equal(a.qtyExplicit, true);
   assert.equal(a.allowShorts, true);
   assert.equal(a.allowOptions, true);
   assert.equal(a.optionsMode, 'execute_paper');
@@ -263,6 +265,7 @@ test('paperDefaultsFromStrategySettings maps non-secret runtime settings into CL
     impact_threshold: 0.33,
     sentiment_threshold: 0.18,
     max_order_notional: 250,
+    sizing_cold_start_target_weight: 0.006,
   });
   const args = parseArgs(['--impact-threshold', '0.4'], defaults);
   assert.deepEqual(args.symbols, ['MSFT', 'AAPL']);
@@ -272,21 +275,38 @@ test('paperDefaultsFromStrategySettings maps non-secret runtime settings into CL
   assert.equal(args.thresholds.minImpact, 0.4); // CLI wins over settings default
   assert.equal(args.thresholds.minSentiment, 0.18);
   assert.equal(args.caps.maxOrderNotional, 250);
+  assert.equal(args.sizingSettings.sizing_cold_start_target_weight, 0.006);
   assert.equal(args.executePaper, false); // settings cannot enable execution
 });
 
 // --- equity long: dry run vs execute ---------------------------------------
 
-test('equity long DRY RUN (no account) accepts and writes nothing', async () => {
+test('equity long DRY RUN with manual qty override accepts and sends no order', async () => {
   const db = freshDb();
   seedScoredEvent(db, { direction: 'up' });
   const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
   const client = fakePaperClient();
-  const result = await runPaperTradeOnce(db, selected, { paperClient: client, allowedSymbols: ['AAPL'], executePaper: false });
+  const result = await runPaperTradeOnce(db, selected, { paperClient: client, allowedSymbols: ['AAPL'], qtyExplicit: true, executePaper: false });
   assert.equal(result.equity.decision, 'accepted');
+  assert.equal(result.equity.manualQtyOverride, true);
   assert.equal(result.equity.proposal.side, 'buy');
   assert.equal(client.calls.equity.length, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM rejected_trades').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_equity_sizing_decisions').get().n, 1);
+  closeDatabase(db);
+});
+
+test('equity long without manual qty rejects when learned sizing lacks broker equity and price', async () => {
+  const db = freshDb();
+  seedScoredEvent(db, { direction: 'up' });
+  const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
+  const result = await runPaperTradeOnce(db, selected, { allowedSymbols: ['AAPL'], executePaper: false });
+  assert.equal(result.equity.decision, 'rejected');
+  assert.equal(result.equity.sizingDecision.mode, 'abstain');
+  assert.match(result.equity.proposal.reason, /learned equity sizing rejected/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM rejected_trades').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_equity_sizing_decisions').get().n, 1);
   closeDatabase(db);
 });
 
@@ -298,7 +318,7 @@ test('equity long EXECUTE submits a buy and writes paper_trades (margin account,
   const account = marginAccount();
   const result = await runPaperTradeOnce(db, selected, {
     paperClient: client, allowedSymbols: ['AAPL'], executePaper: true,
-    account, capabilities: deriveCapabilities(account), referencePrice: 200, qty: 1,
+    account, capabilities: deriveCapabilities(account), referencePrice: 200, qty: 1, qtyExplicit: true,
   });
   assert.equal(result.equity.decision, 'accepted');
   assert.equal(result.equity.risk.approved, true);
@@ -309,6 +329,41 @@ test('equity long EXECUTE submits a buy and writes paper_trades (margin account,
   assert.equal(row.broker_order_status, 'accepted');
   assert.equal(row.broker_truth_state, 'pending');
   assert.equal(row.fill_price, null);
+  const sizing = db.prepare('SELECT * FROM paper_equity_sizing_decisions WHERE paper_trade_id = ?').get(result.equity.paperTradeId);
+  assert.equal(sizing.manual_override, 1);
+  assert.equal(sizing.approved_quantity, 1);
+  closeDatabase(db);
+});
+
+test('equity long EXECUTE defaults to learned cold-start target sizing when --qty is absent', async () => {
+  const db = freshDb();
+  seedScoredEvent(db, { direction: 'up' });
+  const selected = selectRecentScoredEvent(db, { allowedSymbols: ['AAPL'] });
+  const client = fakePaperClient();
+  const account = marginAccount({ equity: 100000, portfolioValue: 100000, cash: 50000, buyingPower: 100000 });
+  const result = await runPaperTradeOnce(db, selected, {
+    paperClient: client, allowedSymbols: ['AAPL'], executePaper: true,
+    account, capabilities: deriveCapabilities(account), referencePrice: 100,
+    caps: { maxOrderNotional: 500 },
+    sizingSettings: {
+      sizing_enable_confidence_scaling: false,
+      sizing_enable_impact_scaling: false,
+    },
+  });
+  assert.equal(result.equity.decision, 'accepted');
+  assert.equal(result.equity.sizingDecision.mode, 'cold_start');
+  assert.equal(result.equity.sizingDecision.requestedTargetWeight, 0.0075);
+  assert.equal(result.equity.sizingDecision.requestedQuantity, 7);
+  assert.equal(result.equity.risk.approved, true);
+  assert.deepEqual(client.calls.equity[0], { symbol: 'AAPL', qty: 5, side: 'buy' });
+  const sizing = db.prepare('SELECT * FROM paper_equity_sizing_decisions WHERE paper_trade_id = ?').get(result.equity.paperTradeId);
+  assert.equal(sizing.manual_override, 0);
+  assert.equal(sizing.sizing_mode, 'cold_start');
+  assert.equal(sizing.requested_quantity, 7);
+  assert.equal(sizing.requested_notional, 700);
+  assert.equal(sizing.approved_quantity, 5);
+  assert.equal(sizing.approved_notional, 500);
+  assert.match(sizing.warnings_json, /clamped to 5 by deterministic risk caps/);
   closeDatabase(db);
 });
 
@@ -428,7 +483,9 @@ test('decision cycle distinguishes risk rejection from signal rejection', async 
     { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
   );
   assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.RISK_REJECTION);
-  assert.match(cycle.trade.result.equity.risk.reason, /cannot verify notional caps/);
+  assert.equal(cycle.trade.result.equity.sizingDecision.mode, 'abstain');
+  assert.equal(cycle.trade.result.equity.risk, null);
+  assert.match(cycle.trade.result.equity.proposal.reason, /reference price unavailable/);
   closeDatabase(db);
 });
 
@@ -450,6 +507,10 @@ test('decision cycle distinguishes broker submission errors', async () => {
   assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR);
   assert.equal(client.calls.equity.length, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 0);
+  const sizing = db.prepare('SELECT * FROM paper_equity_sizing_decisions').get();
+  assert.equal(sizing.risk_approved, 0);
+  assert.equal(sizing.approved_quantity, 0);
+  assert.match(sizing.risk_reason, /sanitized submit failure/);
   closeDatabase(db);
 });
 
@@ -460,7 +521,7 @@ test('explicit --event-id override deliberately retests a processed scored event
     `INSERT INTO rejected_trades (news_event_id, ticker, side, quantity, reason)
      VALUES (?, 'AAPL', 'buy', 1, 'prior rejection')`
   ).run(eventId);
-  const args = parseArgs(['--symbols', 'AAPL', '--event-id', String(eventId)]);
+  const args = parseArgs(['--symbols', 'AAPL', '--event-id', String(eventId), '--qty', '1']);
   const cycle = await runPaperDecisionCycle(db, {}, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
   assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED);
   assert.equal(cycle.selected.event.id, eventId);
@@ -537,7 +598,7 @@ test('an order exceeding --max-order-notional is rejected', async () => {
   const account = marginAccount();
   const result = await runPaperTradeOnce(db, selected, {
     allowedSymbols: ['AAPL'], executePaper: true, paperClient: fakePaperClient(),
-    account, capabilities: deriveCapabilities(account), referencePrice: 1000, qty: 1,
+    account, capabilities: deriveCapabilities(account), referencePrice: 1000, qty: 1, qtyExplicit: true,
     caps: { maxOrderNotional: 500 },
   });
   assert.equal(result.equity.decision, 'rejected');

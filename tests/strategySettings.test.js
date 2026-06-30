@@ -25,12 +25,18 @@ const RT = '/x/data/strategy-settings.json';
 test('validateStrategySettings caps invalid values and drops unknown/forbidden keys', () => {
   const { settings, warnings } = validateStrategySettings({
     max_order_notional: -5, interval_minutes: 1, confidence_threshold: 2,
+    sizing_min_comparable_sample_size: 1,
+    sizing_cold_start_target_weight: 9,
+    sizing_max_target_weight: 9,
     options_mode: 'yolo', symbols: ['aapl', 'aapl', 'msft'],
     UNKNOWN_KEY: 'x', ALPACA_API_SECRET_KEY: 'leak', LIVE_TRADING_ENABLED: 'true',
   });
   assert.equal(settings.max_order_notional, DEFAULT_SETTINGS.max_order_notional); // invalid -> default
   assert.equal(settings.interval_minutes, 5); // floored to the loop minimum
   assert.equal(settings.confidence_threshold, 1); // clamped to [0,1]
+  assert.equal(settings.sizing_min_comparable_sample_size, 3); // floored
+  assert.equal(settings.sizing_cold_start_target_weight, 0.01); // capped beneath hard risk caps
+  assert.equal(settings.sizing_max_target_weight, 0.01);
   assert.equal(settings.options_mode, 'plan_only'); // invalid enum -> default
   assert.deepEqual(settings.symbols, ['AAPL', 'MSFT']); // upper + dedup
   assert.ok(!('UNKNOWN_KEY' in settings));
@@ -84,4 +90,5 @@ test('buildSettingsFile re-validates settings and never carries secrets', () => 
   const file = buildSettingsFile({ settings: { max_order_notional: 999999999, DISCORD_WEBHOOK_URL: 'leak' }, notes: [] }, { now: () => 'T' });
   assert.ok(!('DISCORD_WEBHOOK_URL' in file.settings));
   assert.ok(file.settings.max_order_notional <= 100000); // capped
+  assert.equal(file.settings.sizing_min_comparable_sample_size, DEFAULT_SETTINGS.sizing_min_comparable_sample_size);
 });

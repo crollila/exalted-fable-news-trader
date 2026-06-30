@@ -18,6 +18,7 @@ const REQUIRED_TABLES = [
   'paper_runtime_sessions',
   'paper_broker_account_snapshots',
   'paper_strategy_performance_snapshots',
+  'paper_equity_sizing_decisions',
   'paper_recommendation_audits',
   'paper_universe_selections',
   'risk_state',
@@ -91,12 +92,14 @@ test('migration 004 upgrades an existing database that already applied 001-003',
     '004_paper_runtime_research',
     '005_paper_option_execution',
     '006_paper_broker_truth_performance',
+    '007_paper_equity_sizing_decisions',
   ]);
   const tables = listTables(db);
   assert.ok(tables.includes('paper_option_trades'));
   assert.ok(tables.includes('paper_runtime_sessions'));
   assert.ok(tables.includes('paper_broker_account_snapshots'));
   assert.ok(tables.includes('paper_strategy_performance_snapshots'));
+  assert.ok(tables.includes('paper_equity_sizing_decisions'));
   // migration 005 adds the option-execution lifecycle columns additively.
   const optionCols = db.prepare("PRAGMA table_info('paper_option_trades')").all().map((c) => c.name);
   assert.ok(optionCols.includes('lifecycle_state'));
@@ -106,6 +109,10 @@ test('migration 004 upgrades an existing database that already applied 001-003',
   const tradeCols = db.prepare("PRAGMA table_info('paper_trades')").all().map((c) => c.name);
   assert.ok(tradeCols.includes('broker_order_id'));
   assert.ok(tradeCols.includes('broker_truth_state'));
+  const sizingCols = db.prepare("PRAGMA table_info('paper_equity_sizing_decisions')").all().map((c) => c.name);
+  assert.ok(sizingCols.includes('requested_target_weight'));
+  assert.ok(sizingCols.includes('approved_quantity'));
+  assert.ok(sizingCols.includes('manual_override'));
   closeDatabase(db);
 });
 

@@ -18,6 +18,11 @@ import {
   insertStrategyPerformanceSnapshot,
   getLatestStrategyPerformanceSnapshot,
   updatePaperTradeBrokerTruth,
+  insertEquitySizingDecision,
+  listEquitySizingDecisions,
+  listBrokerConfirmedEquityOutcomes,
+  getOwnedEquityExposureSnapshot,
+  getPaperEventAttemptStats,
   insertRecommendationAudit,
   listRecommendationAudits,
   insertUniverseSelections,
@@ -172,6 +177,96 @@ test('broker account and performance snapshot helpers persist additive truth fie
   assert.equal(latest.id, perf.id);
   assert.equal(latest.bot_gross_exposure, 200);
   assert.equal(latest.broker_account_return_pct, 0.01);
+  closeDatabase(db);
+});
+
+test('equity sizing audits and evidence helpers use only broker-confirmed bot-owned rows', () => {
+  const db = freshDb();
+  const eventId = Number(db.prepare(
+    `INSERT INTO news_events (provider, provider_event_id, ticker, headline, published_at, received_at, news_type)
+     VALUES ('t', 'sizing-1', 'AAPL', 'H', '2026-06-18T14:00:00.000Z', '2026-06-18T14:00:00.000Z', 'earnings')`
+  ).run().lastInsertRowid);
+  db.prepare(
+    `INSERT INTO sentiment_scores
+       (news_event_id, model, prompt_version, sentiment_score, news_type,
+        confidence, raw_response, parse_ok, parser_status, impact_score, direction)
+     VALUES (?, 'claude-opus-4-8', 'model_v1', 0.7, 'earnings',
+        0.9, '{}', 1, 'parsed', 0.8, 'up')`
+  ).run(eventId);
+  const ownedClosed = db.prepare(
+    `INSERT INTO paper_trades
+       (news_event_id, ticker, side, quantity, status, broker_order_id,
+        broker_truth_state, broker_filled_qty, broker_filled_avg_price,
+        broker_realized_pnl_usd, trade_reason)
+     VALUES (?, 'AAPL', 'buy', 2, 'closed', 'ord-owned', 'filled', 2, 100, 12, 'paper order ord-owned')`
+  ).run(eventId).lastInsertRowid;
+  db.prepare(
+    `INSERT INTO paper_trades
+       (news_event_id, ticker, side, quantity, status, broker_truth_state,
+        broker_filled_qty, broker_filled_avg_price, broker_realized_pnl_usd)
+     VALUES (?, 'AAPL', 'buy', 1, 'closed', 'filled', 1, 100, 99)`
+  ).run(eventId);
+  const manualOwned = db.prepare(
+    `INSERT INTO paper_trades
+       (news_event_id, ticker, side, quantity, status, broker_order_id,
+        broker_truth_state, broker_filled_qty, broker_filled_avg_price,
+        broker_realized_pnl_usd, trade_reason)
+     VALUES (?, 'AAPL', 'buy', 1, 'closed', 'ord-manual-override', 'filled', 1, 100, 8, 'paper order ord-manual-override')`
+  ).run(eventId).lastInsertRowid;
+  db.prepare(
+    `INSERT INTO paper_trades
+       (news_event_id, ticker, side, quantity, status, broker_order_id,
+        broker_truth_state, broker_filled_qty, broker_filled_avg_price,
+        broker_realized_pnl_usd)
+     VALUES (?, 'AAPL', 'buy', 3, 'open', 'ord-open', 'filled', 3, 101, 777)`
+  ).run(eventId);
+
+  const audit = insertEquitySizingDecision(db, {
+    paperTradeId: ownedClosed,
+    newsEventId: eventId,
+    ticker: 'aapl',
+    side: 'buy',
+    sizingMode: 'cold_start',
+    evidenceQuality: 'limited',
+    requestedTargetWeight: 0.0075,
+    requestedNotional: 300,
+    requestedQuantity: 3,
+    approvedNotional: 300,
+    approvedQuantity: 3,
+    explanation: 'cold-start sizing: no comparable broker-confirmed outcomes yet',
+    warnings: ['cold start'],
+  });
+  insertEquitySizingDecision(db, {
+    paperTradeId: manualOwned,
+    newsEventId: eventId,
+    ticker: 'AAPL',
+    side: 'buy',
+    manualOverride: true,
+    sizingMode: 'abstain',
+    evidenceQuality: 'manual_override',
+    requestedQuantity: 1,
+    approvedQuantity: 1,
+    explanation: 'manual --qty override; learned sizing not applied',
+  });
+  assert.equal(audit.id, 1);
+  const decisions = listEquitySizingDecisions(db);
+  assert.equal(decisions.length, 2);
+  assert.ok(decisions.some((d) => d.ticker === 'AAPL' && d.manual_override === 0));
+  assert.ok(decisions.some((d) => d.ticker === 'AAPL' && d.manual_override === 1));
+
+  const outcomes = listBrokerConfirmedEquityOutcomes(db);
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].broker_order_id, undefined);
+  assert.equal(outcomes[0].broker_realized_pnl_usd, 12);
+
+  const exposure = getOwnedEquityExposureSnapshot(db);
+  assert.equal(exposure.openPositionCount, 1);
+  assert.equal(exposure.byTickerSide['AAPL|buy'], 303);
+  assert.equal(exposure.dataQuality, 'broker_confirmed');
+
+  const attempts = getPaperEventAttemptStats(db, eventId);
+  assert.equal(attempts.tradeAttempts, 4);
+  assert.equal(attempts.duplicateAttempt, true);
   closeDatabase(db);
 });
 

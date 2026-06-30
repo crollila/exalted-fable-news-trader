@@ -56,6 +56,76 @@ export function estimateNotional({ assetClass, quantity, referencePrice }) {
   return assetClass === 'option' ? px * OPTION_CONTRACT_MULTIPLIER * qty : px * qty;
 }
 
+function wholeSharesForNotional(notional, referencePrice) {
+  const n = Number(notional);
+  const px = Number(referencePrice);
+  if (!Number.isFinite(n) || !Number.isFinite(px) || px <= 0) return null;
+  return Math.max(0, Math.floor(n / px));
+}
+
+/**
+ * Lower a learned PAPER equity quantity to the largest whole-share amount that
+ * can still satisfy deterministic notional-style caps. This never raises size
+ * and does not replace assessRisk(), which still performs privilege checks and
+ * rejects any final proposal that cannot be verified.
+ */
+export function clampEquityQuantityToCaps({
+  proposal,
+  account = null,
+  positions = [],
+  caps = {},
+  daily = { orders: 0, notional: 0 },
+  referencePrice = null,
+  marginEnabled = true,
+} = {}) {
+  const c = resolveCaps(caps);
+  const requestedQuantity = Math.max(0, Math.floor(Number(proposal?.quantity) || 0));
+  const out = (quantity, reason) => ({
+    quantity,
+    requestedQuantity,
+    clamped: quantity < requestedQuantity,
+    reason,
+    caps: c,
+  });
+  if (proposal?.assetClass !== 'equity' || requestedQuantity <= 0) {
+    return out(requestedQuantity, 'not an equity quantity clamp candidate');
+  }
+  if (referencePrice === null || referencePrice === undefined || !Number.isFinite(Number(referencePrice)) || Number(referencePrice) <= 0) {
+    return out(0, 'reference price unavailable for risk-cap quantity clamp');
+  }
+  if ((daily?.orders ?? 0) >= c.maxDailyPaperOrders) {
+    return out(0, `daily paper order cap reached (${c.maxDailyPaperOrders})`);
+  }
+
+  const candidates = [requestedQuantity];
+  const addNotionalLimit = (label, notional) => {
+    const shares = wholeSharesForNotional(notional, referencePrice);
+    if (shares !== null) candidates.push(shares);
+  };
+
+  addNotionalLimit('max order notional', c.maxOrderNotional);
+  addNotionalLimit('remaining daily paper notional', c.maxDailyPaperNotional - (daily?.notional ?? 0));
+  addNotionalLimit('remaining symbol exposure', c.maxSymbolExposure - symbolExposure(positions, proposal.ticker));
+  addNotionalLimit('remaining gross exposure', c.maxGrossExposure - grossExposure(positions));
+
+  const isShort = proposal.side === 'sell';
+  const buyingPower =
+    marginEnabled && typeof account?.buyingPower === 'number'
+      ? account.buyingPower
+      : typeof account?.cash === 'number'
+        ? account.cash
+        : null;
+  if (!isShort && typeof buyingPower === 'number') {
+    addNotionalLimit('buying power', buyingPower);
+  }
+
+  const quantity = Math.max(0, Math.min(...candidates.filter((n) => Number.isFinite(n))));
+  if (quantity < requestedQuantity) {
+    return out(quantity, `learned equity quantity ${requestedQuantity} clamped to ${quantity} by deterministic risk caps`);
+  }
+  return out(quantity, 'learned equity quantity within deterministic risk caps');
+}
+
 /**
  * Assess a proposal against margin/exposure/daily caps.
  *

@@ -275,15 +275,20 @@ node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL --execute-pap
 It selects one recent event scored by the real model (`prompt_version=model_v1`)
 whose ticker is in `--symbols`, excluding events that already have a
 `paper_trades` row or a `rejected_trades` row. Use `--event-id N` to deliberately
-retest a specific scored event. It then builds an **equity long, market buy,
-whole shares** proposal. The risk gate **rejects** unless: the ticker is in the
-`--symbols` allow-list, the parser status is `parsed`/`fallback_used`, the model
-direction is `up` (long-only — **no shorts**), and confidence/impact/sentiment
-clear conservative thresholds. Rejections are written to `rejected_trades` with a
-reason; an executed order is written to `paper_trades`. An accepted **dry run**
-writes nothing and stops before any order.
+retest a specific scored event. It then builds a whole-share PAPER equity
+proposal (long for direction `up`, short for direction `down` only when shorts
+are explicitly gated on). Rejections are written to `rejected_trades` with a
+reason; an executed order is written to `paper_trades`.
 
-Flags: `--symbols A,B` (allow-list), `--qty N` (default 1, hard-capped at 100),
+When `--qty` is absent, PAPER equity proposals use the learned target-sizing
+engine described below instead of defaulting to one share. A missing valid
+reference price or broker account equity makes learned sizing abstain/reject;
+it never falls back to `qty=1`. Passing `--qty N` is an explicit manual override:
+it bypasses learned sizing, is labeled in console/report/audit output, and still
+goes through the deterministic risk gate. Options are not affected by learned
+equity sizing.
+
+Flags: `--symbols A,B` (allow-list), `--qty N` (manual override, hard-capped at 100),
 `--event-id N` (target a specific scored event), `--confidence-threshold`,
 `--impact-threshold`, `--sentiment-threshold` (each a 0–1 float), and
 `--execute-paper` (off by default). Default PAPER signal thresholds are now
@@ -297,6 +302,9 @@ id/status. When paper credentials are available, the script also records a
 broker-truth/performance snapshot and prints broker-confirmed fills, owned
 exposure, broker account return, SPY return, account excess return, and any data-quality
 warnings.
+It also prints the PAPER equity sizing mode, requested target/quantity, approved
+or rejected quantity, manual override status, comparable evidence count, and
+data-quality warnings.
 Never raw model responses, raw payloads, API keys, auth headers, or request
 configs. No scheduling or background jobs; never part of `npm test`. The neutral
 `manual_baseline` score always fails the gate, so only real-model signals can
@@ -384,6 +392,51 @@ snapshot, the system asks for SPY trades in a lookback window ending exactly at
 the account snapshot timestamp and uses the latest trade at or before that
 timestamp. If either aligned SPY price is missing, SPY return and excess return
 are reported as `unavailable`.
+
+## Learned PAPER equity target sizing
+
+PAPER equity entries now use an explainable target portfolio-weight decision
+when `--qty` is not explicitly supplied. The sizing engine is pure and
+testable: it reads only injected signal metadata, broker-confirmed
+ExaltedFable-owned historical outcomes, current bot-owned exposure, broker
+account capacity, configured caps, and the already-approved PriceSource
+reference price. It never calls a model/provider, never fetches a new data
+source, never edits strategy files, and never changes risk caps.
+
+Sizing modes are:
+
+- `cold_start` - conservative exploration when no sufficient comparable
+  broker-confirmed outcomes exist;
+- `evidence_weighted` - a shrunken, positive-expectancy adjustment only after
+  enough independent comparable outcomes exist for the same model/prompt
+  version;
+- `abstain` - used when price, equity, ownership, fill/P&L truth, duplicate
+  status, or comparable evidence quality is insufficient.
+
+Comparable outcomes are considered in a transparent hierarchy: exact
+ticker/news-type/direction/score bucket, then news-type/direction/score bucket,
+then direction/score bucket. Evidence never mixes model/prompt versions, never
+uses broker-wide account returns, excludes manual `--qty` override trades once
+they are audited, and uses legacy rows only when their score provenance is
+unambiguous. Sparse wins are shrunk toward neutral; losing or uncertain
+comparable records reduce allocation or cause abstention.
+
+Non-secret controls live in `config/strategy-settings.example.json` and optional
+local `data/strategy-settings.json`: `sizing_min_comparable_sample_size`,
+`sizing_cold_start_target_weight`, `sizing_max_target_weight`,
+`sizing_enable_confidence_scaling`, and `sizing_enable_impact_scaling`.
+Defaults are conservative (`10` samples, `0.75%` cold-start target, `1%` learned
+target ceiling) and remain beneath the existing hard order/exposure/notional
+caps. The sizing engine requests a whole-share quantity; `paperRisk` remains
+authoritative for account, buying-power, exposure, daily notional/order, and
+short/margin vetoes.
+
+Every equity sizing decision is recorded in
+`paper_equity_sizing_decisions` with sanitized requested and approved/rejected
+weight/notional/quantity, sizing mode, evidence count/quality, clamp/rejection
+reason, manual override flag, and warnings. It never stores raw model responses,
+headlines, secrets, or request objects. Console and EOD reports summarize these
+decisions separately from broker-truth account performance.
 
 ## Market-hours PAPER loop
 
@@ -542,8 +595,10 @@ Non-secret strategy parameters live in a JSON **settings file**, never in `.env`
 
 Settings include `symbols`, `allow_shorts`, `allow_options`, `options_mode`,
 `max_order_notional`, `max_*_exposure`, `max_daily_paper_*`, `max_option_premium`,
-the `*_threshold` knobs, `interval_minutes`, an optional debug `max_iterations`,
-and research
+the `*_threshold` knobs, learned equity sizing controls
+(`sizing_min_comparable_sample_size`, `sizing_cold_start_target_weight`,
+`sizing_max_target_weight`, and optional confidence/impact scaling),
+`interval_minutes`, an optional debug `max_iterations`, and research
 focus (`scrape_target_groups`, `scrape_symbol_focus`). All values are
 validated/capped on load; secrets and `LIVE_TRADING_ENABLED` are never accepted.
 When `data/strategy-settings.json` exists, the PAPER one-shot/loop use these

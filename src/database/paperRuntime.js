@@ -387,6 +387,252 @@ export function listPaperTradesForBrokerReconciliation(db, { limit = 500 } = {})
     .all(Number.parseInt(limit, 10) || 500);
 }
 
+const SIZING_MODES = new Set(['cold_start', 'evidence_weighted', 'abstain']);
+
+function boundedText(value, max = 500) {
+  const s = String(value ?? '').trim();
+  if (!s) return null;
+  return s.length > max ? `${s.slice(0, max - 3)}...` : s;
+}
+
+function intOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number.parseInt(value, 10);
+  return Number.isInteger(n) ? n : null;
+}
+
+function boolInt(value) {
+  return value === true ? 1 : value === false ? 0 : null;
+}
+
+/** Persist one sanitized PAPER equity sizing decision. */
+export function insertEquitySizingDecision(
+  db,
+  {
+    paperTradeId = null,
+    rejectedTradeId = null,
+    newsEventId = null,
+    ticker,
+    side,
+    manualOverride = false,
+    sizingMode = 'abstain',
+    evidenceTier = null,
+    evidenceCount = 0,
+    evidenceQuality = 'none',
+    model = null,
+    promptVersion = null,
+    newsType = null,
+    direction = null,
+    scoreBucket = null,
+    requestedTargetWeight = null,
+    requestedNotional = null,
+    requestedQuantity = null,
+    approvedTargetWeight = null,
+    approvedNotional = null,
+    approvedQuantity = null,
+    referencePrice = null,
+    accountEquity = null,
+    currentOwnedExposure = null,
+    riskApproved = null,
+    riskReason = null,
+    explanation,
+    warnings = [],
+  } = {}
+) {
+  const mode = SIZING_MODES.has(String(sizingMode)) ? String(sizingMode) : 'abstain';
+  const cleanSide = String(side ?? '').trim();
+  if (cleanSide !== 'buy' && cleanSide !== 'sell') {
+    throw new Error('insertEquitySizingDecision: side must be buy/sell');
+  }
+  const run = db
+    .prepare(
+      `INSERT INTO paper_equity_sizing_decisions
+         (paper_trade_id, rejected_trade_id, news_event_id, ticker, side,
+          manual_override, sizing_mode, evidence_tier, evidence_count,
+          evidence_quality, model, prompt_version, news_type, direction,
+          score_bucket, requested_target_weight, requested_notional,
+          requested_quantity, approved_target_weight, approved_notional,
+          approved_quantity, reference_price, account_equity,
+          current_owned_exposure, risk_approved, risk_reason, explanation,
+          warnings_json)
+       VALUES
+         (@paperTradeId, @rejectedTradeId, @newsEventId, @ticker, @side,
+          @manualOverride, @sizingMode, @evidenceTier, @evidenceCount,
+          @evidenceQuality, @model, @promptVersion, @newsType, @direction,
+          @scoreBucket, @requestedTargetWeight, @requestedNotional,
+          @requestedQuantity, @approvedTargetWeight, @approvedNotional,
+          @approvedQuantity, @referencePrice, @accountEquity,
+          @currentOwnedExposure, @riskApproved, @riskReason, @explanation,
+          @warningsJson)`
+    )
+    .run({
+      paperTradeId: intOrNull(paperTradeId),
+      rejectedTradeId: intOrNull(rejectedTradeId),
+      newsEventId: intOrNull(newsEventId),
+      ticker: requiredString('ticker', ticker).toUpperCase(),
+      side: cleanSide,
+      manualOverride: manualOverride ? 1 : 0,
+      sizingMode: mode,
+      evidenceTier: boundedText(evidenceTier, 80),
+      evidenceCount: Math.max(0, Number.parseInt(evidenceCount, 10) || 0),
+      evidenceQuality: requiredString('evidenceQuality', evidenceQuality),
+      model: boundedText(model, 120),
+      promptVersion: boundedText(promptVersion, 80),
+      newsType: boundedText(newsType, 80),
+      direction: boundedText(direction, 40),
+      scoreBucket: boundedText(scoreBucket, 120),
+      requestedTargetWeight: finiteOrNull(requestedTargetWeight),
+      requestedNotional: finiteOrNull(requestedNotional),
+      requestedQuantity: intOrNull(requestedQuantity),
+      approvedTargetWeight: finiteOrNull(approvedTargetWeight),
+      approvedNotional: finiteOrNull(approvedNotional),
+      approvedQuantity: intOrNull(approvedQuantity),
+      referencePrice: finiteOrNull(referencePrice),
+      accountEquity: finiteOrNull(accountEquity),
+      currentOwnedExposure: finiteOrNull(currentOwnedExposure),
+      riskApproved: boolInt(riskApproved),
+      riskReason: boundedText(riskReason, 500),
+      explanation: requiredString('explanation', boundedText(explanation, 700)),
+      warningsJson: asJson((warnings ?? []).map((w) => boundedText(w, 300)).filter(Boolean), []),
+    });
+  return { id: Number(run.lastInsertRowid) };
+}
+
+export function listEquitySizingDecisions(db, { day = null, session = null, limit = 100 } = {}) {
+  const cap = Number.parseInt(limit, 10) || 100;
+  if (session) {
+    const end = session.ended_at ?? new Date().toISOString();
+    return db
+      .prepare(
+        `SELECT *
+           FROM paper_equity_sizing_decisions
+          WHERE created_at >= ? AND created_at <= ?
+          ORDER BY id DESC
+          LIMIT ?`
+      )
+      .all(session.started_at, end, cap);
+  }
+  if (day) {
+    return db
+      .prepare(
+        `SELECT *
+           FROM paper_equity_sizing_decisions
+          WHERE substr(created_at, 1, 10) = ?
+          ORDER BY id DESC
+          LIMIT ?`
+      )
+      .all(requiredString('day', day), cap);
+  }
+  return db
+    .prepare(
+      `SELECT *
+         FROM paper_equity_sizing_decisions
+        ORDER BY id DESC
+        LIMIT ?`
+    )
+    .all(cap);
+}
+
+/** Bot-owned, broker-confirmed equity outcomes eligible for sizing evidence. */
+export function listBrokerConfirmedEquityOutcomes(db, { limit = 500 } = {}) {
+  return db
+    .prepare(
+      `SELECT
+          pt.id AS paper_trade_id,
+          pt.news_event_id,
+          pt.ticker,
+          pt.side,
+          pt.broker_filled_qty,
+          pt.broker_filled_avg_price,
+          pt.broker_realized_pnl_usd,
+          COALESCE(sd.model, s.model) AS model,
+          COALESCE(sd.prompt_version, s.prompt_version) AS prompt_version,
+          s.sentiment_score,
+          s.impact_score,
+          s.confidence,
+          COALESCE(sd.direction, s.direction) AS direction,
+          COALESCE(sd.news_type, s.news_type, n.news_type) AS news_type
+         FROM paper_trades pt
+         LEFT JOIN paper_equity_sizing_decisions sd
+           ON sd.paper_trade_id = pt.id AND sd.manual_override = 0
+         JOIN sentiment_scores s ON s.news_event_id = pt.news_event_id
+         LEFT JOIN news_events n ON n.id = pt.news_event_id
+        WHERE (pt.broker_order_id IS NOT NULL OR pt.trade_reason LIKE '%paper order %')
+          AND pt.news_event_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM paper_equity_sizing_decisions sm
+             WHERE sm.paper_trade_id = pt.id AND sm.manual_override = 1
+          )
+          AND (
+            sd.id IS NOT NULL OR
+            (SELECT COUNT(*) FROM sentiment_scores sx WHERE sx.news_event_id = pt.news_event_id) = 1
+          )
+          AND pt.status = 'closed'
+          AND pt.broker_truth_state IN ('filled','partially_filled','closed')
+          AND pt.broker_filled_qty IS NOT NULL
+          AND pt.broker_filled_qty > 0
+          AND pt.broker_filled_avg_price IS NOT NULL
+          AND pt.broker_filled_avg_price > 0
+          AND pt.broker_realized_pnl_usd IS NOT NULL
+        ORDER BY pt.id DESC
+        LIMIT ?`
+    )
+    .all(Number.parseInt(limit, 10) || 500);
+}
+
+/** Current bot-owned equity exposure by ticker/side from reconciled rows only. */
+export function getOwnedEquityExposureSnapshot(db, { limit = 500 } = {}) {
+  const rows = db
+    .prepare(
+      `SELECT ticker, side, broker_filled_qty, broker_filled_avg_price
+         FROM paper_trades
+        WHERE (broker_order_id IS NOT NULL OR trade_reason LIKE '%paper order %')
+          AND status = 'open'
+          AND broker_truth_state IN ('filled','partially_filled')
+          AND broker_filled_qty IS NOT NULL
+          AND broker_filled_qty > 0
+          AND broker_filled_avg_price IS NOT NULL
+          AND broker_filled_avg_price > 0
+        ORDER BY id DESC
+        LIMIT ?`
+    )
+    .all(Number.parseInt(limit, 10) || 500);
+  const byTickerSide = {};
+  let grossExposure = 0;
+  let openPositionCount = 0;
+  for (const row of rows) {
+    const ticker = String(row.ticker ?? '').trim().toUpperCase();
+    const side = String(row.side ?? '').trim();
+    const notional = Math.abs((Number(row.broker_filled_qty) || 0) * (Number(row.broker_filled_avg_price) || 0));
+    if (!ticker || !side || !(notional > 0)) continue;
+    const key = `${ticker}|${side}`;
+    byTickerSide[key] = (byTickerSide[key] ?? 0) + notional;
+    grossExposure += notional;
+    openPositionCount += 1;
+  }
+  return {
+    byTickerSide,
+    grossExposure,
+    openPositionCount,
+    dataQuality: 'broker_confirmed',
+  };
+}
+
+export function getPaperEventAttemptStats(db, eventId) {
+  const id = intOrNull(eventId);
+  if (!id || id <= 0) return { eventId: null, tradeAttempts: 0, rejectionAttempts: 0, totalAttempts: 0, duplicateAttempt: false };
+  const trades = db.prepare('SELECT COUNT(*) AS n FROM paper_trades WHERE news_event_id = ?').get(id)?.n ?? 0;
+  const rejections = db.prepare('SELECT COUNT(*) AS n FROM rejected_trades WHERE news_event_id = ?').get(id)?.n ?? 0;
+  const total = Number(trades) + Number(rejections);
+  return {
+    eventId: id,
+    tradeAttempts: Number(trades),
+    rejectionAttempts: Number(rejections),
+    totalAttempts: total,
+    duplicateAttempt: total > 0,
+  };
+}
+
 export function insertBrokerAccountSnapshot(
   db,
   {

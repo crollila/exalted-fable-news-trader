@@ -367,6 +367,59 @@ test('equity long EXECUTE defaults to learned cold-start target sizing when --qt
   closeDatabase(db);
 });
 
+test('learned MSFT target is not reduced to one share by implicit fixed-dollar order cap', async () => {
+  const db = freshDb();
+  seedScoredEvent(db, {
+    ticker: 'MSFT',
+    direction: 'up',
+    confidence: 0.6,
+    impact: 0.4666666667,
+    sentiment: 0.7,
+  });
+  const selected = selectRecentScoredEvent(db, { allowedSymbols: ['MSFT'] });
+  const client = fakePaperClient();
+  const account = marginAccount({
+    equity: 1_000_000,
+    portfolioValue: 1_000_000,
+    cash: 1_000_000,
+    buyingPower: 1_000_000,
+  });
+  const result = await runPaperTradeOnce(db, selected, {
+    paperClient: client,
+    allowedSymbols: ['MSFT'],
+    executePaper: true,
+    account,
+    capabilities: deriveCapabilities(account),
+    referencePrice: 371.35,
+    caps: {
+      maxSymbolExposure: 1_000_000,
+      maxGrossExposure: 1_000_000,
+      maxDailyPaperNotional: 1_000_000,
+    },
+  });
+
+  assert.equal(result.equity.decision, 'accepted');
+  assert.equal(result.equity.sizingDecision.requestedTargetWeight, 0.0044);
+  assert.equal(result.equity.sizingDecision.requestedQuantity, 11);
+  assert.equal(result.equity.proposal.quantity, 11);
+  assert.deepEqual(client.calls.equity[0], { symbol: 'MSFT', qty: 11, side: 'buy' });
+
+  const sizing = db.prepare('SELECT * FROM paper_equity_sizing_decisions WHERE paper_trade_id = ?').get(result.equity.paperTradeId);
+  const capReport = JSON.parse(sizing.effective_risk_caps_json);
+  assert.equal(sizing.requested_quantity, 11);
+  assert.equal(sizing.approved_quantity, 11);
+  assert.equal(capReport.orderCap.value, 10000);
+  assert.equal(capReport.orderCap.source, 'learned_max_weight_no_explicit_dollar_cap');
+  assert.equal(capReport.activeCaps.find((c) => c.key === 'maxOrderNotional').clamped, false);
+  assert.doesNotMatch(sizing.warnings_json, /clamped to 1/);
+
+  const reportText = buildPaperReport(result, selected).join('\n');
+  assert.match(reportText, /requested:\s+qty=11 notional=\$4084\.85 weight=0\.44%/);
+  assert.match(reportText, /approved:\s+qty=11 notional=\$4084\.85 weight=0\.41%/);
+  assert.match(reportText, /order cap: source=learned_max_weight_no_explicit_dollar_cap value=\$10000\.00/);
+  closeDatabase(db);
+});
+
 // --- fresh decision cycle orchestration -----------------------------------
 
 test('fresh ingest/classify/trade cycle reaches the fake PAPER submit client', async () => {

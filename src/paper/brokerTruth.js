@@ -407,11 +407,37 @@ export async function fetchAlignedBenchmarkPrice(
   priceSource,
   { ticker = 'SPY', targetAt, lookbackMinutes = BENCHMARK_LOOKBACK_MINUTES } = {}
 ) {
-  if (!priceSource) return { available: false, price: null, at: null, warning: `${ticker} benchmark price source unavailable` };
+  const unavailable = (reason, extra = {}) => ({
+    available: false,
+    price: null,
+    at: null,
+    targetAt: targetAt ?? null,
+    source: priceSource?.name ?? null,
+    alignmentStatus: 'unavailable',
+    unavailableReason: reason,
+    warning: reason,
+    ...extra,
+  });
+  if (!priceSource) return unavailable(`${ticker} benchmark price source unavailable`);
   const targetMs = Date.parse(targetAt);
-  if (!Number.isFinite(targetMs)) return { available: false, price: null, at: null, warning: `${ticker} benchmark target timestamp invalid` };
+  if (!Number.isFinite(targetMs)) return unavailable(`${ticker} benchmark target timestamp invalid`);
   const fromIso = iso(targetMs - lookbackMinutes * 60_000);
   const toIso = iso(targetMs);
+  const sourceName = priceSource.name ?? 'price_source';
+  const aligned = (trade, source, alignmentStatus) => ({
+    available: true,
+    price: Number(trade.price),
+    at: trade.at,
+    targetAt: toIso,
+    source,
+    alignmentStatus,
+    unavailableReason: null,
+    warning: null,
+    requestedFrom: fromIso,
+    requestedTo: toIso,
+  });
+
+  let historicalWarning = null;
   try {
     const trades = await priceSource.getTradesAround(ticker, fromIso, toIso);
     const eligible = (Array.isArray(trades) ? trades : [])
@@ -419,12 +445,53 @@ export async function fetchAlignedBenchmarkPrice(
       .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
     const latest = eligible[eligible.length - 1] ?? null;
     if (!latest) {
-      return { available: false, price: null, at: null, warning: `${ticker} benchmark unavailable at ${targetAt}` };
+      historicalWarning = `${ticker} benchmark unavailable in aligned historical window ending ${targetAt}`;
+    } else {
+      return aligned(latest, `${sourceName}.historical_trades`, latest.at === toIso ? 'exact_target' : 'latest_at_or_before_target');
     }
-    return { available: true, price: Number(latest.price), at: latest.at, warning: null };
   } catch (err) {
-    return { available: false, price: null, at: null, warning: `${ticker} benchmark unavailable: ${warningMessage(err)}` };
+    historicalWarning = `${ticker} benchmark historical window unavailable: ${warningMessage(err)}`;
   }
+
+  if (typeof priceSource.getLatestTrade === 'function') {
+    try {
+      const latest = await priceSource.getLatestTrade(ticker);
+      const latestMs = Date.parse(latest?.at);
+      const latestPrice = positiveNum(latest?.price);
+      if (latestPrice === null || !Number.isFinite(latestMs)) {
+        return unavailable(`${ticker} benchmark latest trade unavailable: malformed latest trade`, {
+          requestedFrom: fromIso,
+          requestedTo: toIso,
+        });
+      }
+      if (latestMs > targetMs) {
+        return unavailable(`${ticker} benchmark latest trade is after target timestamp (${latest.at} > ${targetAt})`, {
+          requestedFrom: fromIso,
+          requestedTo: toIso,
+          source: `${sourceName}.latest_trade`,
+        });
+      }
+      if (latestMs < Date.parse(fromIso)) {
+        return unavailable(`${ticker} benchmark latest trade is stale before aligned lookback window (${latest.at} < ${fromIso})`, {
+          requestedFrom: fromIso,
+          requestedTo: toIso,
+          source: `${sourceName}.latest_trade`,
+        });
+      }
+      return aligned(latest, `${sourceName}.latest_trade`, latest.at === toIso ? 'exact_target' : 'latest_at_or_before_target');
+    } catch (err) {
+      return unavailable(`${ticker} benchmark latest trade unavailable: ${warningMessage(err)}`, {
+        requestedFrom: fromIso,
+        requestedTo: toIso,
+        source: `${sourceName}.latest_trade`,
+      });
+    }
+  }
+
+  return unavailable(historicalWarning ?? `${ticker} benchmark unavailable at ${targetAt}`, {
+    requestedFrom: fromIso,
+    requestedTo: toIso,
+  });
 }
 
 function safeReturn(current, baseline) {
@@ -484,8 +551,26 @@ export async function recordPerformanceSnapshot(
   if (currentEquity === null) warnings.push('broker account return unavailable: broker equity unavailable');
   else if (baselineEquity === null) warnings.push('broker account return unavailable: broker baseline equity unavailable');
 
-  let spyBaseline = { available: false, price: null, at: null, warning: `${benchmarkTicker} benchmark baseline unavailable` };
-  let spyCurrent = { available: false, price: null, at: null, warning: `${benchmarkTicker} benchmark current unavailable` };
+  let spyBaseline = {
+    available: false,
+    price: null,
+    at: null,
+    targetAt: baseline?.snapshot_at ?? null,
+    source: null,
+    alignmentStatus: 'unavailable',
+    unavailableReason: `${benchmarkTicker} benchmark baseline unavailable`,
+    warning: `${benchmarkTicker} benchmark baseline unavailable`,
+  };
+  let spyCurrent = {
+    available: false,
+    price: null,
+    at: null,
+    targetAt: snapshotAt,
+    source: null,
+    alignmentStatus: 'unavailable',
+    unavailableReason: `${benchmarkTicker} benchmark current unavailable`,
+    warning: `${benchmarkTicker} benchmark current unavailable`,
+  };
   if (baseline?.snapshot_at) {
     spyBaseline = await fetchAlignedBenchmarkPrice(priceSource, { ticker: benchmarkTicker, targetAt: baseline.snapshot_at });
   }
@@ -513,8 +598,18 @@ export async function recordPerformanceSnapshot(
     brokerAccountReturnPct: brokerAccountReturn,
     spyBaselineAt: spyBaseline.at,
     spyBaselinePrice: spyBaseline.price,
+    spyBaselineTargetAt: spyBaseline.targetAt ?? baseline?.snapshot_at ?? null,
+    spyBaselineSource: spyBaseline.source ?? null,
+    spyBaselineAlignmentStatus: spyBaseline.alignmentStatus ?? null,
     spyCurrentAt: spyCurrent.at,
     spyCurrentPrice: spyCurrent.price,
+    spyCurrentTargetAt: spyCurrent.targetAt ?? snapshotAt,
+    spyCurrentSource: spyCurrent.source ?? null,
+    spyCurrentAlignmentStatus: spyCurrent.alignmentStatus ?? null,
+    spyUnavailableReason: [spyBaseline, spyCurrent]
+      .map((b) => b?.unavailableReason)
+      .filter(Boolean)
+      .join('; ') || null,
     spyReturnPct: spyReturn,
     brokerAccountExcessReturnPct: brokerAccountExcessReturn,
     botGrossExposure: exposure.grossExposure,
@@ -546,6 +641,10 @@ export async function recordPerformanceSnapshot(
     brokerAccountExcessReturn,
     spyBaseline,
     spyCurrent,
+    spyUnavailableReason: [spyBaseline, spyCurrent]
+      .map((b) => b?.unavailableReason)
+      .filter(Boolean)
+      .join('; ') || null,
     dataQuality,
     warnings,
   };
@@ -560,6 +659,11 @@ export function formatReturn(value) {
 function fmtMoney(value) {
   const n = numOrNull(value);
   return n === null ? 'unavailable' : `$${round2(n).toFixed(2)}`;
+}
+
+function benchmarkLegLine(label, leg = {}) {
+  return `${label}: target=${leg.targetAt ?? 'unavailable'} priceAt=${leg.at ?? 'unavailable'} ` +
+    `source=${leg.source ?? 'unavailable'} align=${leg.alignmentStatus ?? 'unavailable'}`;
 }
 
 export function formatBrokerTruthLines(performance) {
@@ -580,6 +684,9 @@ export function formatBrokerTruthLines(performance) {
     `  P&L:        broker-confirmed owned realized=${realized}`,
     `  session:    brokerAccount=${formatReturn(performance.brokerAccountReturn)} ` +
       `SPY=${formatReturn(performance.spyReturn)} accountExcess=${formatReturn(performance.brokerAccountExcessReturn)}`,
+    `  benchmark:  ${benchmarkLegLine('baseline', performance.spyBaseline)}`,
+    `  benchmark:  ${benchmarkLegLine('current', performance.spyCurrent)}`,
+    `  benchmark unavailable: ${performance.spyUnavailableReason ?? 'none'}`,
     `  ownedReturn:${performance.botReturnUnavailableReason ?? 'unavailable'}`,
     `  quality:    ${performance.dataQuality ?? 'limited'}`,
   ];
@@ -604,10 +711,35 @@ export function hydratePerformanceSnapshotRow(row) {
     botReturnUnavailableReason: 'unavailable: no bot-owned broker-confirmed capital baseline',
     spyBaselineAt: row.spy_baseline_at,
     spyBaselinePrice: row.spy_baseline_price,
+    spyBaselineTargetAt: row.spy_baseline_target_at,
+    spyBaselineSource: row.spy_baseline_source,
+    spyBaselineAlignmentStatus: row.spy_baseline_alignment_status,
     spyCurrentAt: row.spy_current_at,
     spyCurrentPrice: row.spy_current_price,
+    spyCurrentTargetAt: row.spy_current_target_at,
+    spyCurrentSource: row.spy_current_source,
+    spyCurrentAlignmentStatus: row.spy_current_alignment_status,
+    spyUnavailableReason: row.spy_unavailable_reason,
     spyReturn: row.spy_return_pct,
     brokerAccountExcessReturn: row.broker_account_excess_return_pct,
+    spyBaseline: {
+      available: row.spy_baseline_price !== null && row.spy_baseline_price !== undefined,
+      price: row.spy_baseline_price,
+      at: row.spy_baseline_at,
+      targetAt: row.spy_baseline_target_at,
+      source: row.spy_baseline_source,
+      alignmentStatus: row.spy_baseline_alignment_status,
+      unavailableReason: row.spy_baseline_price === null || row.spy_baseline_price === undefined ? row.spy_unavailable_reason : null,
+    },
+    spyCurrent: {
+      available: row.spy_current_price !== null && row.spy_current_price !== undefined,
+      price: row.spy_current_price,
+      at: row.spy_current_at,
+      targetAt: row.spy_current_target_at,
+      source: row.spy_current_source,
+      alignmentStatus: row.spy_current_alignment_status,
+      unavailableReason: row.spy_current_price === null || row.spy_current_price === undefined ? row.spy_unavailable_reason : null,
+    },
     exposure: {
       grossExposure: row.bot_gross_exposure,
       openPositionCount: row.bot_open_position_count,

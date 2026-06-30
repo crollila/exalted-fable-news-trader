@@ -237,7 +237,13 @@ test('buildEodReport renders persisted broker-truth performance and SPY benchmar
     brokerEquityCurrent: 10100,
     brokerAccountReturnPct: 0.01,
     spyBaselinePrice: 500,
+    spyBaselineTargetAt: '2026-06-18T14:00:00.000Z',
+    spyBaselineSource: 'alpaca_iex.historical_trades',
+    spyBaselineAlignmentStatus: 'exact_target',
     spyCurrentPrice: 502.5,
+    spyCurrentTargetAt: '2026-06-18T20:00:00.000Z',
+    spyCurrentSource: 'alpaca_iex.latest_trade',
+    spyCurrentAlignmentStatus: 'latest_at_or_before_target',
     spyReturnPct: 0.005,
     brokerAccountExcessReturnPct: 0.005,
     botGrossExposure: 201.5,
@@ -256,6 +262,9 @@ test('buildEodReport renders persisted broker-truth performance and SPY benchmar
   assert.match(text, /owned return:\s+unavailable/);
   assert.match(text, /SPY session return:\s+0\.50%/);
   assert.match(text, /account excess vs SPY:\s+0\.50%/);
+  assert.match(text, /SPY baseline source:\s+alpaca_iex\.historical_trades/);
+  assert.match(text, /SPY current source:\s+alpaca_iex\.latest_trade/);
+  assert.match(text, /SPY current alignment:.*status=latest_at_or_before_target/);
   closeDatabase(db);
 });
 
@@ -313,12 +322,33 @@ test('buildEodReport renders equity sizing decisions and cold-start warnings', (
     riskReason: 'approved: notional 500 within all caps',
     explanation: 'cold-start sizing: no comparable broker-confirmed outcomes yet',
     warnings: ['cold-start allocation used'],
+    effectiveRiskCaps: {
+      orderCap: {
+        source: 'learned_max_weight_no_explicit_dollar_cap',
+        value: 1000,
+        learnedPercentCap: 1000,
+        explicitDollarCap: null,
+      },
+      activeCaps: [
+        {
+          key: 'maxOrderNotional',
+          source: 'learned_max_weight_no_explicit_dollar_cap',
+          value: 1000,
+          remainingNotional: 1000,
+          allowedQuantity: 10,
+          clamped: false,
+        },
+      ],
+      clampReasons: [],
+    },
   });
   const text = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
   assert.match(text, /Equity sizing decisions \(PAPER equities only\)/);
   assert.match(text, /cold\/evidence\/abstain:\s+1 \/ 0 \/ 0/);
   assert.match(text, /AAPL buy cold_start/);
   assert.match(text, /requested=5 \(\$500\.00, 0\.75%\)/);
+  assert.match(text, /effective order cap: source=learned_max_weight_no_explicit_dollar_cap value=\$1000\.00/);
+  assert.match(text, /cap maxOrderNotional: source=learned_max_weight_no_explicit_dollar_cap value=\$1000\.00/);
   assert.match(text, /cold-start allocation used/);
   closeDatabase(db);
 });
@@ -413,10 +443,10 @@ test('buildEodReport renders sanitized sizing fixture variants truthfully', () =
   const text = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
   assert.match(text, /cold\/evidence\/abstain:\s+1 \/ 1 \/ 3/);
   assert.match(text, /manual --qty override:\s+1/);
-  assert.match(text, /AAPL buy cold_start .*requested=5 \(\$500\.00, 0\.75%\).*approved=5 \(\$500\.00\)/);
-  assert.match(text, /MSFT buy evidence_weighted .*requested=10 \(\$1000\.00, 1\.00%\).*approved=5 \(\$500\.00\)/);
-  assert.match(text, /TSLA buy abstain .*requested=0 \(unavailable, unavailable\).*approved=0 \(unavailable\)/);
-  assert.match(text, /NVDA buy manual_override .*requested=2 \(\$200\.00, 0\.20%\).*approved=2 \(\$200\.00\)/);
+  assert.match(text, /AAPL buy cold_start .*requested=5 \(\$500\.00, 0\.75%\).*approved=5 \(\$500\.00, 0\.50%\)/);
+  assert.match(text, /MSFT buy evidence_weighted .*requested=10 \(\$1000\.00, 1\.00%\).*approved=5 \(\$500\.00, 0\.50%\)/);
+  assert.match(text, /TSLA buy abstain .*requested=0 \(unavailable, unavailable\).*approved=0 \(unavailable, unavailable\)/);
+  assert.match(text, /NVDA buy manual_override .*requested=2 \(\$200\.00, 0\.20%\).*approved=2 \(\$200\.00, 0\.20%\)/);
   assert.match(text, /AMZN buy abstain .*reference price unavailable/);
   assert.match(text, /learned equity quantity 10 clamped to 5 by deterministic risk caps/);
   assert.match(text, /manual --qty override bypassed learned equity sizing/);

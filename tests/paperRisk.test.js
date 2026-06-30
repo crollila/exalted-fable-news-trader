@@ -2,7 +2,14 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assessRisk, clampEquityQuantityToCaps, resolveCaps, estimateNotional, DEFAULT_CAPS } from '../src/paper/paperRisk.js';
+import {
+  assessRisk,
+  clampEquityQuantityToCaps,
+  resolveCaps,
+  resolveLearnedEquityEffectiveCaps,
+  estimateNotional,
+  DEFAULT_CAPS,
+} from '../src/paper/paperRisk.js';
 import { deriveCapabilities } from '../src/paper/accountCapabilities.js';
 
 const margin = (over = {}) => ({
@@ -78,6 +85,107 @@ test('learned equity clamp lowers requested quantity before final risk approval'
   });
   assert.equal(approved.approved, true);
   assert.equal(approved.estNotional, 500);
+});
+
+test('learned equity effective order cap derives from max target weight unless explicit dollar cap is tighter', () => {
+  const implicit = resolveLearnedEquityEffectiveCaps({
+    caps: {},
+    account: margin({ equity: 1_000_000, portfolioValue: 1_000_000 }),
+    maxTargetWeight: 0.01,
+  });
+  assert.equal(implicit.caps.maxOrderNotional, 10_000);
+  assert.equal(implicit.capSources.maxOrderNotional.source, 'learned_max_weight_no_explicit_dollar_cap');
+
+  const explicitTighter = resolveLearnedEquityEffectiveCaps({
+    caps: { maxOrderNotional: 2500 },
+    account: margin({ equity: 1_000_000, portfolioValue: 1_000_000 }),
+    maxTargetWeight: 0.01,
+  });
+  assert.equal(explicitTighter.caps.maxOrderNotional, 2500);
+  assert.equal(explicitTighter.capSources.maxOrderNotional.source, 'explicit_dollar_cap_tighter_than_learned_max_weight');
+
+  const clamped = clampEquityQuantityToCaps({
+    proposal: longEquity({ ticker: 'MSFT', quantity: 11 }),
+    account: margin({ equity: 1_000_000, portfolioValue: 1_000_000, buyingPower: 1_000_000 }),
+    referencePrice: 371.35,
+    caps: {
+      ...implicit.caps,
+      maxSymbolExposure: 1_000_000,
+      maxGrossExposure: 1_000_000,
+      maxDailyPaperNotional: 1_000_000,
+    },
+    capSources: implicit.capSources,
+  });
+  assert.equal(clamped.quantity, 11);
+  assert.equal(clamped.capReport.find((c) => c.key === 'maxOrderNotional').source, 'learned_max_weight_no_explicit_dollar_cap');
+  assert.equal(clamped.capReport.find((c) => c.key === 'maxOrderNotional').clamped, false);
+});
+
+test('learned equity 0.44% target can size to about $4,400 unless an explicit $500 cap is present', () => {
+  const account = margin({
+    equity: 1_000_000,
+    portfolioValue: 1_000_000,
+    cash: 1_000_000,
+    buyingPower: 1_000_000,
+  });
+  const looseExposureCaps = {
+    maxSymbolExposure: 1_000_000,
+    maxGrossExposure: 1_000_000,
+    maxDailyPaperNotional: 1_000_000,
+  };
+  const learned = resolveLearnedEquityEffectiveCaps({
+    caps: looseExposureCaps,
+    account,
+    maxTargetWeight: 0.0044,
+  });
+  assert.equal(learned.caps.maxOrderNotional, 4400);
+  assert.equal(learned.capSources.maxOrderNotional.source, 'learned_max_weight_no_explicit_dollar_cap');
+
+  const learnedClamp = clampEquityQuantityToCaps({
+    proposal: longEquity({ ticker: 'MSFT', quantity: 100 }),
+    account,
+    referencePrice: 100,
+    caps: learned.caps,
+    capSources: learned.capSources,
+  });
+  assert.equal(learnedClamp.quantity, 44);
+  assert.equal(learnedClamp.capReport.find((c) => c.key === 'maxOrderNotional').remainingNotional, 4400);
+  const learnedApproval = assessRisk({
+    proposal: longEquity({ ticker: 'MSFT', quantity: learnedClamp.quantity }),
+    capabilities: cap(account),
+    account,
+    referencePrice: 100,
+    caps: learned.caps,
+    executePaper: true,
+  });
+  assert.equal(learnedApproval.approved, true);
+  assert.equal(learnedApproval.estNotional, 4400);
+
+  const explicit = resolveLearnedEquityEffectiveCaps({
+    caps: { ...looseExposureCaps, maxOrderNotional: 500 },
+    account,
+    maxTargetWeight: 0.0044,
+  });
+  assert.equal(explicit.caps.maxOrderNotional, 500);
+  assert.equal(explicit.capSources.maxOrderNotional.source, 'explicit_dollar_cap_tighter_than_learned_max_weight');
+  const explicitClamp = clampEquityQuantityToCaps({
+    proposal: longEquity({ ticker: 'MSFT', quantity: 100 }),
+    account,
+    referencePrice: 100,
+    caps: explicit.caps,
+    capSources: explicit.capSources,
+  });
+  assert.equal(explicitClamp.quantity, 5);
+  const explicitApproval = assessRisk({
+    proposal: longEquity({ ticker: 'MSFT', quantity: explicitClamp.quantity }),
+    capabilities: cap(account),
+    account,
+    referencePrice: 100,
+    caps: explicit.caps,
+    executePaper: true,
+  });
+  assert.equal(explicitApproval.approved, true);
+  assert.equal(explicitApproval.estNotional, 500);
 });
 
 test('rejects over --max-symbol-exposure given existing positions', () => {

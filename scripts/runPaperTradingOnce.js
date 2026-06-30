@@ -53,7 +53,13 @@ import { proposeOption, DEFAULT_OPTION_CONTRACT_LIMIT } from '../src/paper/optio
 import { enrichOptionProposal } from '../src/paper/optionContracts.js';
 import { entryLimitPrice, optionEntryBlocked } from '../src/paper/optionExits.js';
 import { reconcileBotOptions } from '../src/paper/optionMonitor.js';
-import { assessRisk, clampEquityQuantityToCaps, resolveCaps, DEFAULT_CAPS } from '../src/paper/paperRisk.js';
+import {
+  assessRisk,
+  clampEquityQuantityToCaps,
+  resolveCaps,
+  resolveLearnedEquityEffectiveCaps,
+  DEFAULT_CAPS,
+} from '../src/paper/paperRisk.js';
 import { deriveCapabilities, summarizeCapabilities } from '../src/paper/accountCapabilities.js';
 import {
   getOwnedEquityExposureSnapshot,
@@ -65,6 +71,7 @@ import {
 import {
   decideEquitySizing,
   formatSizingDecision,
+  resolveEquitySizingSettings,
   scoreBucket,
   SIZING_MODES,
 } from '../src/paper/equitySizing.js';
@@ -355,6 +362,45 @@ function round2(value) {
   return n === null ? null : Math.round(n * 100) / 100;
 }
 
+function money(value) {
+  const n = finiteNum(value);
+  return n === null ? 'unavailable' : `$${round2(n).toFixed(2)}`;
+}
+
+function pct(value) {
+  const n = finiteNum(value);
+  return n === null ? 'unavailable' : `${(n * 100).toFixed(2)}%`;
+}
+
+function approvedSizingValues(sub, result = {}) {
+  const qty = sub?.decision === 'accepted' ? Number(sub?.proposal?.quantity) || 0 : 0;
+  const notional =
+    sub?.risk?.estNotional !== null && sub?.risk?.estNotional !== undefined
+      ? finiteNum(sub.risk.estNotional)
+      : result?.referencePrice !== null && result?.referencePrice !== undefined
+        ? round2(qty * Number(result.referencePrice))
+        : null;
+  const equity = finiteNum(
+    sub?.sizingDecision?.diagnostics?.accountEquity ??
+    result?.capabilities?.equity
+  );
+  return {
+    qty,
+    notional,
+    weight: notional !== null && equity !== null && equity > 0 ? notional / equity : null,
+  };
+}
+
+function capReportLines(report = {}) {
+  const active = Array.isArray(report?.activeCaps) ? report.activeCaps : [];
+  return active.map((cap) => {
+    const used = cap.used === null || cap.used === undefined ? '' : ` used=${money(cap.used)}`;
+    return `    cap:       ${cap.key} source=${cap.source ?? 'unknown'} value=${money(cap.value)}${used} ` +
+      `remaining=${money(cap.remainingNotional)} allows=${cap.allowedQuantity ?? 'n/a'} ` +
+      `clamp=${cap.clamped ? 'yes' : 'no'} reason=${cap.reason ?? 'unavailable'}`;
+  });
+}
+
 function equitySignalFromProposal(proposal) {
   const score = proposal?.score ?? {};
   return {
@@ -408,6 +454,7 @@ function withSizingDecision(
     account = null,
     positions = [],
     caps = {},
+    capSources = {},
     daily = { orders: 0, notional: 0 },
     referencePrice = null,
     paperFeatures = DEFAULT_PAPER_FEATURES,
@@ -430,16 +477,45 @@ function withSizingDecision(
     account,
     positions,
     caps,
+    capSources,
     daily,
     referencePrice,
     marginEnabled: resolvePaperFeatures(paperFeatures).enableMargin,
   });
   const qty = clamp.quantity;
   const clampWarnings = [];
+  const hardQuantityCaps = [];
   if (cappedQty < requestedQty) {
-    clampWarnings.push(`learned quantity ${requestedQty} clamped to hard quantity cap ${maxQty}`);
+    const reason = `learned quantity ${requestedQty} clamped to hard quantity cap ${maxQty}`;
+    clampWarnings.push(reason);
+    hardQuantityCaps.push({
+      key: 'maxQuantity',
+      label: 'hard quantity cap',
+      source: 'MAX_QTY',
+      value: maxQty,
+      used: null,
+      remainingNotional: null,
+      allowedQuantity: cappedQty,
+      clamped: true,
+      reason,
+    });
   }
-  if (qty < cappedQty) clampWarnings.push(clamp.reason);
+  if (qty < cappedQty) {
+    const reasons = clamp.clampReasons?.length > 0 ? clamp.clampReasons : [clamp.reason];
+    clampWarnings.push(clamp.reason, ...reasons);
+  }
+  const orderCap = capSources.maxOrderNotional ?? null;
+  sizingDecision.effectiveRiskCaps = {
+    orderCap,
+    activeCaps: [...hardQuantityCaps, ...(clamp.capReport ?? [])],
+    clampReasons: clampWarnings,
+  };
+  if (orderCap) {
+    clampWarnings.unshift(
+      `effective order cap source=${orderCap.source} value=${money(orderCap.value)} ` +
+      `learnedPctCap=${money(orderCap.learnedPercentCap)} explicitDollarCap=${money(orderCap.explicitDollarCap)}`
+    );
+  }
   if (clampWarnings.length > 0) {
     sizingDecision.warnings = [
       ...(sizingDecision.warnings ?? []),
@@ -523,6 +599,7 @@ function insertSizingAuditIfPresent(db, sub, ctx) {
     riskReason,
     explanation,
     warnings,
+    effectiveRiskCaps: decision.effectiveRiskCaps ?? null,
   }).id;
 }
 
@@ -721,6 +798,10 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
     optionMaxPremium !== null && optionMaxPremium !== undefined
       ? { ...caps, maxOptionPremium: optionMaxPremium }
       : caps;
+  const normalizedSizingSettings = resolveEquitySizingSettings(sizingSettings);
+  let learnedEquityCapContext = null;
+  let equityCapsForRisk = effectiveCaps;
+  let equityCapSources = {};
   let resolvedAsset = asset;
 
   const result = {
@@ -758,13 +839,20 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
         currentOwnedExposure,
       });
     } else {
+      learnedEquityCapContext = resolveLearnedEquityEffectiveCaps({
+        caps: effectiveCaps,
+        account,
+        maxTargetWeight: normalizedSizingSettings.sizing_max_target_weight,
+      });
+      equityCapsForRisk = learnedEquityCapContext.caps;
+      equityCapSources = learnedEquityCapContext.capSources;
       equitySizingDecision = decideEquitySizing({
         signal: equitySignalFromProposal(equityProposal),
         referencePrice,
         account,
-        caps: resolveCaps(effectiveCaps),
+        caps: resolveCaps(equityCapsForRisk),
         daily,
-        settings: sizingSettings,
+        settings: normalizedSizingSettings,
         currentOwnedExposure,
         historicalOutcomes: historicalEquityOutcomes,
         duplicateAttempt: eventAttemptStats?.duplicateAttempt === true,
@@ -773,7 +861,8 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
       equityProposal = withSizingDecision(equityProposal, equitySizingDecision, {
         account,
         positions,
-        caps: effectiveCaps,
+        caps: equityCapsForRisk,
+        capSources: equityCapSources,
         daily,
         referencePrice,
         paperFeatures: features,
@@ -784,7 +873,7 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
     resolvedAsset = await fetchAssetState(paperClient, event?.ticker);
   }
   result.equity = await processProposal(db, equityProposal, {
-    kind: 'equity', capabilities, account, positions, caps: effectiveCaps, daily, referencePrice,
+    kind: 'equity', capabilities, account, positions, caps: equityCapsForRisk, daily, referencePrice,
     executePaper, paperClient, paperFeatures: features, asset: resolvedAsset,
     sizingDecision: equitySizingDecision,
     manualQtyOverride: qtyExplicit,
@@ -1161,7 +1250,7 @@ export function oneLineSummary(result) {
   return `${eqTxt}; ${opTxt}`;
 }
 
-function subLines(label, sub) {
+function subLines(label, sub, result = {}) {
   if (!sub) return [];
   if (sub.decision === 'disabled') return [`  ${label}:     disabled (--allow-options not set)`];
   const p = sub.proposal;
@@ -1177,10 +1266,26 @@ function subLines(label, sub) {
   }
   if (label === 'equity' && sub.sizingDecision) {
     const approvedQty = sub.decision === 'accepted' ? p.quantity : 0;
+    const approved = approvedSizingValues(sub, result);
+    const requestedQty = sub.sizingDecision.requestedQuantity ?? 0;
+    const requestedNotional = sub.sizingDecision.requestedNotional;
+    const requestedWeight = sub.sizingDecision.requestedTargetWeight;
+    const caps = sub.sizingDecision.effectiveRiskCaps ?? {};
     lines.push(
       `    sizing:    ${sub.manualQtyOverride ? 'manual --qty override' : formatSizingDecision(sub.sizingDecision)}`,
-      `    approved:  qty=${approvedQty} audit=${sub.sizingAuditId ?? 'pending'}`
+      `    requested: qty=${requestedQty} notional=${money(requestedNotional)} weight=${pct(requestedWeight)}`,
+      `    approved:  qty=${approvedQty} notional=${money(approved.notional)} weight=${pct(approved.weight)} audit=${sub.sizingAuditId ?? 'pending'}`
     );
+    if (caps.orderCap) {
+      lines.push(
+        `    order cap: source=${caps.orderCap.source ?? 'unknown'} value=${money(caps.orderCap.value)} ` +
+        `learnedPct=${money(caps.orderCap.learnedPercentCap)} explicitDollar=${money(caps.orderCap.explicitDollarCap)}`
+      );
+    }
+    lines.push(...capReportLines(caps));
+    for (const reason of (caps.clampReasons ?? []).slice(0, 5)) {
+      lines.push(`    clamp:    ${reason}`);
+    }
     if (sub.sizingDecision.warnings?.length > 0) {
       lines.push(`    sizing warnings: ${sub.sizingDecision.warnings.slice(0, 3).join('; ')}`);
     }
@@ -1211,8 +1316,8 @@ export function buildPaperReport(result, selected) {
       `dir=${s.direction ?? '?'} status=${s.parserStatus ?? '?'} ` +
       `sentiment=${s.sentiment ?? '?'} impact=${s.impact ?? '?'} confidence=${s.confidence ?? '?'}`,
   ];
-  lines.push(...subLines('equity', result.equity));
-  lines.push(...subLines('option', result.option));
+  lines.push(...subLines('equity', result.equity, result));
+  lines.push(...subLines('option', result.option, result));
   if (result.mode === 'dry_run') {
     lines.push('  (DRY RUN — pass --execute-paper to actually submit PAPER orders)');
   }

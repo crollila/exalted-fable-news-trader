@@ -437,6 +437,7 @@ export function insertEquitySizingDecision(
     riskReason = null,
     explanation,
     warnings = [],
+    effectiveRiskCaps = null,
   } = {}
 ) {
   const mode = SIZING_MODES.has(String(sizingMode)) ? String(sizingMode) : 'abstain';
@@ -454,7 +455,7 @@ export function insertEquitySizingDecision(
           requested_quantity, approved_target_weight, approved_notional,
           approved_quantity, reference_price, account_equity,
           current_owned_exposure, risk_approved, risk_reason, explanation,
-          warnings_json)
+          warnings_json, effective_risk_caps_json)
        VALUES
          (@paperTradeId, @rejectedTradeId, @newsEventId, @ticker, @side,
           @manualOverride, @sizingMode, @evidenceTier, @evidenceCount,
@@ -463,7 +464,7 @@ export function insertEquitySizingDecision(
           @requestedQuantity, @approvedTargetWeight, @approvedNotional,
           @approvedQuantity, @referencePrice, @accountEquity,
           @currentOwnedExposure, @riskApproved, @riskReason, @explanation,
-          @warningsJson)`
+          @warningsJson, @effectiveRiskCapsJson)`
     )
     .run({
       paperTradeId: intOrNull(paperTradeId),
@@ -494,6 +495,7 @@ export function insertEquitySizingDecision(
       riskReason: boundedText(riskReason, 500),
       explanation: requiredString('explanation', boundedText(explanation, 700)),
       warningsJson: asJson((warnings ?? []).map((w) => boundedText(w, 300)).filter(Boolean), []),
+      effectiveRiskCapsJson: effectiveRiskCaps ? asJson(effectiveRiskCaps, {}) : null,
     });
   return { id: Number(run.lastInsertRowid) };
 }
@@ -730,8 +732,15 @@ export function insertStrategyPerformanceSnapshot(
     brokerAccountReturnPct = null,
     spyBaselineAt = null,
     spyBaselinePrice = null,
+    spyBaselineTargetAt = null,
+    spyBaselineSource = null,
+    spyBaselineAlignmentStatus = null,
     spyCurrentAt = null,
     spyCurrentPrice = null,
+    spyCurrentTargetAt = null,
+    spyCurrentSource = null,
+    spyCurrentAlignmentStatus = null,
+    spyUnavailableReason = null,
     spyReturnPct = null,
     brokerAccountExcessReturnPct = null,
     botGrossExposure = null,
@@ -761,6 +770,10 @@ export function insertStrategyPerformanceSnapshot(
           snapshot_at, snapshot_kind, broker_equity_baseline, broker_equity_current,
           broker_portfolio_value_current, broker_account_return_pct,
           spy_baseline_at, spy_baseline_price, spy_current_at, spy_current_price,
+          spy_baseline_target_at, spy_current_target_at,
+          spy_baseline_source, spy_current_source,
+          spy_baseline_alignment_status, spy_current_alignment_status,
+          spy_unavailable_reason,
           spy_return_pct, broker_account_excess_return_pct, bot_gross_exposure,
           bot_realized_pnl_usd, bot_open_position_count, bot_orders_submitted, bot_orders_filled,
           bot_orders_open, bot_orders_canceled, bot_orders_rejected,
@@ -770,6 +783,10 @@ export function insertStrategyPerformanceSnapshot(
           @snapshotAt, @snapshotKind, @brokerEquityBaseline, @brokerEquityCurrent,
           @brokerPortfolioValueCurrent, @brokerAccountReturnPct,
           @spyBaselineAt, @spyBaselinePrice, @spyCurrentAt, @spyCurrentPrice,
+          @spyBaselineTargetAt, @spyCurrentTargetAt,
+          @spyBaselineSource, @spyCurrentSource,
+          @spyBaselineAlignmentStatus, @spyCurrentAlignmentStatus,
+          @spyUnavailableReason,
           @spyReturnPct, @brokerAccountExcessReturnPct, @botGrossExposure,
           @botRealizedPnlUsd, @botOpenPositionCount, @botOrdersSubmitted, @botOrdersFilled,
           @botOrdersOpen, @botOrdersCanceled, @botOrdersRejected,
@@ -787,8 +804,15 @@ export function insertStrategyPerformanceSnapshot(
       brokerAccountReturnPct: finiteOrNull(brokerAccountReturnPct),
       spyBaselineAt,
       spyBaselinePrice: finiteOrNull(spyBaselinePrice),
+      spyBaselineTargetAt,
+      spyBaselineSource,
+      spyBaselineAlignmentStatus,
       spyCurrentAt,
       spyCurrentPrice: finiteOrNull(spyCurrentPrice),
+      spyCurrentTargetAt,
+      spyCurrentSource,
+      spyCurrentAlignmentStatus,
+      spyUnavailableReason,
       spyReturnPct: finiteOrNull(spyReturnPct),
       brokerAccountExcessReturnPct: finiteOrNull(brokerAccountExcessReturnPct),
       botGrossExposure: finiteOrNull(botGrossExposure),

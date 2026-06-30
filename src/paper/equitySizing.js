@@ -104,6 +104,10 @@ function normalizedSettings(settings = {}) {
   };
 }
 
+export function resolveEquitySizingSettings(settings = {}) {
+  return normalizedSettings(settings);
+}
+
 function baseDecision(overrides = {}) {
   const mode = VALID_MODES.has(overrides.mode) ? overrides.mode : SIZING_MODES.ABSTAIN;
   return {

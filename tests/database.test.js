@@ -50,6 +50,20 @@ function insertNewsEvent(db, overrides = {}) {
     .run(row);
 }
 
+function applyMigrationVersions(db, versions) {
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+  `);
+  for (const version of versions) {
+    const sql = fs.readFileSync(new URL(`../src/database/migrations/${version}.sql`, import.meta.url), 'utf8');
+    db.exec(sql);
+    db.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(version);
+  }
+}
+
 // --- migrations -------------------------------------------------------------
 
 test('migration runs successfully and creates all required tables', () => {
@@ -76,23 +90,14 @@ test('migration is idempotent (second run applies nothing)', () => {
 
 test('migration 004 upgrades an existing database that already applied 001-003', () => {
   const db = openMemoryDatabase();
-  db.exec(`
-    CREATE TABLE schema_migrations (
-      version TEXT PRIMARY KEY,
-      applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-    );
-  `);
-  for (const version of ['001_initial', '002_sentiment_scores_phase3', '003_price_reactions_event_study']) {
-    const sql = fs.readFileSync(new URL(`../src/database/migrations/${version}.sql`, import.meta.url), 'utf8');
-    db.exec(sql);
-    db.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(version);
-  }
+  applyMigrationVersions(db, ['001_initial', '002_sentiment_scores_phase3', '003_price_reactions_event_study']);
   const result = runMigrations(db);
   assert.deepEqual(result.applied, [
     '004_paper_runtime_research',
     '005_paper_option_execution',
     '006_paper_broker_truth_performance',
     '007_paper_equity_sizing_decisions',
+    '008_paper_cap_and_benchmark_metadata',
   ]);
   const tables = listTables(db);
   assert.ok(tables.includes('paper_option_trades'));
@@ -113,6 +118,66 @@ test('migration 004 upgrades an existing database that already applied 001-003',
   assert.ok(sizingCols.includes('requested_target_weight'));
   assert.ok(sizingCols.includes('approved_quantity'));
   assert.ok(sizingCols.includes('manual_override'));
+  assert.ok(sizingCols.includes('effective_risk_caps_json'));
+  const perfCols = db.prepare("PRAGMA table_info('paper_strategy_performance_snapshots')").all().map((c) => c.name);
+  assert.ok(perfCols.includes('spy_current_source'));
+  assert.ok(perfCols.includes('spy_current_alignment_status'));
+  closeDatabase(db);
+});
+
+test('migration 008 preserves existing paper records and leaves new metadata nullable', () => {
+  const db = openMemoryDatabase();
+  applyMigrationVersions(db, [
+    '001_initial',
+    '002_sentiment_scores_phase3',
+    '003_price_reactions_event_study',
+    '004_paper_runtime_research',
+    '005_paper_option_execution',
+    '006_paper_broker_truth_performance',
+    '007_paper_equity_sizing_decisions',
+  ]);
+  const sessionId = db
+    .prepare(
+      `INSERT INTO paper_runtime_sessions (session_date, started_at, status)
+       VALUES ('2026-06-18', '2026-06-18T13:30:00.000Z', 'open')`
+    )
+    .run().lastInsertRowid;
+  db
+    .prepare(
+      `INSERT INTO paper_strategy_performance_snapshots
+         (runtime_session_id, snapshot_at, snapshot_kind, data_quality, warnings_json)
+       VALUES
+         (?, '2026-06-18T14:00:00.000Z', 'loop', 'limited', '[]')`
+    )
+    .run(sessionId);
+  db
+    .prepare(
+      `INSERT INTO paper_equity_sizing_decisions
+         (ticker, side, sizing_mode, evidence_count, evidence_quality, explanation, warnings_json)
+       VALUES
+         ('AAPL', 'buy', 'cold_start', 0, 'limited', 'existing row before 008', '[]')`
+    )
+    .run();
+
+  const result = runMigrations(db);
+  assert.deepEqual(result.applied, ['008_paper_cap_and_benchmark_metadata']);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_runtime_sessions').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_strategy_performance_snapshots').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_equity_sizing_decisions').get().n, 1);
+  const sizing = db.prepare('SELECT effective_risk_caps_json FROM paper_equity_sizing_decisions').get();
+  assert.equal(sizing.effective_risk_caps_json, null);
+  const perf = db
+    .prepare(
+      `SELECT spy_baseline_target_at, spy_current_target_at, spy_baseline_source,
+              spy_current_source, spy_unavailable_reason
+         FROM paper_strategy_performance_snapshots`
+    )
+    .get();
+  assert.equal(perf.spy_baseline_target_at, null);
+  assert.equal(perf.spy_current_target_at, null);
+  assert.equal(perf.spy_baseline_source, null);
+  assert.equal(perf.spy_current_source, null);
+  assert.equal(perf.spy_unavailable_reason, null);
   closeDatabase(db);
 });
 

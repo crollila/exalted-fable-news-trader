@@ -9,6 +9,7 @@ import {
   calculateBotStrategyExposure,
   classifyBrokerOrderState,
   fetchAlignedBenchmarkPrice,
+  formatBrokerTruthLines,
   reconcileBrokerTruth,
   recordPerformanceSnapshot,
 } from '../src/paper/brokerTruth.js';
@@ -61,14 +62,22 @@ function fakePaperClient({ orders = {}, positions = [], account = null, position
   };
 }
 
-function fakePriceSource(tradesByTicker = {}) {
-  return {
-    name: 'fixture',
+function fakePriceSource(tradesByTicker = {}, { latestByTicker = null, name = 'fixture' } = {}) {
+  const source = {
+    name,
     getTradesAround: async (ticker, fromIso, toIso) =>
       (tradesByTicker[String(ticker).toUpperCase()] ?? [])
         .filter((t) => t.at >= fromIso && t.at <= toIso)
         .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0)),
   };
+  if (latestByTicker) {
+    source.getLatestTrade = async (ticker) => {
+      const trade = latestByTicker[String(ticker).toUpperCase()];
+      if (!trade) throw new Error(`latest missing ${ticker}`);
+      return trade;
+    };
+  }
+  return source;
 }
 
 test('classifyBrokerOrderState recognizes paper order transitions', () => {
@@ -208,10 +217,14 @@ test('recordPerformanceSnapshot aligns broker account return and SPY return on s
   assert.equal(second.botReturn, null);
   assert.equal(second.spyReturn, 0.01);
   assert.equal(second.brokerAccountExcessReturn, 0);
+  assert.equal(second.spyBaseline.source, 'fixture.historical_trades');
+  assert.equal(second.spyCurrent.alignmentStatus, 'exact_target');
   assert.equal(second.exposure.grossExposure, 100);
   const latest = db.prepare('SELECT * FROM paper_strategy_performance_snapshots ORDER BY id DESC LIMIT 1').get();
   assert.equal(latest.broker_account_return_pct, 0.01);
   assert.equal(latest.spy_return_pct, 0.01);
+  assert.equal(latest.spy_current_source, 'fixture.historical_trades');
+  assert.equal(latest.spy_current_alignment_status, 'exact_target');
   closeDatabase(db);
 });
 
@@ -356,4 +369,109 @@ test('fetchAlignedBenchmarkPrice uses the latest trade at or before the target t
   assert.equal(price.available, true);
   assert.equal(price.price, 500);
   assert.equal(price.at, '2026-06-18T14:00:00.000Z');
+  assert.equal(price.source, 'fixture.historical_trades');
+  assert.equal(price.alignmentStatus, 'exact_target');
+});
+
+test('fetchAlignedBenchmarkPrice falls back to read-only latest trade when historical window is unavailable', async () => {
+  const source = {
+    name: 'alpaca_iex',
+    getTradesAround: async () => {
+      throw new Error('HTTP 403 too recent');
+    },
+    getLatestTrade: async () => ({ price: 505, at: '2026-06-18T14:59:58.000Z' }),
+  };
+  const price = await fetchAlignedBenchmarkPrice(source, {
+    ticker: 'SPY',
+    targetAt: '2026-06-18T15:00:00.000Z',
+  });
+
+  assert.equal(price.available, true);
+  assert.equal(price.price, 505);
+  assert.equal(price.source, 'alpaca_iex.latest_trade');
+  assert.equal(price.alignmentStatus, 'latest_at_or_before_target');
+  assert.equal(price.targetAt, '2026-06-18T15:00:00.000Z');
+});
+
+test('fetchAlignedBenchmarkPrice refuses latest trades after the aligned target timestamp', async () => {
+  const source = fakePriceSource({ SPY: [] }, {
+    latestByTicker: {
+      SPY: { price: 506, at: '2026-06-18T15:00:01.000Z' },
+    },
+    name: 'alpaca_iex',
+  });
+  const price = await fetchAlignedBenchmarkPrice(source, {
+    ticker: 'SPY',
+    targetAt: '2026-06-18T15:00:00.000Z',
+  });
+
+  assert.equal(price.available, false);
+  assert.equal(price.price, null);
+  assert.equal(price.alignmentStatus, 'unavailable');
+  assert.match(price.unavailableReason, /after target timestamp/);
+});
+
+test('fetchAlignedBenchmarkPrice rejects stale latest fallback outside the documented lookback window', async () => {
+  const source = {
+    name: 'alpaca_iex',
+    getTradesAround: async () => {
+      throw new Error('HTTP 403 too recent');
+    },
+    getLatestTrade: async () => ({ price: 499, at: '2026-06-18T13:59:59.000Z' }),
+  };
+  const price = await fetchAlignedBenchmarkPrice(source, {
+    ticker: 'SPY',
+    targetAt: '2026-06-18T15:00:00.000Z',
+  });
+
+  assert.equal(price.available, false);
+  assert.equal(price.price, null);
+  assert.equal(price.requestedFrom, '2026-06-18T14:00:00.000Z');
+  assert.equal(price.requestedTo, '2026-06-18T15:00:00.000Z');
+  assert.equal(price.source, 'alpaca_iex.latest_trade');
+  assert.match(price.unavailableReason, /stale before aligned lookback window/);
+});
+
+test('fetchAlignedBenchmarkPrice returns unavailable when no historical or latest benchmark trade exists', async () => {
+  const price = await fetchAlignedBenchmarkPrice(fakePriceSource({ SPY: [] }), {
+    ticker: 'SPY',
+    targetAt: '2026-06-18T15:00:00.000Z',
+  });
+
+  assert.equal(price.available, false);
+  assert.equal(price.price, null);
+  assert.equal(price.at, null);
+  assert.equal(price.source, 'fixture');
+  assert.equal(price.alignmentStatus, 'unavailable');
+  assert.match(price.unavailableReason, /unavailable in aligned historical window/);
+});
+
+test('formatBrokerTruthLines prints benchmark unavailable reason explicitly', () => {
+  const lines = formatBrokerTruthLines({
+    broker: { orders: { submitted: 0, filled: 0, open: 0, canceled: 0, rejected: 0, expired: 0, replaced: 0 } },
+    exposure: { grossExposure: 0, openPositionCount: 0, realizedPnlUsd: null },
+    brokerAccountReturn: 0,
+    spyReturn: null,
+    brokerAccountExcessReturn: null,
+    spyBaseline: {
+      targetAt: '2026-06-18T14:00:00.000Z',
+      at: null,
+      source: 'alpaca_iex.latest_trade',
+      alignmentStatus: 'unavailable',
+    },
+    spyCurrent: {
+      targetAt: '2026-06-18T15:00:00.000Z',
+      at: null,
+      source: 'alpaca_iex.latest_trade',
+      alignmentStatus: 'unavailable',
+    },
+    spyUnavailableReason: 'SPY benchmark latest trade is stale before aligned lookback window',
+    botReturnUnavailableReason: 'unavailable',
+    dataQuality: 'limited',
+    warnings: [],
+  });
+
+  const text = lines.join('\n');
+  assert.match(text, /benchmark:\s+baseline: target=2026-06-18T14:00:00\.000Z priceAt=unavailable/);
+  assert.match(text, /benchmark unavailable: SPY benchmark latest trade is stale before aligned lookback window/);
 });

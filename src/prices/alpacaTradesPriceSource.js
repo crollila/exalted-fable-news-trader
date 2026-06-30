@@ -8,6 +8,7 @@
 //
 // Verified API (docs.alpaca.markets, 2026-06):
 //   GET https://data.alpaca.markets/v2/stocks/{symbol}/trades
+//   GET https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest
 //   headers: APCA-API-KEY-ID / APCA-API-SECRET-KEY (same pair as news)
 //   params:  start, end (RFC-3339, whole seconds), limit (<=10000),
 //            feed ('iex' is the only no-subscription feed), page_token
@@ -107,8 +108,8 @@ export function createAlpacaTradesPriceSource(
   const doFetch = httpFetch ?? globalThis.fetch;
 
   /** Fetch one page; returns the parsed payload. Sanitized errors only. */
-  async function fetchPage(symbol, params) {
-    const url = new URL(`${baseUrl}/${encodeURIComponent(symbol)}/trades`);
+  async function fetchJson(path, params) {
+    const url = new URL(`${baseUrl}${path}`);
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
@@ -153,6 +154,11 @@ export function createAlpacaTradesPriceSource(
       throw new Error('alpacaTradesPriceSource: unexpected payload shape (trades is not an array)');
     }
     return payload;
+  }
+
+  /** Fetch one historical page; returns the parsed payload. */
+  async function fetchPage(symbol, params) {
+    return fetchJson(`/${encodeURIComponent(symbol)}/trades`, params);
   }
 
   /** Map one raw item to a Trade, or null if the item is malformed. */
@@ -233,5 +239,19 @@ export function createAlpacaTradesPriceSource(
     return trades;
   }
 
-  return { name: `alpaca_${feed}`, getTradesAround };
+  async function getLatestTrade(ticker) {
+    const symbol = String(ticker ?? '').trim().toUpperCase();
+    if (!symbol) {
+      throw new Error('alpacaTradesPriceSource: ticker must be a non-empty string');
+    }
+    const payload = await fetchJson(`/${encodeURIComponent(symbol)}/trades/latest`, { feed });
+    const raw = payload?.trade ?? payload?.trades?.[symbol] ?? null;
+    const trade = mapTrade(raw);
+    if (!trade) {
+      throw new Error('alpacaTradesPriceSource: latest trade payload was missing or malformed');
+    }
+    return trade;
+  }
+
+  return { name: `alpaca_${feed}`, getTradesAround, getLatestTrade };
 }

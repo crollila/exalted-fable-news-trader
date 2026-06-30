@@ -27,6 +27,16 @@ function num(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function numOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function posNumOrNull(value) {
+  const n = numOrNull(value);
+  return n !== null && n > 0 ? n : null;
+}
+
 /** Merge caller caps over the conservative defaults. */
 export function resolveCaps(caps = {}) {
   return {
@@ -41,6 +51,71 @@ export function resolveCaps(caps = {}) {
 
 function round2(n) {
   return n === null || n === undefined ? null : Math.round(Number(n) * 100) / 100;
+}
+
+function hasOwnCap(caps, key) {
+  return Object.prototype.hasOwnProperty.call(caps ?? {}, key);
+}
+
+function capSourceLabel(source) {
+  return String(source ?? 'default').replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 80);
+}
+
+/**
+ * Resolve learned-equity caps before final risk assessment. The key alignment
+ * rule is that the legacy/default fixed-dollar order cap is not allowed to be
+ * the hidden limiter for a valid portfolio-weight target. Explicit user caps
+ * still apply, and the learned max target weight remains the hard percentage
+ * ceiling.
+ */
+export function resolveLearnedEquityEffectiveCaps({
+  caps = {},
+  account = null,
+  maxTargetWeight = null,
+} = {}) {
+  const resolved = resolveCaps(caps);
+  const accountEquity = posNumOrNull(account?.equity ?? account?.portfolioValue);
+  const weight = posNumOrNull(maxTargetWeight);
+  const learnedPctCap =
+    accountEquity !== null && weight !== null
+      ? Math.round(accountEquity * weight * 100) / 100
+      : null;
+  const explicitOrderCap = hasOwnCap(caps, 'maxOrderNotional')
+    ? posNumOrNull(caps.maxOrderNotional)
+    : null;
+
+  let effectiveOrderCap = resolved.maxOrderNotional;
+  let orderCapSource = 'default_fixed_dollar';
+  if (learnedPctCap !== null && explicitOrderCap !== null) {
+    if (explicitOrderCap <= learnedPctCap) {
+      effectiveOrderCap = explicitOrderCap;
+      orderCapSource = 'explicit_dollar_cap_tighter_than_learned_max_weight';
+    } else {
+      effectiveOrderCap = learnedPctCap;
+      orderCapSource = 'learned_max_weight_tighter_than_explicit_dollar_cap';
+    }
+  } else if (learnedPctCap !== null) {
+    effectiveOrderCap = learnedPctCap;
+    orderCapSource = 'learned_max_weight_no_explicit_dollar_cap';
+  } else if (explicitOrderCap !== null) {
+    effectiveOrderCap = explicitOrderCap;
+    orderCapSource = 'explicit_dollar_cap';
+  }
+
+  return {
+    caps: { ...resolved, maxOrderNotional: effectiveOrderCap },
+    capSources: {
+      maxOrderNotional: {
+        source: orderCapSource,
+        value: round2(effectiveOrderCap),
+        accountEquity: round2(accountEquity),
+        maxTargetWeight: weight,
+        learnedPercentCap: round2(learnedPctCap),
+        explicitDollarCap: round2(explicitOrderCap),
+        defaultDollarCap: DEFAULT_CAPS.maxOrderNotional,
+      },
+    },
+  };
 }
 
 /**
@@ -74,39 +149,106 @@ export function clampEquityQuantityToCaps({
   account = null,
   positions = [],
   caps = {},
+  capSources = {},
   daily = { orders: 0, notional: 0 },
   referencePrice = null,
   marginEnabled = true,
 } = {}) {
   const c = resolveCaps(caps);
   const requestedQuantity = Math.max(0, Math.floor(Number(proposal?.quantity) || 0));
+  const capReport = [];
+  const clampReasons = [];
   const out = (quantity, reason) => ({
     quantity,
     requestedQuantity,
     clamped: quantity < requestedQuantity,
     reason,
     caps: c,
+    capReport,
+    clampReasons,
   });
   if (proposal?.assetClass !== 'equity' || requestedQuantity <= 0) {
     return out(requestedQuantity, 'not an equity quantity clamp candidate');
   }
   if (referencePrice === null || referencePrice === undefined || !Number.isFinite(Number(referencePrice)) || Number(referencePrice) <= 0) {
-    return out(0, 'reference price unavailable for risk-cap quantity clamp');
+    const reason = 'reference price unavailable for risk-cap quantity clamp';
+    clampReasons.push(reason);
+    capReport.push({
+      key: 'referencePrice',
+      label: 'reference price',
+      source: 'market_data',
+      value: null,
+      remainingNotional: null,
+      allowedQuantity: 0,
+      clamped: requestedQuantity > 0,
+      reason,
+    });
+    return out(0, reason);
   }
   if ((daily?.orders ?? 0) >= c.maxDailyPaperOrders) {
-    return out(0, `daily paper order cap reached (${c.maxDailyPaperOrders})`);
+    const reason = `daily paper order cap reached (${c.maxDailyPaperOrders})`;
+    clampReasons.push(reason);
+    capReport.push({
+      key: 'maxDailyPaperOrders',
+      label: 'daily paper order count',
+      source: 'maxDailyPaperOrders',
+      value: c.maxDailyPaperOrders,
+      used: Number(daily?.orders ?? 0),
+      remaining: 0,
+      remainingNotional: 0,
+      allowedQuantity: 0,
+      clamped: true,
+      reason,
+    });
+    return out(0, reason);
   }
 
   const candidates = [requestedQuantity];
-  const addNotionalLimit = (label, notional) => {
+  const addNotionalLimit = (key, label, notional, { source = key, capValue = notional, used = null } = {}) => {
     const shares = wholeSharesForNotional(notional, referencePrice);
-    if (shares !== null) candidates.push(shares);
+    if (shares === null) return;
+    candidates.push(shares);
+    const clamped = shares < requestedQuantity;
+    const cleanLabel = String(label);
+    const reason = clamped
+      ? `${cleanLabel} cap allows ${shares} share(s) at reference price $${round2(referencePrice)?.toFixed(2)}`
+      : `${cleanLabel} cap allows requested quantity (${requestedQuantity} share(s))`;
+    const report = {
+      key,
+      label: cleanLabel,
+      source: capSourceLabel(source),
+      value: round2(capValue),
+      used: round2(used),
+      remainingNotional: round2(notional),
+      allowedQuantity: shares,
+      clamped,
+      reason,
+    };
+    capReport.push(report);
+    if (clamped) clampReasons.push(reason);
   };
 
-  addNotionalLimit('max order notional', c.maxOrderNotional);
-  addNotionalLimit('remaining daily paper notional', c.maxDailyPaperNotional - (daily?.notional ?? 0));
-  addNotionalLimit('remaining symbol exposure', c.maxSymbolExposure - symbolExposure(positions, proposal.ticker));
-  addNotionalLimit('remaining gross exposure', c.maxGrossExposure - grossExposure(positions));
+  addNotionalLimit('maxOrderNotional', 'max order notional', c.maxOrderNotional, {
+    source: capSources.maxOrderNotional?.source ?? 'maxOrderNotional',
+    capValue: c.maxOrderNotional,
+  });
+  addNotionalLimit('maxDailyPaperNotional', 'remaining daily paper notional', c.maxDailyPaperNotional - (daily?.notional ?? 0), {
+    source: 'maxDailyPaperNotional',
+    capValue: c.maxDailyPaperNotional,
+    used: daily?.notional ?? 0,
+  });
+  const currentSymbolExposure = symbolExposure(positions, proposal.ticker);
+  addNotionalLimit('maxSymbolExposure', 'remaining symbol exposure', c.maxSymbolExposure - currentSymbolExposure, {
+    source: 'maxSymbolExposure',
+    capValue: c.maxSymbolExposure,
+    used: currentSymbolExposure,
+  });
+  const currentGrossExposure = grossExposure(positions);
+  addNotionalLimit('maxGrossExposure', 'remaining gross exposure', c.maxGrossExposure - currentGrossExposure, {
+    source: 'maxGrossExposure',
+    capValue: c.maxGrossExposure,
+    used: currentGrossExposure,
+  });
 
   const isShort = proposal.side === 'sell';
   const buyingPower =
@@ -116,12 +258,16 @@ export function clampEquityQuantityToCaps({
         ? account.cash
         : null;
   if (!isShort && typeof buyingPower === 'number') {
-    addNotionalLimit('buying power', buyingPower);
+    addNotionalLimit('buyingPower', marginEnabled ? 'buying power' : 'cash buying power', buyingPower, {
+      source: marginEnabled ? 'broker_buying_power' : 'cash',
+      capValue: buyingPower,
+    });
   }
 
   const quantity = Math.max(0, Math.min(...candidates.filter((n) => Number.isFinite(n))));
   if (quantity < requestedQuantity) {
-    return out(quantity, `learned equity quantity ${requestedQuantity} clamped to ${quantity} by deterministic risk caps`);
+    const reason = `learned equity quantity ${requestedQuantity} clamped to ${quantity} by deterministic risk caps`;
+    return out(quantity, reason);
   }
   return out(quantity, 'learned equity quantity within deterministic risk caps');
 }

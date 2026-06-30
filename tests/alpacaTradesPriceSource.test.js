@@ -127,6 +127,38 @@ test('query includes symbol path, whole-second start/end, feed, limit; no secret
   assert.equal(http.calls[0].init.headers['APCA-API-SECRET-KEY'], FAKE_SECRET);
 });
 
+test('getLatestTrade uses the read-only latest trade endpoint and stays sanitized', async () => {
+  const http = fakeFetch(okResponse({
+    trade: { t: '2026-06-10T14:35:00.123456789Z', p: 203.5, s: 10 },
+  }));
+  const source = createAlpacaTradesPriceSource(configuredConfig(), { httpFetch: http });
+  const trade = await source.getLatestTrade('spy');
+
+  assert.deepEqual(trade, { price: 203.5, at: '2026-06-10T14:35:00.123Z', size: 10 });
+  assert.equal(http.calls.length, 1);
+  const url = new URL(http.calls[0].url);
+  assert.ok(url.pathname.endsWith('/stocks/SPY/trades/latest'), `path was ${url.pathname}`);
+  assert.equal(url.searchParams.get('feed'), 'iex');
+  assert.ok(!http.calls[0].url.includes(FAKE_KEY_ID));
+  assert.ok(!http.calls[0].url.includes(FAKE_SECRET));
+});
+
+test('getLatestTrade rejects malformed latest payloads without leaking keys', async () => {
+  const source = createAlpacaTradesPriceSource(configuredConfig(), {
+    httpFetch: fakeFetch(okResponse({ trade: { t: 'bad', p: 0 } })),
+  });
+  let caught;
+  try {
+    await source.getLatestTrade('SPY');
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught);
+  assert.match(caught.message, /latest trade payload/);
+  assert.ok(!caught.message.includes(FAKE_KEY_ID));
+  assert.ok(!caught.message.includes(FAKE_SECRET));
+});
+
 test('input validation throws before any HTTP', async () => {
   const http = fakeFetch(okResponse({ trades: [] }));
   const source = createAlpacaTradesPriceSource(configuredConfig(), { httpFetch: http });

@@ -124,6 +124,15 @@ function parseJsonArray(text) {
   }
 }
 
+function parseJsonObject(text) {
+  try {
+    const parsed = JSON.parse(text ?? '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function mergeCounts(target, source = {}) {
   for (const [key, value] of Object.entries(source ?? {})) {
     target[key] = (target[key] ?? 0) + (Number(value) || 0);
@@ -281,11 +290,14 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     requestedTargetWeight: row.requested_target_weight,
     requestedNotional: row.requested_notional,
     requestedQuantity: row.requested_quantity,
+    approvedTargetWeight: row.approved_target_weight,
     approvedNotional: row.approved_notional,
     approvedQuantity: row.approved_quantity,
+    accountEquity: row.account_equity,
     riskApproved: row.risk_approved,
     riskReason: row.risk_reason,
     explanation: row.explanation,
+    effectiveRiskCaps: parseJsonObject(row.effective_risk_caps_json),
   }));
 
   const sessions = db
@@ -514,8 +526,19 @@ function brokerTruthSection(data = {}) {
     `  owned return:           ${performance.botReturnUnavailableReason ?? 'unavailable'}`,
     `  SPY session return:     ${formatReturn(performance.spyReturn)}`,
     `  account excess vs SPY:  ${formatReturn(performance.brokerAccountExcessReturn)}`,
+    `  SPY baseline source:    ${performance.spyBaseline?.source ?? performance.spyBaselineSource ?? 'unavailable'}`,
+    `  SPY baseline alignment: target=${performance.spyBaseline?.targetAt ?? performance.spyBaselineTargetAt ?? 'unavailable'} ` +
+      `priceAt=${performance.spyBaseline?.at ?? performance.spyBaselineAt ?? 'unavailable'} ` +
+      `status=${performance.spyBaseline?.alignmentStatus ?? performance.spyBaselineAlignmentStatus ?? 'unavailable'}`,
+    `  SPY current source:     ${performance.spyCurrent?.source ?? performance.spyCurrentSource ?? 'unavailable'}`,
+    `  SPY current alignment:  target=${performance.spyCurrent?.targetAt ?? performance.spyCurrentTargetAt ?? 'unavailable'} ` +
+      `priceAt=${performance.spyCurrent?.at ?? performance.spyCurrentAt ?? 'unavailable'} ` +
+      `status=${performance.spyCurrent?.alignmentStatus ?? performance.spyCurrentAlignmentStatus ?? 'unavailable'}`,
     '  note: broker-wide equity may include manual Alpaca activity; owned exposure counts only ExaltedFable-recorded orders.',
   );
+  if (performance.spyUnavailableReason) {
+    lines.push(`  SPY unavailable reason: ${performance.spyUnavailableReason}`);
+  }
   const warnings = brokerTruth.warnings ?? performance.warnings ?? [];
   if (warnings.length > 0) {
     lines.push('  data-quality warnings:');
@@ -544,13 +567,38 @@ function equitySizingSection(data = {}) {
     `  manual --qty override: ${sizing.manualOverrideCount ?? 0}`,
   );
   for (const s of sizing.samples ?? []) {
+    const approvedWeight = s.approvedTargetWeight ?? (
+      s.approvedNotional !== null && s.approvedNotional !== undefined &&
+      s.accountEquity !== null && s.accountEquity !== undefined && Number(s.accountEquity) > 0
+        ? Number(s.approvedNotional) / Number(s.accountEquity)
+        : null
+    );
     lines.push(
       `  ${s.ticker} ${s.side} ${s.manualOverride ? 'manual_override' : s.mode} ` +
         `evidence=${s.evidenceCount ?? 0}/${s.evidenceQuality ?? 'unknown'} ` +
         `requested=${s.requestedQuantity ?? 0} (${moneyOrUnavailable(s.requestedNotional)}, ${pctOrUnavailable(s.requestedTargetWeight)}) ` +
-        `approved=${s.approvedQuantity ?? 0} (${moneyOrUnavailable(s.approvedNotional)}) ` +
+        `approved=${s.approvedQuantity ?? 0} (${moneyOrUnavailable(s.approvedNotional)}, ${pctOrUnavailable(approvedWeight)}) ` +
         `reason=${s.riskReason ?? s.explanation ?? 'unavailable'}`
     );
+    const caps = s.effectiveRiskCaps ?? {};
+    const orderCap = caps.orderCap ?? null;
+    if (orderCap) {
+      lines.push(
+        `    effective order cap: source=${orderCap.source ?? 'unknown'} value=${moneyOrUnavailable(orderCap.value)} ` +
+        `learnedPct=${moneyOrUnavailable(orderCap.learnedPercentCap)} explicitDollar=${moneyOrUnavailable(orderCap.explicitDollarCap)}`
+      );
+    }
+    for (const cap of (caps.activeCaps ?? []).slice(0, LIST_CAP)) {
+      const used = cap.used === null || cap.used === undefined ? '' : ` used=${moneyOrUnavailable(cap.used)}`;
+      lines.push(
+        `    cap ${cap.key}: source=${cap.source ?? 'unknown'} value=${moneyOrUnavailable(cap.value)}${used} ` +
+        `remaining=${moneyOrUnavailable(cap.remainingNotional)} allows=${cap.allowedQuantity ?? 'n/a'} ` +
+        `clamp=${cap.clamped ? 'yes' : 'no'}`
+      );
+    }
+    if ((caps.clampReasons ?? []).length > 0) {
+      for (const reason of caps.clampReasons.slice(0, LIST_CAP)) lines.push(`    clamp reason: ${reason}`);
+    }
   }
   if ((sizing.warnings ?? []).length > 0) {
     lines.push('  sizing warnings:');

@@ -109,6 +109,7 @@ test('migration 004+ upgrades an existing database that already applied 001-003'
     '007_paper_equity_sizing_decisions',
     '008_paper_cap_and_benchmark_metadata',
     '011_simplify',
+    '012_exit_orders',
   ]);
   const tables = listTables(db);
   assert.ok(tables.includes('paper_runtime_sessions'));
@@ -166,7 +167,7 @@ test('migration 008 preserves existing paper records and leaves new metadata nul
     .run();
 
   const result = runMigrations(db);
-  assert.deepEqual(result.applied, ['008_paper_cap_and_benchmark_metadata', '011_simplify']);
+  assert.deepEqual(result.applied, ['008_paper_cap_and_benchmark_metadata', '011_simplify', '012_exit_orders']);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_runtime_sessions').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_strategy_performance_snapshots').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_equity_sizing_decisions').get().n, 1);

@@ -71,6 +71,7 @@ test('all migrations apply cleanly and are idempotent with the runner', () => {
     '007_paper_equity_sizing_decisions',
     '008_paper_cap_and_benchmark_metadata',
     '011_simplify',
+    '012_exit_orders',
   ]);
   const second = runMigrations(db);
   assert.equal(second.applied.length, 0);
@@ -79,6 +80,7 @@ test('all migrations apply cleanly and are idempotent with the runner', () => {
   assert.ok(second.skipped.includes('007_paper_equity_sizing_decisions'));
   assert.ok(second.skipped.includes('008_paper_cap_and_benchmark_metadata'));
   assert.ok(second.skipped.includes('011_simplify'));
+  assert.ok(second.skipped.includes('012_exit_orders'));
   closeDatabase(db);
 });
 

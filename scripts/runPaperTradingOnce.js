@@ -64,6 +64,7 @@ export {
   fetchAssetState,
   executeSelectedPaperTrade,
   runPaperDecisionCycle,
+  runExitMonitor,
   oneLineDecisionSummary,
   buildDecisionCycleReport,
   oneLineSummary,
@@ -121,6 +122,17 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
     if (Object.prototype.hasOwnProperty.call(settings, key)) defaults.sizingSettings[key] = settings[key];
   }
   if (Object.keys(defaults.sizingSettings).length === 0) delete defaults.sizingSettings;
+  defaults.exitSettings = {};
+  for (const key of [
+    'exit_take_profit_pct',
+    'exit_stop_loss_pct',
+    'exit_max_hold_minutes',
+    'exit_learning_enabled',
+    'exit_min_sample_size',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(settings, key)) defaults.exitSettings[key] = settings[key];
+  }
+  if (Object.keys(defaults.exitSettings).length === 0) delete defaults.exitSettings;
   return defaults;
 }
 
@@ -170,6 +182,7 @@ export function parseArgs(argv, defaults = {}) {
     thresholds: { ...(defaults.thresholds ?? {}) },
     caps: { ...(defaults.caps ?? {}) },
     sizingSettings: { ...(defaults.sizingSettings ?? {}) },
+    exitSettings: { ...(defaults.exitSettings ?? {}) },
     paperFeatures: resolvePaperFeatures(defaults.paperFeatures ?? DEFAULT_PAPER_FEATURES),
   };
   const setThresh = (key, v) => { const f = parseUnitFloat(v); if (f !== null) args.thresholds[key] = f; };

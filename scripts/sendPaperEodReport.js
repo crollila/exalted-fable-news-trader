@@ -227,6 +227,24 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     )
     .all(...dayParams);
 
+  // Exits closed in this window, grouped by policy reason (take_profit /
+  // stop_loss / max_hold / other).
+  const exitReasonRows = db
+    .prepare(
+      `SELECT exit_reason, COUNT(*) AS n, COALESCE(SUM(pnl_usd), 0) AS pnl
+         FROM paper_trades
+        WHERE status = 'closed' AND exit_reason IS NOT NULL
+          ${day ? "AND substr(COALESCE(exit_at, created_at), 1, 10) = ?" : ''}
+        GROUP BY exit_reason
+        ORDER BY n DESC`
+    )
+    .all(...(day ? [day] : []));
+  const exits = {
+    total: exitReasonRows.reduce((s, r) => s + Number(r.n), 0),
+    realizedPnl: round2(exitReasonRows.reduce((s, r) => s + Number(r.pnl), 0)),
+    byReason: exitReasonRows.map((r) => ({ reason: r.exit_reason, n: Number(r.n), pnl: round2(r.pnl) })),
+  };
+
   const sizingRows = listEquitySizingDecisions(db, {
     day: session ? null : day,
     session,
@@ -336,6 +354,7 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     session: sessionSummary,
     evidenceScope: filter.label,
     riskState: day ? getRiskState(db, day) : null,
+    exits,
     ...evidence,
     ordersSubmitted: trades.length,
     longCount,
@@ -555,6 +574,9 @@ export function buildEodReport(data, { day = null } = {}) {
     `  kill switch:                     ${data.riskState?.kill_switch_active === 1
       ? `ACTIVE — ${data.riskState.kill_switch_reason ?? 'no reason recorded'}`
       : 'inactive'}`,
+    `  exits (closed this window):      ${data.exits?.total ?? 0}${(data.exits?.byReason ?? [])
+      .map((r) => ` ${r.reason}=${r.n}`)
+      .join('')}`,
     `  shorts/margin usage:             ${session.shortsUsed ?? 0} / ${session.marginUsed ?? 0}`,
     `  model requests/tokens:           ${session.modelRequestCount ?? 0} request(s); token usage unavailable`,
     `  data quality:                    ${dataQuality.status}`,

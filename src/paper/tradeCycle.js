@@ -50,6 +50,8 @@ import {
   tradingDay,
   updateDailyLossState,
 } from './riskState.js';
+import { resolveExitSettings, resolveLearnedExitParams } from './exitPolicy.js';
+import { monitorOpenEquityPositions } from './positionMonitor.js';
 import { MODEL_PROMPT_VERSION } from '../sentiment/modelClassifier.js';
 
 export const DEFAULT_SYMBOLS = Object.freeze(['AAPL']);
@@ -784,6 +786,29 @@ export async function executeSelectedPaperTrade(
   return { selected, result, lines };
 }
 
+/**
+ * One exit-monitor pass with learned parameters: exits run BEFORE new entries
+ * every cycle and regardless of the kill switch (closing risk is always
+ * allowed). Returns the monitor result (never throws).
+ */
+export async function runExitMonitor(db, { paperClient = null, nowMs = Date.now(), args = {} } = {}) {
+  const base = resolveExitSettings(args.exitSettings ?? {});
+  const learned = resolveLearnedExitParams({
+    closedOutcomes: listBrokerConfirmedEquityOutcomes(db),
+    base,
+    learningEnabled: base.learningEnabled,
+    minSampleSize: base.minSampleSize,
+  });
+  const monitor = await monitorOpenEquityPositions(db, {
+    paperClient,
+    nowMs,
+    executePaper: args.executePaper === true,
+    exitParams: learned.params,
+    exitParamsExplanation: learned.mode === 'learned' ? learned.explanation : null,
+  });
+  return { ...monitor, exitParams: learned.params, exitParamsMode: learned.mode };
+}
+
 function hasSignalPass(selected, args) {
   const features = resolvePaperFeatures(args.paperFeatures ?? DEFAULT_PAPER_FEATURES);
   const equity = assessProposal({
@@ -842,6 +867,7 @@ export async function runPaperDecisionCycle(
     mode: args.executePaper ? 'execute_paper' : 'dry_run',
     outcome: null,
     skipReason: null,
+    exits: null,
     ingestion: null,
     classification: null,
     freshCandidates: [],
@@ -849,6 +875,8 @@ export async function runPaperDecisionCycle(
     trade: null,
     lines: [],
   };
+  // Exits FIRST: manage what we already hold before considering new entries.
+  base.exits = await runExitMonitor(db, { paperClient, nowMs, args });
   const since = new Date(nowMs - args.newsLookbackMinutes * 60_000).toISOString();
   const cycleArgs = args;
 
@@ -979,6 +1007,13 @@ export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
     'Paper trading decision cycle (fresh ingest/classify/trade, PAPER-only)',
     `  outcome:    ${cycle.outcome ?? 'unknown'}`,
   ];
+  if (cycle.exits && cycle.exits.checked > 0) {
+    lines.push(
+      `  exits:      checked=${cycle.exits.checked} planned=${cycle.exits.exitsPlanned} ` +
+        `submitted=${cycle.exits.exitsSubmitted} filled=${cycle.exits.exitsFilled} errors=${cycle.exits.errors}`
+    );
+    lines.push(...cycle.exits.lines.map((line) => `  ${line}`));
+  }
   if (cycle.ingestion) {
     lines.push(
       `  ingest:     fetched=${cycle.ingestion.fetched} inserted=${cycle.ingestion.inserted} ` +
@@ -1087,16 +1122,21 @@ export function buildPaperReport(result, selected) {
 export async function executeOneShot(db, {
   args, paperClient = null, priceSource = null, nowMs = Date.now(),
 }) {
+  // Exits FIRST: manage open positions before considering a new entry.
+  const exits = await runExitMonitor(db, { paperClient, nowMs, args });
+  const exitLines = exits.checked > 0 ? exits.lines : [];
+
   const selected = selectRecentScoredEvent(db, {
     eventId: args.eventId,
     allowedSymbols: args.symbols,
     excludeProcessed: true,
   });
   if (!selected) {
-    return { selected: null, result: null, lines: [
+    return { selected: null, result: null, exits, lines: [
+      ...exitLines,
       `No eligible scored event found (need a ${MODEL_PROMPT_VERSION} score on one of [${args.symbols.join(',')}]).`,
     ] };
   }
   const trade = await executeSelectedPaperTrade(db, selected, { args, paperClient, priceSource, nowMs });
-  return { selected, result: trade.result, lines: trade.lines };
+  return { selected, result: trade.result, exits, lines: [...exitLines, ...trade.lines] };
 }

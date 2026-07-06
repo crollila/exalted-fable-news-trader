@@ -42,6 +42,11 @@ export const DEFAULT_SETTINGS = Object.freeze({
   sizing_max_target_weight: 0.01,
   sizing_enable_confidence_scaling: true,
   sizing_enable_impact_scaling: true,
+  exit_take_profit_pct: 0.04,
+  exit_stop_loss_pct: 0.035,
+  exit_max_hold_minutes: 390,
+  exit_learning_enabled: true,
+  exit_min_sample_size: 10,
   interval_minutes: 15,
   max_iterations: null,
 });
@@ -64,6 +69,11 @@ export const SETTING_SPECS = Object.freeze({
   sizing_max_target_weight: { kind: 'num', min: 0.0001, max: 0.01 },
   sizing_enable_confidence_scaling: { kind: 'bool' },
   sizing_enable_impact_scaling: { kind: 'bool' },
+  exit_take_profit_pct: { kind: 'num', min: 0.005, max: 0.5 },
+  exit_stop_loss_pct: { kind: 'num', min: 0.005, max: 0.25 },
+  exit_max_hold_minutes: { kind: 'int', min: 5, max: 10080 },
+  exit_learning_enabled: { kind: 'bool' },
+  exit_min_sample_size: { kind: 'int', min: 3, max: 100 },
   interval_minutes: { kind: 'int', min: MIN_INTERVAL_MINUTES, max: 1440 },
   max_iterations: { kind: 'optional_int', min: 1, max: MAX_ITERATIONS_CAP },
 });

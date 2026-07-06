@@ -31,8 +31,6 @@ import {
 import { createAlpacaNewsHttpTransport } from '../src/providers/alpacaNewsHttpTransport.js';
 import { createAlpacaNewsProvider } from '../src/providers/alpacaNewsProvider.js';
 import { createAlpacaPaperClient } from '../src/paper/alpacaPaperClient.js';
-import { reconcileBotOptions } from '../src/paper/optionMonitor.js';
-import { optionEntryBlocked } from '../src/paper/optionExits.js';
 import { formatBrokerTruthLines, recordPerformanceSnapshot } from '../src/paper/brokerTruth.js';
 import { createAlpacaTradesPriceSource } from '../src/prices/alpacaTradesPriceSource.js';
 import { createDiscordWebhookClient } from '../src/notifications/discordWebhookClient.js';
@@ -54,7 +52,7 @@ import {
   paperFeaturesFromConfig,
 } from './runPaperTradingOnce.js';
 import { buildClassifier } from './classifyNewsOnce.js';
-import { runEodReport, currentConstraintsFromConfig, OPTIONS_DISCLOSURE } from './sendPaperEodReport.js';
+import { runEodReport, currentConstraintsFromConfig } from './sendPaperEodReport.js';
 
 export { MIN_INTERVAL_MINUTES };
 
@@ -91,7 +89,6 @@ function emptySessionStats(sessionDate, sessionId = null) {
     orderStatus: {},
     modelRequestCount: 0,
     shortsUsed: 0,
-    optionsUsed: 0,
     marginUsed: 0,
     eodSent: false,
   };
@@ -132,12 +129,8 @@ function applyCycleStats(stats, cycle, args) {
   mergeCounts(stats.classificationStatus, cycle?.classification?.statusCounts);
   if (cycle?.skipReason) inc(stats.skippedReasons, cycle.skipReason);
   countTradeSub(stats, cycle?.trade?.result?.equity);
-  countTradeSub(stats, cycle?.trade?.result?.option);
   if (cycle?.trade?.result?.equity?.proposal?.side === 'sell' && cycle.trade.result.equity.decision === 'accepted') {
     stats.shortsUsed += 1;
-  }
-  if (cycle?.trade?.result?.option && ['accepted', 'plan'].includes(cycle.trade.result.option.decision)) {
-    stats.optionsUsed += 1;
   }
   if (args?.paperFeatures?.enableMargin) stats.marginUsed = 1;
 }
@@ -156,7 +149,6 @@ function persistSessionStats(db, stats, status = 'open', extra = {}) {
     orderStatus: stats.orderStatus,
     modelRequestCount: stats.modelRequestCount,
     shortsUsed: stats.shortsUsed,
-    optionsUsed: stats.optionsUsed,
     marginUsed: stats.marginUsed,
     ...extra,
   });
@@ -215,7 +207,6 @@ async function main() {
   }
 
   console.log('Paper trading loop (manual, PAPER-only — live trading disabled)');
-  console.log(OPTIONS_DISCLOSURE);
   console.log(`  ${HOLIDAY_LIMITATION_NOTE}`);
   // Graceful shutdown: SIGINT/SIGTERM flips a flag the loop checks each turn.
   let stopRequested = false;
@@ -255,11 +246,11 @@ async function main() {
         `interval=${args.intervalMinutes}m max-iter=${args.maxIterations ?? 'continuous'} ` +
         `${classifierLabel} ingest-limit=${args.ingestLimit} ` +
         `classify-limit=${args.classifyLimit} lookback=${args.newsLookbackMinutes}m ` +
-        `shorts=${args.allowShorts ? 'on' : 'off'} options=${args.allowOptions ? args.optionsMode : 'off'} ` +
+        `shorts=${args.allowShorts ? 'on' : 'off'} ` +
         `outside-hours=${args.runOutsideMarketHours ? 'yes' : 'no'}`
     );
     if (args.deprecatedRunOutsideMarketHours) {
-      console.error('--run-outside-market-hours is deprecated and ignored: market-closed cycles never call news/model/price/options/order APIs.');
+      console.error('--run-outside-market-hours is deprecated and ignored: market-closed cycles never call news/model/price/order APIs.');
     }
 
     let currentStats = null;
@@ -279,7 +270,6 @@ async function main() {
         currentStats.orderStatus = parseJsonMap(existing.order_status_json);
         currentStats.modelRequestCount = Number(existing.model_request_count) || 0;
         currentStats.shortsUsed = Number(existing.shorts_used) || 0;
-        currentStats.optionsUsed = Number(existing.options_used) || 0;
         currentStats.marginUsed = Number(existing.margin_used) || 0;
         currentStats.eodSent = existing.eod_report_status === 'sent';
         console.log(`Paper runtime session resumed: date=${sessionDate} id=${existing.id}`);
@@ -294,30 +284,13 @@ async function main() {
       return currentStats;
     };
 
-    const runOnce = async ({ nowMs, session }) => {
+    const runOnce = async ({ nowMs }) => {
       const stats = ensureSession(nowMs);
-      const sessionCloseMs = session?.nextCloseMs ?? null;
-      // Monitor bot-owned options FIRST (reconcile fills/exits/forced flatten),
-      // then consider new entries. Non-fatal: never throws out of the monitor.
-      if (paperClient) {
-        const mon = await reconcileBotOptions(db, {
-          paperClient, config, nowMs,
-          session: { isOpen: true, sessionCloseMs },
-          onLog: (line) => console.log(`  [option-monitor] ${line}`),
-        });
-        if (mon.unresolved > 0) {
-          console.error(`  [option-monitor] WARNING: ${mon.unresolved} UNRESOLVED option position(s) — see EOD report.`);
-        }
-      }
-      const optionEntry = optionEntryBlocked({
-        nowMs, sessionOpen: true, sessionCloseMs,
-        noEntryBeforeCloseMinutes: config.optionExecution.noEntryBeforeCloseMinutes,
-      });
       const cycle = await runPaperDecisionCycle(
         db,
         { provider, classifier, paperClient, priceSource, providerSkipReason },
         args,
-        { nowMs, optionEntry, optionConfig: config.optionExecution }
+        { nowMs }
       );
       applyCycleStats(stats, cycle, args);
       let performance = null;

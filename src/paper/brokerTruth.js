@@ -10,12 +10,10 @@ import {
   insertBrokerAccountSnapshot,
   insertStrategyPerformanceSnapshot,
   listPaperTradesForBrokerReconciliation,
-  updatePaperOptionTrade,
   updatePaperTradeBrokerTruth,
 } from '../database/paperRuntime.js';
 
 const LEGACY_ORDER_RE = /paper order\s+([A-Za-z0-9_-]+)/i;
-const OWNED_OPTION_ORDER_LIMIT = 500;
 const BENCHMARK_LOOKBACK_MINUTES = 60;
 
 function numOrNull(value) {
@@ -48,10 +46,6 @@ function parseJsonArray(text) {
   } catch {
     return [];
   }
-}
-
-function optionLifecycle(row) {
-  return row.lifecycle_state || (row.status === 'closed' ? 'closed' : row.status === 'canceled' ? 'canceled' : 'open');
 }
 
 function emptyOrderCounts() {
@@ -186,131 +180,6 @@ async function reconcileEquityRows(db, { paperClient, nowIso, positionsAvailable
   }
 }
 
-function realizedOptionPnl({ entryPrice, exitPrice, contracts }) {
-  const entry = numOrNull(entryPrice);
-  const exit = numOrNull(exitPrice);
-  const qty = numOrNull(contracts);
-  if (entry === null || exit === null || qty === null) return null;
-  return round2((exit - entry) * 100 * qty);
-}
-
-function optionStatusFromOrder({ row, state, filledQty, positionsAvailable, position }) {
-  const lifecycle = optionLifecycle(row);
-  if (lifecycle === 'closed' || row.status === 'closed') return { status: 'closed', lifecycleState: 'closed' };
-  if (['canceled', 'rejected', 'expired'].includes(state) && !(filledQty > 0)) {
-    return { status: 'canceled', lifecycleState: 'canceled' };
-  }
-  if ((state === 'filled' || state === 'partially_filled') && positionsAvailable && !position) {
-    return { status: 'closed', lifecycleState: 'closed' };
-  }
-  if ((state === 'filled' || state === 'partially_filled') && filledQty > 0) {
-    return { status: 'open', lifecycleState: 'open' };
-  }
-  return { status: 'open', lifecycleState: lifecycle };
-}
-
-async function reconcileOptionRows(db, { paperClient, nowIso, positionsAvailable, positionsBySymbol, counts, warnings }) {
-  const rows = db
-    .prepare(
-      `SELECT *
-         FROM paper_option_trades
-        WHERE entry_order_id IS NOT NULL
-           OR exit_order_id IS NOT NULL
-        ORDER BY id ASC
-        LIMIT ?`
-    )
-    .all(OWNED_OPTION_ORDER_LIMIT);
-
-  for (const row of rows) {
-    const symbol = String(row.option_symbol ?? '').trim().toUpperCase();
-    const position = positionsBySymbol.get(symbol) ?? null;
-    const basePositionUpdate = {
-      brokerPositionQty: positionsAvailable ? numOrNull(position?.qty) : null,
-      brokerPositionMarketValue: positionsAvailable ? numOrNull(position?.marketValue) : null,
-      brokerUnrealizedPl: positionsAvailable ? numOrNull(position?.unrealizedPl) : null,
-      lastCheckedAt: nowIso,
-    };
-
-    if (row.entry_order_id) {
-      let order = null;
-      try {
-        order = await paperClient.getOrder(row.entry_order_id);
-      } catch (err) {
-        counts.submitted += 1;
-        counts.errors += 1;
-        warnings.push(`option entry order ${row.entry_order_id} unavailable: ${warningMessage(err)}`);
-      }
-      if (order) {
-        const state = classifyBrokerOrderState(order);
-        countBrokerOrder(counts, order, state);
-        const filledQty = numOrNull(order.filledQty);
-        const filledAvgPrice = numOrNull(order.filledAvgPrice);
-        const filledAt = order.filledAt ?? null;
-        const statusUpdate = optionStatusFromOrder({ row, state, filledQty, positionsAvailable, position });
-        const notionalEntry =
-          filledQty !== null && filledQty > 0 && filledAvgPrice !== null
-            ? round2(filledQty * filledAvgPrice * 100)
-            : undefined;
-        const updates = {
-          ...basePositionUpdate,
-          entryOrderStatus: order.status ?? null,
-          entryFilledQty: filledQty,
-          entryFilledAvgPrice: filledAvgPrice,
-          entryFilledAt: filledAt,
-          ...statusUpdate,
-        };
-        const openedAt = filledAt ?? (filledQty !== null && filledQty > 0 ? order.submittedAt : null);
-        if (openedAt) updates.openedAt = openedAt;
-        if (filledAvgPrice !== null) updates.premiumEntry = filledAvgPrice;
-        if (notionalEntry !== undefined) updates.notionalEntry = notionalEntry;
-        updatePaperOptionTrade(db, row.id, updates);
-      } else {
-        updatePaperOptionTrade(db, row.id, basePositionUpdate);
-      }
-    } else {
-      updatePaperOptionTrade(db, row.id, basePositionUpdate);
-    }
-
-    if (row.exit_order_id) {
-      let order = null;
-      try {
-        order = await paperClient.getOrder(row.exit_order_id);
-      } catch (err) {
-        counts.submitted += 1;
-        counts.errors += 1;
-        warnings.push(`option exit order ${row.exit_order_id} unavailable: ${warningMessage(err)}`);
-      }
-      if (!order) continue;
-
-      const state = classifyBrokerOrderState(order);
-      countBrokerOrder(counts, order, state);
-      const filledQty = numOrNull(order.filledQty);
-      const filledAvgPrice = numOrNull(order.filledAvgPrice);
-      const filledAt = order.filledAt ?? null;
-      const updates = {
-        lastCheckedAt: nowIso,
-        exitOrderStatus: order.status ?? null,
-        exitFilledQty: filledQty,
-        exitFilledAvgPrice: filledAvgPrice,
-        exitFilledAt: filledAt,
-      };
-      if (filledQty !== null && filledQty > 0 && filledAvgPrice !== null) {
-        updates.status = 'closed';
-        updates.lifecycleState = 'closed';
-        updates.closedAt = filledAt ?? nowIso;
-        updates.premiumExit = filledAvgPrice;
-        updates.notionalExit = round2(filledQty * filledAvgPrice * 100);
-        updates.realizedPnlUsd = realizedOptionPnl({
-          entryPrice: row.entry_filled_avg_price ?? row.premium_entry,
-          exitPrice: filledAvgPrice,
-          contracts: filledQty,
-        });
-      }
-      updatePaperOptionTrade(db, row.id, updates);
-    }
-  }
-}
-
 export async function reconcileBrokerTruth(
   db,
   { paperClient = null, nowMs = Date.now() } = {}
@@ -340,7 +209,6 @@ export async function reconcileBrokerTruth(
   const positionsBySymbol = positionMap(positions);
 
   await reconcileEquityRows(db, { paperClient, nowIso, positionsAvailable, positionsBySymbol, counts, warnings });
-  await reconcileOptionRows(db, { paperClient, nowIso, positionsAvailable, positionsBySymbol, counts, warnings });
 
   return {
     reconciledAt: nowIso,
@@ -369,30 +237,6 @@ export function calculateBotStrategyExposure(db, { positionsAvailable = true } =
     if (!positionsAvailable || row.status !== 'open' || !['filled', 'partially_filled'].includes(state)) continue;
     if (filledQty === null || fillPrice === null) continue;
     grossExposure += Math.abs(filledQty * fillPrice);
-    openPositionCount += 1;
-  }
-
-  const optionRows = db
-    .prepare(
-      `SELECT *
-         FROM paper_option_trades
-        WHERE entry_order_id IS NOT NULL
-           OR exit_order_id IS NOT NULL
-        ORDER BY id ASC
-        LIMIT ?`
-    )
-    .all(OWNED_OPTION_ORDER_LIMIT);
-  for (const row of optionRows) {
-    if (row.realized_pnl_usd !== null && row.realized_pnl_usd !== undefined) {
-      knownRealizedPnl += Number(row.realized_pnl_usd) || 0;
-      realizedPnlKnown = true;
-    }
-    const lifecycle = optionLifecycle(row);
-    if (!positionsAvailable || !['open', 'pending_exit', 'unresolved'].includes(lifecycle) || row.status !== 'open') continue;
-    const filledQty = positiveNum(row.entry_filled_qty);
-    const fillPrice = positiveNum(row.entry_filled_avg_price);
-    if (filledQty === null || fillPrice === null) continue;
-    grossExposure += Math.abs(filledQty * fillPrice * 100);
     openPositionCount += 1;
   }
 

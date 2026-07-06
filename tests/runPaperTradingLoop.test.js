@@ -214,7 +214,7 @@ test('loop parseArgs forwards advanced one-shot flags AND its own scheduling fla
   const a = parseArgs([
     '--symbols', 'AAPL,MSFT', '--classifier', 'openai', '--ingest-limit', '12',
     '--classify-limit', '4', '--news-lookback-minutes', '90',
-    '--allow-shorts', '--allow-options', '--options-mode', 'plan_only',
+    '--allow-shorts',
     '--max-order-notional', '500', '--interval-minutes', '1', '--max-iterations', '20',
     '--run-outside-market-hours', 'true', '--send-discord-eod-report', '--execute-paper',
   ]);
@@ -225,7 +225,6 @@ test('loop parseArgs forwards advanced one-shot flags AND its own scheduling fla
   assert.equal(a.classifyLimit, 4);
   assert.equal(a.newsLookbackMinutes, 90);
   assert.equal(a.allowShorts, true);
-  assert.equal(a.allowOptions, true);
   assert.equal(a.caps.maxOrderNotional, 500);
   assert.equal(a.executePaper, true);
   // loop-specific flags

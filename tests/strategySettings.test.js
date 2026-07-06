@@ -28,7 +28,7 @@ test('validateStrategySettings caps invalid values and drops unknown/forbidden k
     sizing_min_comparable_sample_size: 1,
     sizing_cold_start_target_weight: 9,
     sizing_max_target_weight: 9,
-    options_mode: 'yolo', symbols: ['aapl', 'aapl', 'msft'],
+    symbols: ['aapl', 'aapl', 'msft'],
     UNKNOWN_KEY: 'x', ALPACA_API_SECRET_KEY: 'leak', LIVE_TRADING_ENABLED: 'true',
   });
   assert.equal(settings.max_order_notional, DEFAULT_SETTINGS.max_order_notional); // invalid -> default
@@ -37,7 +37,6 @@ test('validateStrategySettings caps invalid values and drops unknown/forbidden k
   assert.equal(settings.sizing_min_comparable_sample_size, 3); // floored
   assert.equal(settings.sizing_cold_start_target_weight, 0.01); // capped beneath hard risk caps
   assert.equal(settings.sizing_max_target_weight, 0.01);
-  assert.equal(settings.options_mode, 'plan_only'); // invalid enum -> default
   assert.deepEqual(settings.symbols, ['AAPL', 'MSFT']); // upper + dedup
   assert.ok(!('UNKNOWN_KEY' in settings));
   assert.ok(!('ALPACA_API_SECRET_KEY' in settings)); // forbidden secret-like key dropped

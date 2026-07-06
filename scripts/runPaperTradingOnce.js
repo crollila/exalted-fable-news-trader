@@ -1,29 +1,23 @@
-// scripts/runPaperTradingOnce.js — MANUAL one-shot PAPER trade (Phase 5
-// advanced: long/short equity + options + margin-aware risk).
+// scripts/runPaperTradingOnce.js — MANUAL one-shot PAPER equity trade.
 //
 //   Dry run (default; NO order):
 //     node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL,MSFT \
-//       --classifier openai --allow-shorts --allow-options --options-mode plan_only
+//       --classifier openai --allow-shorts
 //
 //   Execute PAPER orders (requires Alpaca paper creds in .env):
 //     node --env-file=.env scripts/runPaperTradingOnce.js --symbols AAPL --execute-paper
 //
 // FLOW: select ONE recent real-model-scored event -> build an EQUITY proposal
-// (long on up / short on down when --allow-shorts) AND, if --allow-options, an
-// OPTION plan (buy call/put by explicit OCC --option-symbol or contract
-// discovery) -> margin-aware risk gate (account snapshot + caps) -> DRY RUN
-// reports only; --execute-paper submits PAPER equity orders only -> persist
-// paper_trades (filled) / rejected_trades (refused) -> sanitized report.
+// (long on up / short on down when --allow-shorts) -> margin-aware risk gate
+// (account snapshot + caps) -> DRY RUN reports only; --execute-paper submits
+// PAPER equity orders -> persist paper_trades (filled) / rejected_trades
+// (refused) -> sanitized report.
 //
 // HARD SAFETY:
 // - PAPER ONLY. The order client is hard-wired to the Alpaca paper endpoint;
 //   no live endpoint exists and nothing consumes config.liveTradingEnabled.
-// - DRY RUN IS THE DEFAULT. Equity orders go out ONLY with --execute-paper AND
-//   creds. Option order submission is disabled until tested exit monitoring and
-//   sell-to-close reporting exist; option execute_paper requests are rejected
-//   after contract/quote/risk validation with a structured reason.
-// - No uncapped trading: qty/contract caps + margin-aware notional/exposure/
-//   daily caps. No spreads, no multi-leg, no uncovered option writing.
+// - DRY RUN IS THE DEFAULT. Orders go out ONLY with --execute-paper AND creds.
+// - No uncapped trading: qty caps + margin-aware notional/exposure/daily caps.
 // - SANITIZED OUTPUT ONLY. Never raw model responses, raw payloads, API keys,
 //   headers, request configs, or webhook URLs.
 
@@ -49,10 +43,6 @@ import {
   MAX_QTY,
   DEFAULT_THRESHOLDS,
 } from '../src/paper/paperTradeProposal.js';
-import { proposeOption, DEFAULT_OPTION_CONTRACT_LIMIT } from '../src/paper/optionsProposal.js';
-import { enrichOptionProposal } from '../src/paper/optionContracts.js';
-import { entryLimitPrice, optionEntryBlocked } from '../src/paper/optionExits.js';
-import { reconcileBotOptions } from '../src/paper/optionMonitor.js';
 import {
   assessRisk,
   clampEquityQuantityToCaps,
@@ -65,7 +55,6 @@ import {
   getOwnedEquityExposureSnapshot,
   getPaperEventAttemptStats,
   insertEquitySizingDecision,
-  insertPaperOptionTrade,
   listBrokerConfirmedEquityOutcomes,
 } from '../src/database/paperRuntime.js';
 import {
@@ -85,11 +74,9 @@ import { MODEL_PROMPT_VERSION } from '../src/sentiment/modelClassifier.js';
 export { DEFAULT_QTY, MAX_QTY, DEFAULT_THRESHOLDS, DEFAULT_CAPS };
 
 const DEFAULT_SYMBOLS = ['AAPL'];
-const OPTIONS_MODES = new Set(['plan_only', 'execute_paper']);
 export const PAPER_CLASSIFIERS = Object.freeze(['openai', 'anthropic', 'real_model']);
 export const DEFAULT_PAPER_FEATURES = Object.freeze({
   enableShorts: false,
-  enableOptions: false,
   enableMargin: false,
 });
 export const DEFAULT_PAPER_INGEST_LIMIT = 20;
@@ -144,8 +131,6 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
   const defaults = {};
   if (Array.isArray(settings.symbols)) defaults.symbols = cleanSymbols(settings.symbols);
   if (typeof settings.allow_shorts === 'boolean') defaults.allowShorts = settings.allow_shorts;
-  if (typeof settings.allow_options === 'boolean') defaults.allowOptions = settings.allow_options;
-  if (OPTIONS_MODES.has(settings.options_mode)) defaults.optionsMode = settings.options_mode;
 
   defaults.thresholds = {};
   if (parseUnitFloat(settings.confidence_threshold) !== null) defaults.thresholds.minConfidence = Number(settings.confidence_threshold);
@@ -159,10 +144,6 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
   if (parsePosNum(settings.max_gross_exposure) !== null) defaults.caps.maxGrossExposure = Number(settings.max_gross_exposure);
   if (parsePosNum(settings.max_daily_paper_orders) !== null) defaults.caps.maxDailyPaperOrders = Number(settings.max_daily_paper_orders);
   if (parsePosNum(settings.max_daily_paper_notional) !== null) defaults.caps.maxDailyPaperNotional = Number(settings.max_daily_paper_notional);
-  if (parsePosNum(settings.max_option_premium) !== null) {
-    defaults.caps.maxOptionPremium = Number(settings.max_option_premium);
-    defaults.optionMaxPremium = Number(settings.max_option_premium);
-  }
   if (Object.keys(defaults.caps).length === 0) delete defaults.caps;
   defaults.sizingSettings = {};
   for (const key of [
@@ -181,7 +162,6 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
 export function paperFeaturesFromConfig(config = {}) {
   return {
     enableShorts: config?.paperCapabilities?.enableShorts === true,
-    enableOptions: config?.paperCapabilities?.enableOptions === true,
     enableMargin: config?.paperCapabilities?.enableMargin === true,
   };
 }
@@ -189,7 +169,6 @@ export function paperFeaturesFromConfig(config = {}) {
 function resolvePaperFeatures(features = {}) {
   return {
     enableShorts: features.enableShorts === true,
-    enableOptions: features.enableOptions === true,
     enableMargin: features.enableMargin === true,
   };
 }
@@ -211,13 +190,6 @@ export function parseArgs(argv, defaults = {}) {
     maxSymbolsPerCycle: clampInt(defaults.maxSymbolsPerCycle, DEFAULT_MAX_SYMBOLS_PER_CYCLE, 1, MAX_SYMBOLS_PER_CYCLE),
     newsLookbackMinutes: clampInt(defaults.newsLookbackMinutes, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES),
     allowShorts: defaults.allowShorts === true,
-    allowOptions: defaults.allowOptions === true,
-    optionsMode: OPTIONS_MODES.has(defaults.optionsMode) ? defaults.optionsMode : 'plan_only',
-    optionSymbol: defaults.optionSymbol ?? null,
-    optionExpiryDaysMin: parsePosInt(defaults.optionExpiryDaysMin),
-    optionExpiryDaysMax: parsePosInt(defaults.optionExpiryDaysMax),
-    optionMaxPremium: parsePosNum(defaults.optionMaxPremium),
-    optionContractLimit: parsePosInt(defaults.optionContractLimit) ?? DEFAULT_OPTION_CONTRACT_LIMIT,
     thresholds: { ...(defaults.thresholds ?? {}) },
     caps: { ...(defaults.caps ?? {}) },
     sizingSettings: { ...(defaults.sizingSettings ?? {}) },
@@ -245,17 +217,7 @@ export function parseArgs(argv, defaults = {}) {
     else if (flag === '--max-symbols-per-cycle' && next) { args.maxSymbolsPerCycle = clampInt(next, DEFAULT_MAX_SYMBOLS_PER_CYCLE, 1, MAX_SYMBOLS_PER_CYCLE); i += 1; }
     else if (flag === '--news-lookback-minutes' && next) { args.newsLookbackMinutes = clampInt(next, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES); i += 1; }
     else if (flag === '--allow-shorts') { args.allowShorts = true; }
-    else if (flag === '--allow-options') { args.allowOptions = true; }
-    else if (flag === '--options-mode' && next) {
-      if (OPTIONS_MODES.has(next.trim())) args.optionsMode = next.trim(); i += 1;
-    } else if (flag === '--option-symbol' && next) { args.optionSymbol = next.trim().toUpperCase(); i += 1; }
-    else if (flag === '--option-expiry-days-min' && next) { args.optionExpiryDaysMin = parsePosInt(next); i += 1; }
-    else if (flag === '--option-expiry-days-max' && next) { args.optionExpiryDaysMax = parsePosInt(next); i += 1; }
-    else if (flag === '--option-max-premium' && next) {
-      const n = parsePosNum(next); if (n !== null) { args.optionMaxPremium = n; args.caps.maxOptionPremium = n; } i += 1;
-    } else if (flag === '--option-contract-limit' && next) {
-      args.optionContractLimit = parsePosInt(next) ?? DEFAULT_OPTION_CONTRACT_LIMIT; i += 1;
-    } else if (flag === '--max-order-notional' && next) { setCap('maxOrderNotional', next); i += 1; }
+    else if (flag === '--max-order-notional' && next) { setCap('maxOrderNotional', next); i += 1; }
     else if (flag === '--max-symbol-exposure' && next) { setCap('maxSymbolExposure', next); i += 1; }
     else if (flag === '--max-gross-exposure' && next) { setCap('maxGrossExposure', next); i += 1; }
     else if (flag === '--max-daily-paper-orders' && next) { setCap('maxDailyPaperOrders', next); i += 1; }
@@ -345,10 +307,8 @@ export function getDailyCounters(db, day = new Date().toISOString().slice(0, 10)
 }
 
 /** Map a proposal to the shape paperRisk expects. */
-function riskShape(proposal, kind) {
-  return kind === 'option'
-    ? { assetClass: 'option', side: 'buy', ticker: proposal.underlying, quantity: proposal.contracts }
-    : { assetClass: 'equity', side: proposal.side, ticker: proposal.ticker, quantity: proposal.quantity };
+function riskShape(proposal) {
+  return { assetClass: 'equity', side: proposal.side, ticker: proposal.ticker, quantity: proposal.quantity };
 }
 
 function finiteNum(value) {
@@ -610,14 +570,14 @@ function insertSizingAuditIfPresent(db, sub, ctx) {
 async function processProposal(db, proposal, ctx) {
   const {
     kind, capabilities, account, positions, caps, daily, referencePrice,
-    executePaper, paperClient, planOnly = false, paperFeatures = DEFAULT_PAPER_FEATURES,
-    asset = null, optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
+    executePaper, paperClient, paperFeatures = DEFAULT_PAPER_FEATURES,
+    asset = null,
     nowMs = Date.now(), sizingDecision = null, manualQtyOverride = false,
     currentOwnedExposure = 0, dataQualityWarnings = [],
   } = ctx;
   const sub = {
     kind, proposal, risk: null, decision: 'rejected',
-    rejectedTradeId: null, paperTradeId: null, paperOptionTradeId: null,
+    rejectedTradeId: null, paperTradeId: null,
     order: null, orderError: null,
     brokerTruthState: null, brokerHasFill: false,
     sizingDecision, manualQtyOverride, sizingAuditId: null,
@@ -627,9 +587,9 @@ async function processProposal(db, proposal, ctx) {
   if (!proposal.accepted) {
     sub.rejectedTradeId = insertRejectedTrade(db, {
       newsEventId: proposal.eventId,
-      ticker: proposal.underlying ?? proposal.ticker,
-      side: kind === 'option' ? 'buy' : proposal.side,
-      quantity: proposal.contracts ?? proposal.quantity ?? null,
+      ticker: proposal.ticker,
+      side: proposal.side,
+      quantity: proposal.quantity ?? null,
       reason: proposal.reason,
     }).id;
     insertSizingAuditIfPresent(db, sub, {
@@ -641,10 +601,10 @@ async function processProposal(db, proposal, ctx) {
   // Margin-aware risk gate (run when we have an account snapshot, or when we are
   // about to execute — a real order is never sent without a risk pass).
   const haveAccount = Boolean(capabilities && capabilities.available);
-  const needsMandatoryRisk = kind === 'option' || proposal.side === 'sell';
+  const needsMandatoryRisk = proposal.side === 'sell';
   if (haveAccount || executePaper || needsMandatoryRisk) {
     sub.risk = assessRisk({
-      proposal: riskShape(proposal, kind),
+      proposal: riskShape(proposal),
       capabilities: capabilities ?? { available: false },
       account, positions, caps, daily, referencePrice, executePaper,
       asset,
@@ -653,9 +613,9 @@ async function processProposal(db, proposal, ctx) {
     if (!sub.risk.approved) {
       sub.rejectedTradeId = insertRejectedTrade(db, {
         newsEventId: proposal.eventId,
-        ticker: proposal.underlying ?? proposal.ticker,
-        side: kind === 'option' ? 'buy' : proposal.side,
-        quantity: proposal.contracts ?? proposal.quantity ?? null,
+        ticker: proposal.ticker,
+        side: proposal.side,
+        quantity: proposal.quantity ?? null,
         reason: sub.risk.reason,
       }).id;
       insertSizingAuditIfPresent(db, sub, {
@@ -666,7 +626,6 @@ async function processProposal(db, proposal, ctx) {
   }
 
   sub.decision = 'accepted';
-  if (planOnly) { sub.decision = 'plan'; return sub; } // options plan_only never executes
   if (!executePaper) {
     insertSizingAuditIfPresent(db, sub, {
       account, referencePrice, currentOwnedExposure, dataQualityWarnings, manualQtyOverride,
@@ -681,60 +640,7 @@ async function processProposal(db, proposal, ctx) {
     return sub;
   }
 
-  // OPTION entry: a bounded LONG buy/limit/day, persisted as `pending_entry` for
-  // the monitor to reconcile (fills, stale-cancel, deterministic exits). It is
-  // NEVER a market order and is gated by a valid session / pre-close cutoff.
-  if (kind === 'option') {
-    if (optionEntry && optionEntry.blocked) {
-      sub.decision = 'rejected';
-      sub.rejectedTradeId = insertRejectedTrade(db, {
-        newsEventId: proposal.eventId, ticker: proposal.underlying ?? proposal.ticker,
-        side: 'buy', quantity: proposal.contracts ?? null, reason: optionEntry.reason,
-      }).id;
-      return sub;
-    }
-    const ask = proposal.premiumEntry ?? proposal.quoteAsk ?? null;
-    const limitPrice = entryLimitPrice({ ask, slippagePct: optionConfig.limitSlippagePct });
-    if (limitPrice === null) {
-      sub.decision = 'rejected';
-      sub.rejectedTradeId = insertRejectedTrade(db, {
-        newsEventId: proposal.eventId, ticker: proposal.underlying ?? proposal.ticker,
-        side: 'buy', quantity: proposal.contracts ?? null,
-        reason: 'option entry blocked: no usable ask to price a bounded limit',
-      }).id;
-      return sub;
-    }
-    try {
-      const order = await paperClient.submitOptionLimitOrder({
-        optionSymbol: proposal.optionSymbol, qty: proposal.contracts, side: 'buy', limitPrice,
-      });
-      sub.order = order;
-      sub.paperOptionTradeId = insertPaperOptionTrade(db, {
-        newsEventId: proposal.eventId,
-        underlying: proposal.underlying,
-        optionSymbol: proposal.optionSymbol,
-        expiry: proposal.expiry,
-        strike: proposal.strike,
-        right: proposal.right,
-        quantity: proposal.contracts,
-        premiumEntry: proposal.premiumEntry,
-        notionalEntry: proposal.notionalEntry,
-        strategy: proposal.strategy,
-        strategyRationale: proposal.strategyRationale,
-        exitPolicy: proposal.exitPolicy,
-        status: 'open',
-        lifecycleState: 'pending_entry',
-        entryOrderId: order.id,
-        entryOrderStatus: order.status,
-        entryLimitPrice: limitPrice,
-      }).id;
-    } catch (err) {
-      sub.orderError = err.message; // already sanitized by the client
-    }
-    return sub;
-  }
-
-  // EQUITY entry: single-leg market/day (unchanged).
+  // EQUITY entry: single-leg market/day.
   try {
     const order = await paperClient.submitMarketOrder({ symbol: proposal.ticker, qty: proposal.quantity, side: proposal.side });
     sub.order = order;
@@ -785,19 +691,13 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
   const {
     paperClient = null, qty = DEFAULT_QTY, allowedSymbols = [], thresholds = {}, allowShorts = false,
     qtyExplicit = false, sizingSettings = {},
-    allowOptions = false, optionsMode = 'plan_only', optionSymbol = null, optionMaxPremium = null,
-    optionContractLimit = DEFAULT_OPTION_CONTRACT_LIMIT, optionExpiryDaysMin = null, optionExpiryDaysMax = null,
     caps = {}, account = null, positions = [], capabilities = null, referencePrice = null,
-    optionReferencePrice = null, daily = { orders: 0, notional: 0 }, executePaper = false,
+    daily = { orders: 0, notional: 0 }, executePaper = false,
     nowMs = Date.now(), paperFeatures = DEFAULT_PAPER_FEATURES, asset = null,
-    optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
     historicalEquityOutcomes = [], ownedEquityExposure = null, eventAttemptStats = null,
   } = deps;
   const features = resolvePaperFeatures(paperFeatures);
-  const effectiveCaps =
-    optionMaxPremium !== null && optionMaxPremium !== undefined
-      ? { ...caps, maxOptionPremium: optionMaxPremium }
-      : caps;
+  const effectiveCaps = caps;
   const normalizedSizingSettings = resolveEquitySizingSettings(sizingSettings);
   let learnedEquityCapContext = null;
   let equityCapsForRisk = effectiveCaps;
@@ -809,7 +709,6 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
     capabilities: capabilities ? summarizeCapabilities(capabilities) : null,
     referencePrice,
     equity: null,
-    option: null,
   };
 
   let equityProposal = assessProposal({
@@ -880,36 +779,6 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
     currentOwnedExposure,
     dataQualityWarnings,
   });
-
-  let optionProposal = proposeOption({
-    event, score, allowOptions, optionsEnabled: features.enableOptions, optionsMode, optionSymbol, allowedSymbols, thresholds,
-    optionContractLimit, optionExpiryDaysMin, optionExpiryDaysMax, optionMaxPremium, nowMs,
-  });
-  if (optionProposal.enabled && optionProposal.accepted) {
-    optionProposal = await enrichOptionProposal({
-      proposal: optionProposal,
-      paperClient,
-      underlyingAsset: resolvedAsset,
-      optionSymbol,
-      optionMaxPremium,
-      optionExpiryDaysMin,
-      optionExpiryDaysMax,
-      nowMs,
-    });
-  }
-  if (optionProposal.enabled) {
-    result.option = await processProposal(db, optionProposal, {
-      kind: 'option', capabilities, account, positions, caps: effectiveCaps, daily,
-      referencePrice: optionProposal.premiumEntry ?? optionReferencePrice, executePaper, paperClient,
-      planOnly: optionProposal.planOnly, paperFeatures: features,
-      asset: resolvedAsset, optionEntry, optionConfig,
-    });
-  } else {
-    result.option = {
-      kind: 'option', proposal: optionProposal, risk: null, decision: 'disabled',
-      rejectedTradeId: null, paperTradeId: null, order: null, orderError: null,
-    };
-  }
   return result;
 }
 
@@ -954,10 +823,7 @@ export async function fetchAssetState(paperClient, symbol) {
 export async function executeSelectedPaperTrade(
   db,
   selected,
-  {
-    args, paperClient = null, priceSource = null, nowMs = Date.now(),
-    optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
-  }
+  { args, paperClient = null, priceSource = null, nowMs = Date.now() }
 ) {
   const { account, positions, capabilities } = await fetchAccountState(paperClient);
   const asset = await fetchAssetState(paperClient, selected.event.ticker);
@@ -971,19 +837,15 @@ export async function executeSelectedPaperTrade(
     daily, nowMs,
     qty: args.qty, qtyExplicit: args.qtyExplicit, sizingSettings: args.sizingSettings,
     allowedSymbols: args.symbols, thresholds: args.thresholds, allowShorts: args.allowShorts,
-    allowOptions: args.allowOptions, optionsMode: args.optionsMode, optionSymbol: args.optionSymbol,
-    optionMaxPremium: args.optionMaxPremium, optionContractLimit: args.optionContractLimit,
-    optionExpiryDaysMin: args.optionExpiryDaysMin, optionExpiryDaysMax: args.optionExpiryDaysMax,
     caps: args.caps, executePaper: args.executePaper,
     historicalEquityOutcomes, ownedEquityExposure, eventAttemptStats,
     asset,
     paperFeatures: args.paperFeatures ?? DEFAULT_PAPER_FEATURES,
-    optionEntry, optionConfig,
   });
   return { selected, result, lines: buildPaperReport(result, selected) };
 }
 
-function hasSignalPass(selected, args, nowMs) {
+function hasSignalPass(selected, args) {
   const features = resolvePaperFeatures(args.paperFeatures ?? DEFAULT_PAPER_FEATURES);
   const equity = assessProposal({
     event: selected.event,
@@ -994,27 +856,11 @@ function hasSignalPass(selected, args, nowMs) {
     allowShorts: args.allowShorts,
     shortsEnabled: features.enableShorts,
   });
-  if (equity.accepted) return true;
-  const option = proposeOption({
-    event: selected.event,
-    score: selected.score,
-    allowOptions: args.allowOptions,
-    optionsEnabled: features.enableOptions,
-    optionsMode: args.optionsMode,
-    optionSymbol: args.optionSymbol,
-    allowedSymbols: args.symbols,
-    thresholds: args.thresholds,
-    optionContractLimit: args.optionContractLimit,
-    optionExpiryDaysMin: args.optionExpiryDaysMin,
-    optionExpiryDaysMax: args.optionExpiryDaysMax,
-    optionMaxPremium: args.optionMaxPremium,
-    nowMs,
-  });
-  return option.enabled && option.accepted;
+  return equity.accepted;
 }
 
 function tradeOutcome(result) {
-  const subs = [result?.equity, result?.option].filter(Boolean);
+  const subs = [result?.equity].filter(Boolean);
   if (subs.some((s) => s.orderError)) return PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR;
   if (subs.some((s) => s.decision === 'rejected' && s.risk && !s.risk.approved)) {
     return PAPER_DECISION_OUTCOMES.RISK_REJECTION;
@@ -1050,7 +896,7 @@ export async function runPaperDecisionCycle(
   db,
   { provider = null, classifier = null, paperClient = null, priceSource = null, providerSkipReason = null } = {},
   args = parseArgs([]),
-  { nowMs = Date.now(), optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {} } = {}
+  { nowMs = Date.now() } = {}
 ) {
   const base = {
     mode: args.executePaper ? 'execute_paper' : 'dry_run',
@@ -1087,7 +933,7 @@ export async function runPaperDecisionCycle(
         skipReason: `explicit event ${args.eventId} has no ${MODEL_PROMPT_VERSION} score in allowed symbols`,
       };
     }
-    const trade = await executeSelectedPaperTrade(db, selected, { args: cycleArgs, paperClient, priceSource, nowMs, optionEntry, optionConfig });
+    const trade = await executeSelectedPaperTrade(db, selected, { args: cycleArgs, paperClient, priceSource, nowMs });
     return { ...base, outcome: tradeOutcome(trade.result), selected, trade, lines: trade.lines };
   }
 
@@ -1165,9 +1011,9 @@ export async function runPaperDecisionCycle(
     };
   }
 
-  const selected = unprocessed.find((c) => hasSignalPass(c, cycleArgs, nowMs));
+  const selected = unprocessed.find((c) => hasSignalPass(c, cycleArgs));
   const candidate = selected ?? unprocessed[0];
-  const trade = await executeSelectedPaperTrade(db, candidate, { args: cycleArgs, paperClient, priceSource, nowMs, optionEntry, optionConfig });
+  const trade = await executeSelectedPaperTrade(db, candidate, { args: cycleArgs, paperClient, priceSource, nowMs });
   const outcome = selected
     ? tradeOutcome(trade.result)
     : PAPER_DECISION_OUTCOMES.ALL_FRESH_SCORES_FAILED_SIGNAL_THRESHOLDS;
@@ -1243,27 +1089,15 @@ export function oneLineSummary(result) {
       ? ` size=${e.sizingDecision.mode} qty=${e.proposal?.quantity ?? e.sizingDecision.requestedQuantity ?? '?'}`
       : '';
   const eqTxt = `equity ${e?.proposal?.side ?? '?'} ${e?.decision ?? '?'}${sizeTxt}`;
-  let opTxt = 'option off';
-  if (result.option && result.option.decision !== 'disabled') {
-    opTxt = `option ${result.option.proposal?.intent ?? '?'} ${result.option.decision}`;
-  }
-  return `${eqTxt}; ${opTxt}`;
+  return eqTxt;
 }
 
 function subLines(label, sub, result = {}) {
   if (!sub) return [];
-  if (sub.decision === 'disabled') return [`  ${label}:     disabled (--allow-options not set)`];
   const p = sub.proposal;
   const lines = [
     `  ${label}:     ${sub.decision.toUpperCase()} — ${p.reason}`,
   ];
-  if (label === 'option' && p.optionSymbol) {
-    lines.push(
-      `    contract:   ${p.optionSymbol} ${p.right ?? '?'} strike ${p.strike ?? '?'} exp ${p.expiry ?? '?'}`,
-      `    premium:    entry=${p.premiumEntry ?? '?'} notional=${p.notionalEntry ?? '?'} bid=${p.quoteBid ?? '?'} ask=${p.quoteAsk ?? '?'}`,
-      `    exit:       ${p.exitPolicy ?? '(none)'}`
-    );
-  }
   if (label === 'equity' && sub.sizingDecision) {
     const approvedQty = sub.decision === 'accepted' ? p.quantity : 0;
     const approved = approvedSizingValues(sub, result);
@@ -1294,7 +1128,6 @@ function subLines(label, sub, result = {}) {
   if (sub.rejectedTradeId !== null) lines.push(`    logged:     rejected_trades id ${sub.rejectedTradeId}`);
   if (sub.order) lines.push(`    order:      id ${sub.order.id ?? '?'} status ${sub.order.status ?? '?'}${sub.order.filledAvgPrice !== null ? ` filledAvgPrice ${sub.order.filledAvgPrice}` : ''}`);
   if (sub.paperTradeId !== null) lines.push(`    logged:     paper_trades id ${sub.paperTradeId}`);
-  if (sub.paperOptionTradeId !== null) lines.push(`    logged:     paper_option_trades id ${sub.paperOptionTradeId}`);
   if (sub.orderError) lines.push(`    order error: ${sub.orderError}`);
   return lines;
 }
@@ -1317,7 +1150,6 @@ export function buildPaperReport(result, selected) {
       `sentiment=${s.sentiment ?? '?'} impact=${s.impact ?? '?'} confidence=${s.confidence ?? '?'}`,
   ];
   lines.push(...subLines('equity', result.equity, result));
-  lines.push(...subLines('option', result.option, result));
   if (result.mode === 'dry_run') {
     lines.push('  (DRY RUN — pass --execute-paper to actually submit PAPER orders)');
   }
@@ -1331,7 +1163,6 @@ export function buildPaperReport(result, selected) {
  */
 export async function executeOneShot(db, {
   args, paperClient = null, priceSource = null, nowMs = Date.now(),
-  optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
 }) {
   const selected = selectRecentScoredEvent(db, {
     eventId: args.eventId,
@@ -1343,7 +1174,7 @@ export async function executeOneShot(db, {
       `No eligible scored event found (need a ${MODEL_PROMPT_VERSION} score on one of [${args.symbols.join(',')}]).`,
     ] };
   }
-  const trade = await executeSelectedPaperTrade(db, selected, { args, paperClient, priceSource, nowMs, optionEntry, optionConfig });
+  const trade = await executeSelectedPaperTrade(db, selected, { args, paperClient, priceSource, nowMs });
   return { selected, result: trade.result, lines: trade.lines };
 }
 
@@ -1375,34 +1206,8 @@ async function main() {
     const paperClient = hasCreds ? createAlpacaPaperClient(config) : null;
     const priceSource = hasCreds ? createAlpacaTradesPriceSource(config) : null;
 
-    // Resolve the current session (for the option-entry/pre-close gate) and
-    // reconcile any bot-owned open options BEFORE considering a new entry.
-    const optionConfig = config.optionExecution;
     const nowMs = Date.now();
-    let session = { isOpen: false, sessionCloseMs: null };
-    if (paperClient) {
-      try {
-        const clock = await paperClient.getClock();
-        const closeMs = Date.parse(clock?.nextClose);
-        session = { isOpen: clock?.isOpen === true, sessionCloseMs: Number.isFinite(closeMs) ? closeMs : null };
-      } catch { /* clock unavailable -> option entry stays blocked (fail closed) */ }
-      const mon = await reconcileBotOptions(db, {
-        paperClient, config, nowMs, session,
-        onLog: (line) => console.log(`  [option-monitor] ${line}`),
-      });
-      if (mon.checked > 0) {
-        console.log(
-          `Option monitor: checked ${mon.checked} (exits submitted ${mon.exitsSubmitted}, ` +
-            `closed ${mon.exitsFilled}, unresolved ${mon.unresolved}).`
-        );
-      }
-    }
-    const optionEntry = optionEntryBlocked({
-      nowMs, sessionOpen: session.isOpen, sessionCloseMs: session.sessionCloseMs,
-      noEntryBeforeCloseMinutes: optionConfig.noEntryBeforeCloseMinutes,
-    });
-
-    const { lines, result } = await executeOneShot(db, { args, paperClient, priceSource, nowMs, optionEntry, optionConfig });
+    const { lines, result } = await executeOneShot(db, { args, paperClient, priceSource, nowMs });
     for (const line of lines) console.log(line);
     if (paperClient) {
       const performance = await recordPerformanceSnapshot(db, {
@@ -1415,7 +1220,7 @@ async function main() {
     }
     if (!result) return;
 
-    const orderErr = result.equity?.orderError || result.option?.orderError;
+    const orderErr = result.equity?.orderError;
     if (orderErr) {
       console.log('Paper trading completed WITH AN ORDER ERROR (see above).');
       process.exitCode = 1;

@@ -25,10 +25,9 @@ test('resolveCaps fills conservative defaults', () => {
   assert.equal(resolveCaps({ maxOrderNotional: 250 }).maxOrderNotional, 250);
 });
 
-test('estimateNotional: equity = price*qty, option = price*100*contracts, null when no price', () => {
-  assert.equal(estimateNotional({ assetClass: 'equity', quantity: 3, referencePrice: 100 }), 300);
-  assert.equal(estimateNotional({ assetClass: 'option', quantity: 2, referencePrice: 1.5 }), 300);
-  assert.equal(estimateNotional({ assetClass: 'equity', quantity: 3, referencePrice: null }), null);
+test('estimateNotional: price*qty, null when no price', () => {
+  assert.equal(estimateNotional({ quantity: 3, referencePrice: 100 }), 300);
+  assert.equal(estimateNotional({ quantity: 3, referencePrice: null }), null);
 });
 
 test('approves a long within all caps', () => {
@@ -303,21 +302,3 @@ test('equity dry-run is allowed (with caveat) when notional is unverifiable', ()
   assert.match(r.reason, /unverified/);
 });
 
-test('options without a quote are refused because premium caps cannot be verified', () => {
-  const r = assessRisk({ proposal: { assetClass: 'option', side: 'buy', ticker: 'AAPL', quantity: 1 }, capabilities: cap(margin()), account: margin(), referencePrice: null, executePaper: true });
-  assert.equal(r.approved, false);
-  assert.match(r.reason, /premium quote unavailable/);
-});
-
-test('option debit with a validated quote can pass risk caps', () => {
-  const r = assessRisk({ proposal: { assetClass: 'option', side: 'buy', ticker: 'AAPL', quantity: 1 }, capabilities: cap(margin()), account: margin(), referencePrice: 2, executePaper: true });
-  assert.equal(r.approved, true);
-  assert.equal(r.estNotional, 200);
-});
-
-test('option execute is refused without an options-eligible account', () => {
-  const acct = margin({ optionsTradingLevel: null });
-  const r = assessRisk({ proposal: { assetClass: 'option', side: 'buy', ticker: 'AAPL', quantity: 1 }, capabilities: cap(acct), account: acct, referencePrice: null, executePaper: true });
-  assert.equal(r.approved, false);
-  assert.match(r.reason, /options capability is absent\/unknown/);
-});

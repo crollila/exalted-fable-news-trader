@@ -307,76 +307,7 @@ test('getAsset exposes tradability and shortability without raw payload leakage'
   assert.ok(!Object.prototype.hasOwnProperty.call(asset, 'raw'));
 });
 
-test('getOptionContracts discovers sanitized tradable contracts from the paper endpoint', async () => {
-  const { fetchFn, calls } = fakeFetch(() => ({
-    ok: true, status: 200,
-    json: async () => ({
-      option_contracts: [
-        {
-          id: 'c1', symbol: 'AAPL260116C00150000', underlying_symbol: 'AAPL',
-          status: 'active', tradable: true, expiration_date: '2026-01-16',
-          strike_price: '150', type: 'call', style: 'american',
-          open_interest: '1234', secret: 'RAW-MUST-NOT-APPEAR',
-        },
-      ],
-      next_page_token: 'NEXT',
-    }),
-  }));
-  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
-  const result = await client.getOptionContracts({
-    underlyingSymbols: ['aapl'],
-    expirationDateGte: '2026-01-01',
-    expirationDateLte: '2026-02-01',
-    type: 'call',
-    limit: 50,
-  });
-  assert.ok(calls[0].url.startsWith(`${PAPER_BASE_URL}/v2/options/contracts`));
-  assert.ok(!calls[0].url.startsWith(LIVE_BASE_URL_FORBIDDEN));
-  assert.match(decodeURIComponent(calls[0].url), /underlying_symbols=AAPL/);
-  assert.equal(result.nextPageToken, 'NEXT');
-  assert.deepEqual(result.contracts[0], {
-    id: 'c1',
-    symbol: 'AAPL260116C00150000',
-    underlyingSymbol: 'AAPL',
-    status: 'active',
-    tradable: true,
-    expirationDate: '2026-01-16',
-    strikePrice: 150,
-    type: 'call',
-    style: 'american',
-    openInterest: 1234,
-    closePrice: null,
-  });
-});
-
-test('getOptionQuote uses the read-only data endpoint and sanitizes bid/ask/mid', async () => {
-  const { fetchFn, calls } = fakeFetch(() => ({
-    ok: true, status: 200,
-    json: async () => ({
-      snapshots: {
-        AAPL260116C00150000: {
-          latestQuote: { bp: 2.4, ap: 2.6, t: '2026-06-18T14:00:01.000Z', raw: 'hide' },
-        },
-      },
-    }),
-  }));
-  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
-  const quote = await client.getOptionQuote({
-    underlyingSymbol: 'aapl',
-    optionSymbol: 'AAPL260116C00150000',
-  });
-  assert.ok(calls[0].url.startsWith(`${DATA_BASE_URL}/v1beta1/options/snapshots/AAPL`));
-  assert.ok(!calls[0].url.startsWith(LIVE_BASE_URL_FORBIDDEN));
-  assert.deepEqual(quote, {
-    symbol: 'AAPL260116C00150000',
-    bid: 2.4,
-    ask: 2.6,
-    mid: 2.5,
-    updatedAt: '2026-06-18T14:00:01.000Z',
-  });
-});
-
-// --- equity short + option orders ------------------------------------------
+// --- equity short orders ----------------------------------------------------
 
 test('submitMarketOrder sends a short (sell) equity order', async () => {
   const { fetchFn, calls } = fakeFetch(() => okOrder({ side: 'sell' }));
@@ -384,30 +315,6 @@ test('submitMarketOrder sends a short (sell) equity order', async () => {
   await client.submitMarketOrder({ symbol: 'AAPL', qty: 2, side: 'sell' });
   assert.equal(JSON.parse(calls[0].init.body).side, 'sell');
   assert.ok(calls[0].url.startsWith(PAPER_BASE_URL));
-});
-
-test('submitOptionLimitOrder sends a bounded BUY limit/day option order on the paper endpoint', async () => {
-  const { fetchFn, calls } = fakeFetch(() => okOrder({ symbol: 'AAPL260116C00150000', asset_class: 'us_option', type: 'limit' }));
-  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
-  const order = await client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'buy', limitPrice: 2.21 });
-  assert.ok(calls[0].url.startsWith(`${PAPER_BASE_URL}/v2/orders`));
-  assert.ok(!calls[0].url.startsWith(LIVE_BASE_URL_FORBIDDEN));
-  assert.deepEqual(JSON.parse(calls[0].init.body), {
-    symbol: 'AAPL260116C00150000', qty: 1, side: 'buy', type: 'limit', time_in_force: 'day', limit_price: 2.21,
-  });
-  assert.equal(order.id, 'ord_123');
-});
-
-test('submitOptionLimitOrder supports sell-to-close and refuses bad OCC/qty/side/limit (never a market order)', async () => {
-  const { fetchFn, calls } = fakeFetch(() => okOrder({ side: 'sell', type: 'limit' }));
-  const client = createAlpacaPaperClient(paperConfig(), { httpFetch: fetchFn });
-  await client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 2, side: 'sell', limitPrice: 1.85 });
-  assert.equal(JSON.parse(calls[0].init.body).side, 'sell');
-  await assert.rejects(() => client.submitOptionLimitOrder({ optionSymbol: 'NOTANOCC', qty: 1, limitPrice: 1 }), /OCC option symbol/);
-  await assert.rejects(() => client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 0, limitPrice: 1 }), /positive integer/);
-  await assert.rejects(() => client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'short', limitPrice: 1 }), /buy\/sell/);
-  await assert.rejects(() => client.submitOptionLimitOrder({ optionSymbol: 'AAPL260116C00150000', qty: 1, side: 'buy', limitPrice: 0 }), /positive number/);
-  assert.equal(calls.length, 1); // only the valid sell-to-close was sent
 });
 
 test('getOrder polls (GET) and cancelOrder deletes (DELETE, 204 no-body) on the paper endpoint', async () => {

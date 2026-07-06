@@ -9,9 +9,6 @@
 
 import { grossExposure, symbolExposure, MIN_SHORT_EQUITY_USD } from './accountCapabilities.js';
 
-/** Option contracts cover 100 shares of the underlying. */
-export const OPTION_CONTRACT_MULTIPLIER = 100;
-
 /** Conservative default caps (USD), all overridable by CLI. */
 export const DEFAULT_CAPS = Object.freeze({
   maxOrderNotional: 500,
@@ -19,7 +16,6 @@ export const DEFAULT_CAPS = Object.freeze({
   maxGrossExposure: 5000,
   maxDailyPaperOrders: 10,
   maxDailyPaperNotional: 5000,
-  maxOptionPremium: 250, // per order, USD
 });
 
 function num(value, fallback) {
@@ -45,7 +41,6 @@ export function resolveCaps(caps = {}) {
     maxGrossExposure: num(caps.maxGrossExposure, DEFAULT_CAPS.maxGrossExposure),
     maxDailyPaperOrders: num(caps.maxDailyPaperOrders, DEFAULT_CAPS.maxDailyPaperOrders),
     maxDailyPaperNotional: num(caps.maxDailyPaperNotional, DEFAULT_CAPS.maxDailyPaperNotional),
-    maxOptionPremium: num(caps.maxOptionPremium, DEFAULT_CAPS.maxOptionPremium),
   };
 }
 
@@ -119,16 +114,16 @@ export function resolveLearnedEquityEffectiveCaps({
 }
 
 /**
- * Estimate the order notional (USD). Equity = price * qty; option = price *
- * 100 * contracts. Returns null when the reference price is unavailable.
+ * Estimate the order notional (USD): price * qty. Returns null when the
+ * reference price is unavailable.
  */
-export function estimateNotional({ assetClass, quantity, referencePrice }) {
+export function estimateNotional({ quantity, referencePrice }) {
   if (referencePrice === null || referencePrice === undefined || !Number.isFinite(Number(referencePrice))) {
     return null;
   }
   const px = Number(referencePrice);
   const qty = Number(quantity) || 0;
-  return assetClass === 'option' ? px * OPTION_CONTRACT_MULTIPLIER * qty : px * qty;
+  return px * qty;
 }
 
 function wholeSharesForNotional(notional, referencePrice) {
@@ -276,14 +271,14 @@ export function clampEquityQuantityToCaps({
  * Assess a proposal against margin/exposure/daily caps.
  *
  * @param {object} args
- * @param {object} args.proposal     { assetClass:'equity'|'option', side, ticker, quantity }
+ * @param {object} args.proposal     { assetClass:'equity', side, ticker, quantity }
  * @param {object} args.capabilities deriveCapabilities() result
  * @param {object|null} args.account sanitized account snapshot
  * @param {object[]} [args.positions] sanitized positions
  * @param {object|null} [args.asset]  sanitized asset snapshot for shortability checks
  * @param {object} [args.caps]       cap overrides
  * @param {object} [args.daily]      { orders:number, notional:number } so far today
- * @param {number|null} [args.referencePrice] per-share (equity) or per-contract premium (option)
+ * @param {number|null} [args.referencePrice] per-share reference price
  * @param {boolean} [args.executePaper]  whether a real order would be sent
  * @param {boolean} [args.marginEnabled] central PAPER_ENABLE_MARGIN gate
  * @returns {{ approved:boolean, reason:string, estNotional:number|null, caps:object }}
@@ -301,7 +296,6 @@ export function assessRisk({
   marginEnabled = true,
 } = {}) {
   const c = resolveCaps(caps);
-  const isOption = proposal?.assetClass === 'option';
   const isShort = proposal?.assetClass === 'equity' && proposal?.side === 'sell';
   const estNotional = estimateNotional({ ...proposal, referencePrice });
   const out = (approved, reason) => ({ approved, reason, estNotional: round2(estNotional), caps: c });
@@ -327,9 +321,6 @@ export function assessRisk({
   if (isShort && (account?.equity ?? 0) < MIN_SHORT_EQUITY_USD) {
     return out(false, `short rejected: equity below $${MIN_SHORT_EQUITY_USD} margin threshold`);
   }
-  if (isOption && !capabilities.optionsEligible) {
-    return out(false, 'option execution rejected: account options capability is absent/unknown');
-  }
 
   // 3. Daily order-count cap (independent of notional).
   if ((daily?.orders ?? 0) >= c.maxDailyPaperOrders) {
@@ -338,20 +329,12 @@ export function assessRisk({
 
   // 4. Notional-dependent caps. Fail-safe when notional is unknown.
   if (estNotional === null) {
-    if (isOption) {
-      return out(false, 'option premium quote unavailable - refusing option proposal');
-    }
     if (executePaper) {
       return out(false, 'cannot verify notional caps without a reference price — refusing to execute');
     }
     return out(true, 'approved (DRY RUN; notional unverified — no reference price)');
   }
 
-  if (isOption) {
-    if (estNotional > c.maxOptionPremium) {
-      return out(false, `option premium ${round2(estNotional)} exceeds --option-max-premium ${c.maxOptionPremium}`);
-    }
-  }
   if (estNotional > c.maxOrderNotional) {
     return out(false, `order notional ${round2(estNotional)} exceeds --max-order-notional ${c.maxOrderNotional}`);
   }

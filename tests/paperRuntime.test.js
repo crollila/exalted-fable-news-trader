@@ -6,9 +6,6 @@ import assert from 'node:assert/strict';
 import { openMemoryDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import {
-  insertPaperOptionTrade,
-  closePaperOptionTrade,
-  listPaperOptionTrades,
   startPaperRuntimeSession,
   updatePaperRuntimeSession,
   getPaperRuntimeSession,
@@ -35,39 +32,6 @@ function freshDb() {
   return db;
 }
 
-test('paper option trade helper records a long call audit row and close policy outcome', () => {
-  const db = freshDb();
-  const { id } = insertPaperOptionTrade(db, {
-    underlying: 'aapl',
-    optionSymbol: 'AAPL260116C00150000',
-    expiry: '2026-01-16',
-    strike: 150,
-    right: 'call',
-    quantity: 1,
-    premiumEntry: 2.5,
-    notionalEntry: 250,
-    strategy: 'long_call',
-    strategyRationale: 'bullish_call from model direction up',
-    exitPolicy: 'close at 50% gain, 50% loss, or before expiry',
-  });
-  assert.equal(id, 1);
-  assert.equal(closePaperOptionTrade(db, {
-    id,
-    premiumExit: 3.75,
-    notionalExit: 375,
-    exitReason: 'take_profit_50pct',
-    closedAt: '2026-01-12T20:00:00.000Z',
-  }).changes, 1);
-  const row = listPaperOptionTrades(db)[0];
-  assert.equal(row.underlying, 'AAPL');
-  assert.equal(row.option_symbol, 'AAPL260116C00150000');
-  assert.equal(row.right, 'call');
-  assert.equal(row.status, 'closed');
-  assert.equal(row.exit_reason, 'take_profit_50pct');
-  assert.equal(row.premium_exit, 3.75);
-  closeDatabase(db);
-});
-
 test('paper runtime sessions persist sanitized counters and JSON maps', () => {
   const db = freshDb();
   const { id } = startPaperRuntimeSession(db, {
@@ -84,7 +48,6 @@ test('paper runtime sessions persist sanitized counters and JSON maps', () => {
     ordersSubmitted: 1,
     orderStatus: { accepted: 1 },
     modelRequestCount: 5,
-    optionsUsed: 1,
     eodReportStatus: 'sent',
     eodReportSentAt: '2026-06-18T20:01:00.000Z',
   });
@@ -94,7 +57,6 @@ test('paper runtime sessions persist sanitized counters and JSON maps', () => {
   assert.equal(row.fresh_news_count, 7);
   assert.deepEqual(JSON.parse(row.classification_status_json), { parsed: 4, model_error: 1 });
   assert.deepEqual(JSON.parse(row.rejected_reason_json), { 'confidence below threshold': 1 });
-  assert.equal(row.options_used, 1);
   assert.equal(row.eod_report_status, 'sent');
   closeDatabase(db);
 });

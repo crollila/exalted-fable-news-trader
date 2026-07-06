@@ -11,9 +11,7 @@ import { insertPaperTrade, insertRejectedTrade } from '../src/paper/paperTradePr
 import {
   insertBrokerAccountSnapshot,
   insertEquitySizingDecision,
-  insertPaperOptionTrade,
   insertStrategyPerformanceSnapshot,
-  updatePaperOptionTrade,
 } from '../src/database/paperRuntime.js';
 import {
   parseArgs,
@@ -21,7 +19,6 @@ import {
   buildEodReport,
   runEodReport,
   EOD_TEST_MESSAGE,
-  OPTIONS_DISCLOSURE,
 } from '../scripts/sendPaperEodReport.js';
 
 function freshDb() {
@@ -150,7 +147,6 @@ test('collectEodData aggregates paper_trades and rejected_trades (all-time)', ()
   assert.equal(data.fills, 1); // only AAPL had a fill price
   assert.equal(data.rejectedCount, 3);
   assert.equal(data.proposals, 5);
-  assert.equal(data.optionsCount, 0);
   // Recurring reason surfaces first.
   assert.equal(data.rejectionReasons[0].n, 2);
   assert.match(data.rejectionReasons[0].reason, /is not up/);
@@ -454,50 +450,11 @@ test('buildEodReport renders sanitized sizing fixture variants truthfully', () =
   closeDatabase(db);
 });
 
-test('the EOD report shows the options-execution section (opened/closed/realized P&L) with a loud unresolved warning', () => {
+test('an empty day still renders a delivery-proving no-trade report', () => {
   const db = freshDb();
-  const closed = insertPaperOptionTrade(db, {
-    underlying: 'AAPL', optionSymbol: 'AAPL260116C00150000', expiry: '2026-01-16', strike: 150,
-    right: 'call', quantity: 1, premiumEntry: 2.0, notionalEntry: 200, strategy: 'long_call',
-    exitPolicy: 'test', status: 'open', lifecycleState: 'pending_entry',
-  }).id;
-  updatePaperOptionTrade(db, closed, {
-    lifecycleState: 'closed', status: 'closed', premiumExit: 2.5, realizedPnlUsd: 50,
-    exitReason: 'take_profit', closedAt: '2026-06-18T19:00:00.000Z',
-  });
-  const unresolved = insertPaperOptionTrade(db, {
-    underlying: 'MSFT', optionSymbol: 'MSFT260116P00400000', expiry: '2026-01-16', strike: 400,
-    right: 'put', quantity: 1, premiumEntry: 3.0, notionalEntry: 300, strategy: 'long_put',
-    exitPolicy: 'test', status: 'open', lifecycleState: 'unresolved',
-  }).id;
-  updatePaperOptionTrade(db, unresolved, { exitReason: 'unfilled after 6 attempts past close' });
-
-  const text = buildEodReport(collectEodData(db, { day: null }), {}).join('\n');
-  assert.match(text, /Options execution \(PAPER, long calls\/puts only\)/);
-  assert.match(text, /opened:\s+2/);
-  assert.match(text, /closed:\s+1/);
-  assert.match(text, /realized option P&L: 50/);
-  assert.match(text, /take_profit=1/);
-  assert.match(text, /⚠ WARNING: 1 UNRESOLVED option position/);
-  assert.match(text, /MSFT260116P00400000/);
-  closeDatabase(db);
-});
-
-test('every EOD report carries the exact options-execution disclosure (active AND no-trade)', () => {
-  const db = freshDb();
-  // No-trade report still discloses the options status.
   const empty = buildEodReport(collectEodData(db, { day: null }), {}).join('\n');
-  assert.ok(empty.includes(OPTIONS_DISCLOSURE));
   assert.match(empty, /No paper-trading records for this day yet/);
-  // Active report discloses it too.
-  seedActivity(db);
-  const active = buildEodReport(collectEodData(db, { day: null }), { day: '2026-06-18' }).join('\n');
-  assert.ok(active.includes(OPTIONS_DISCLOSURE));
-  // The exact wording is locked.
-  assert.equal(
-    OPTIONS_DISCLOSURE,
-    'Monitored PAPER option execution is available for gated long calls/puts only: bounded buy-limit entries, monitored exits, and sell-to-close only.'
-  );
+  assert.match(empty, /PAPER trading only\. Live trading disabled\./);
   closeDatabase(db);
 });
 

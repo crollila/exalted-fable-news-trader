@@ -263,7 +263,6 @@ test('live trading defaults to disabled', () => {
   assert.equal(config.paperTrading, true);
   assert.deepEqual(config.paperCapabilities, {
     enableShorts: false,
-    enableOptions: false,
     enableMargin: false,
   });
 });
@@ -271,12 +270,10 @@ test('live trading defaults to disabled', () => {
 test('paper feature flags default off and parse strict true values', () => {
   const config = loadConfig({
     PAPER_ENABLE_SHORTS: 'true',
-    PAPER_ENABLE_OPTIONS: 'TRUE',
     PAPER_ENABLE_MARGIN: 'false',
   });
   assert.deepEqual(config.paperCapabilities, {
     enableShorts: true,
-    enableOptions: true,
     enableMargin: false,
   });
 });

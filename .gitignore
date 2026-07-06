@@ -12,6 +12,7 @@ coverage/
 *.sqlite-wal
 *.sqlite-shm
 data/*.sqlite-*
+data/*.bak
 
 # Runtime strategy state (non-secret, but local/per-run — committed template is
 # config/strategy-settings.example.json). The bot may write this only with --write.

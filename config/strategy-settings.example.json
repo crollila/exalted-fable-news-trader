@@ -1,5 +1,5 @@
 {
-  "_comment": "Committed template/defaults for ExaltedFable strategy settings. Copy to data/strategy-settings.json (gitignored) for local runtime overrides, or let scripts/updateStrategySettingsFromLearning.js --write create it. NON-SECRET ONLY. The bot NEVER writes .env and NEVER enables live trading.",
+  "_comment": "Committed template/defaults for ExaltedFable strategy settings. Copy to data/strategy-settings.json (gitignored) for local runtime overrides. NON-SECRET ONLY. The bot NEVER writes .env and NEVER enables live trading.",
   "version": 1,
   "settings": {
     "symbols": ["AAPL", "MSFT", "NVDA"],
@@ -19,9 +19,7 @@
     "sizing_enable_confidence_scaling": true,
     "sizing_enable_impact_scaling": true,
     "interval_minutes": 15,
-    "max_iterations": null,
-    "scrape_target_groups": ["filings", "company_news"],
-    "scrape_symbol_focus": ["AAPL", "MSFT", "NVDA"]
+    "max_iterations": null
   },
   "notes": []
 }

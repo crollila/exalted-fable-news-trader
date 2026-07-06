@@ -27,19 +27,12 @@ import { runMigrations } from '../src/database/migrations.js';
 import { createDiscordWebhookClient } from '../src/notifications/discordWebhookClient.js';
 import {
   getLatestStrategyPerformanceSnapshot,
-  insertRecommendationAudit,
   listEquitySizingDecisions,
 } from '../src/database/paperRuntime.js';
 import {
   formatReturn,
   hydratePerformanceSnapshotRow,
 } from '../src/paper/brokerTruth.js';
-import {
-  buildConstraintRecommendations,
-  formatRecommendationsSection,
-} from '../src/paper/constraintRecommendations.js';
-import { buildStrategyRecommendations, formatStrategySection } from '../src/paper/strategyLearning.js';
-import { loadStrategySettings } from '../src/config/strategySettings.js';
 
 /** Short message used by --test-message (proves delivery without a full report). */
 export const EOD_TEST_MESSAGE =
@@ -53,12 +46,10 @@ const LIST_CAP = 10;
  * happens only when --send-discord (or --test-message) is explicitly present.
  *   --day YYYY-MM-DD   --dry-run   --send-discord   --test-message
  *   --session-id N
- *   --include-constraint-recommendations (default on)   --no-constraint-recommendations
  */
 export function parseArgs(argv) {
   const args = {
     day: null, sessionId: null, send: false, testMessage: false, dryRun: false,
-    includeRecommendations: true, includeStrategyRecommendations: true,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -76,14 +67,6 @@ export function parseArgs(argv) {
       args.testMessage = true;
     } else if (flag === '--dry-run') {
       args.dryRun = true;
-    } else if (flag === '--include-constraint-recommendations') {
-      args.includeRecommendations = true;
-    } else if (flag === '--no-constraint-recommendations') {
-      args.includeRecommendations = false;
-    } else if (flag === '--no-strategy-recommendations') {
-      args.includeStrategyRecommendations = false;
-    } else if (flag === '--include-strategy-recommendations') {
-      args.includeStrategyRecommendations = true;
     }
   }
   return args;
@@ -516,7 +499,7 @@ function equitySizingSection(data = {}) {
  * next-day ideas) derived ONLY from the counts above — no model calls, no free
  * text beyond our own rejection-reason strings.
  */
-export function buildEodReport(data, { day = null, recommendations = null, strategy = null } = {}) {
+export function buildEodReport(data, { day = null } = {}) {
   const label = day ?? data.day ?? 'all-time';
   const session = data.session ?? {};
   const dataQuality = data.dataQuality ?? assessEodDataQuality(data);
@@ -540,8 +523,6 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     );
     lines.push('', ...brokerTruthSection(data));
     lines.push('', ...equitySizingSection(data));
-    if (strategy) lines.push('', ...formatStrategySection(strategy));
-    if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
     return lines;
   }
 
@@ -636,8 +617,6 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
   }
   lines.push('', ...brokerTruthSection(data));
   lines.push('', ...equitySizingSection(data));
-  if (strategy) lines.push('', ...formatStrategySection(strategy));
-  if (Array.isArray(recommendations)) lines.push('', ...formatRecommendationsSection(recommendations));
   return lines;
 }
 
@@ -658,72 +637,21 @@ export async function runEodReport(
   db,
   {
     day = null, send = false, testMessage = false, discordClient = null,
-    sessionId = null,
-    includeRecommendations = true, currentConstraints = {}, minSampleSize,
-    includeStrategyRecommendations = true, strategySettings = null, sessionStats = null,
+    sessionId = null, sessionStats = null,
   } = {}
 ) {
   const data = collectEodData(db, { day, sessionId });
   if (sessionStats) {
     data.session = { ...data.session, ...sessionStats };
   }
-  const dataQuality = assessEodDataQuality(data, { minSampleSize });
+  const dataQuality = assessEodDataQuality(data);
   data.dataQuality = dataQuality;
-  // Recommendations + strategy analysis are advisory only; they never edit
-  // .env, strategy files, prompts, risk limits, DB settings, or runtime behavior.
-  let recResult = includeRecommendations && dataQuality.canRecommend
-    ? buildConstraintRecommendations({ data, current: currentConstraints, minSampleSize })
-    : null;
-  if (includeRecommendations && !dataQuality.canRecommend && String(currentConstraints?.LIVE_TRADING_ENABLED) === 'true') {
-    const safety = buildConstraintRecommendations({ data, current: currentConstraints, minSampleSize });
-    recResult = {
-      analysis: safety.analysis,
-      recommendations: safety.recommendations.filter((r) => r.variable === 'LIVE_TRADING_ENABLED'),
-    };
-  }
-  const strategyResult = includeStrategyRecommendations && dataQuality.canRecommend
-    ? buildStrategyRecommendations({ data, settings: strategySettings ?? loadStrategySettings().settings })
-    : null;
-  const renderedRecommendations = includeRecommendations
-    ? (recResult ? recResult.recommendations : [])
-    : null;
-  const lines = buildEodReport(data, {
-    day,
-    recommendations: renderedRecommendations,
-    strategy: strategyResult,
-  });
+  const lines = buildEodReport(data, { day });
   const content = lines.join('\n');
   const result = {
     day, data, lines, content, sent: false,
-    recommendations: renderedRecommendations,
-    strategy: strategyResult,
     dataQuality,
   };
-
-  if (recResult && recResult.recommendations.length > 0) {
-    insertRecommendationAudit(db, {
-      version: 'constraint_recommendations_v1',
-      kind: 'constraint_suggestion',
-      evidenceWindowStart: day,
-      evidenceWindowEnd: day,
-      sampleSize: recResult.analysis.sampleSize,
-      dataQuality: recResult.analysis.sampleSize >= (minSampleSize ?? 10) ? 'sufficient' : 'limited',
-      observations: [recResult.analysis],
-      recommendations: recResult.recommendations,
-    });
-  }
-  if (strategyResult && strategyResult.changes.length > 0) {
-    insertRecommendationAudit(db, {
-      version: 'strategy_recommendations_v1',
-      kind: 'strategy_suggestion',
-      evidenceWindowStart: day,
-      evidenceWindowEnd: day,
-      sampleSize: strategyResult.analysis.sampleSize,
-      dataQuality: strategyResult.analysis.sampleSize >= 10 ? 'sufficient' : 'limited',
-      observations: [strategyResult.analysis, strategyResult.researchFocus],
-      recommendations: strategyResult.changes,
-    });
-  }
 
   if (send || testMessage) {
     if (!discordClient) {
@@ -738,23 +666,8 @@ export async function runEodReport(
   return result;
 }
 
-/**
- * Build the sanitized map of CURRENT .env constraint values for the recommender.
- * Reads through config ONLY (never the raw .env). Only the knobs the system
- * actually wires are populated; the rest stay unset so the recommender marks
- * them "(not set)" rather than inventing a current value. LIVE_TRADING_ENABLED is
- * surfaced so the recommender can insist it stays false (it never emits true).
- */
-export function currentConstraintsFromConfig(config) {
-  return {
-    MAX_TRADES_PER_DAY: config?.risk?.maxTradesPerDay ?? null,
-    LIVE_TRADING_ENABLED: config?.liveTradingEnabled ? 'true' : 'false',
-  };
-}
-
 async function main() {
-  const { day, sessionId, send, testMessage, includeRecommendations, includeStrategyRecommendations } =
-    parseArgs(process.argv.slice(2));
+  const { day, sessionId, send, testMessage } = parseArgs(process.argv.slice(2));
   const config = loadConfig();
   const wantSend = send || testMessage;
 
@@ -781,9 +694,6 @@ async function main() {
 
     const result = await runEodReport(db, {
       day, sessionId, send, testMessage, discordClient,
-      includeRecommendations,
-      includeStrategyRecommendations,
-      currentConstraints: currentConstraintsFromConfig(config),
     });
     for (const line of result.lines) console.log(line);
     if (result.sent) {

@@ -44,8 +44,6 @@ export const DEFAULT_SETTINGS = Object.freeze({
   sizing_enable_impact_scaling: true,
   interval_minutes: 15,
   max_iterations: null,
-  scrape_target_groups: ['filings', 'company_news'],
-  scrape_symbol_focus: ['AAPL', 'MSFT', 'NVDA'],
 });
 
 /** Per-field validation/cap specs. Keys NOT listed here are dropped. */
@@ -68,8 +66,6 @@ export const SETTING_SPECS = Object.freeze({
   sizing_enable_impact_scaling: { kind: 'bool' },
   interval_minutes: { kind: 'int', min: MIN_INTERVAL_MINUTES, max: 1440 },
   max_iterations: { kind: 'optional_int', min: 1, max: MAX_ITERATIONS_CAP },
-  scrape_target_groups: { kind: 'strings' },
-  scrape_symbol_focus: { kind: 'symbols' },
 });
 
 /** Keys that must never appear in strategy settings (defense in depth). */

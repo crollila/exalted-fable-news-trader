@@ -20,10 +20,6 @@ import {
   listBrokerConfirmedEquityOutcomes,
   getOwnedEquityExposureSnapshot,
   getPaperEventAttemptStats,
-  insertRecommendationAudit,
-  listRecommendationAudits,
-  insertUniverseSelections,
-  listUniverseSelections,
 } from '../src/database/paperRuntime.js';
 
 function freshDb() {
@@ -232,40 +228,3 @@ test('equity sizing audits and evidence helpers use only broker-confirmed bot-ow
   closeDatabase(db);
 });
 
-test('recommendation audits persist versioned evidence summaries only', () => {
-  const db = freshDb();
-  const { id } = insertRecommendationAudit(db, {
-    version: 'paper_research_v1',
-    kind: 'constraint_suggestion',
-    evidenceWindowStart: '2026-06-18',
-    evidenceWindowEnd: '2026-06-18',
-    sampleSize: 12,
-    dataQuality: 'sufficient',
-    observations: [{ slice: 'confidence>=0.75', outcome: '+1.2%' }],
-    recommendations: [{ manualEditLine: 'PAPER_CONFIDENCE_THRESHOLD=0.65' }],
-  });
-  assert.equal(id, 1);
-  const row = listRecommendationAudits(db, { kind: 'constraint_suggestion' })[0];
-  assert.equal(row.version, 'paper_research_v1');
-  assert.equal(row.sample_size, 12);
-  assert.deepEqual(JSON.parse(row.recommendations_json), [
-    { manualEditLine: 'PAPER_CONFIDENCE_THRESHOLD=0.65' },
-  ]);
-  closeDatabase(db);
-});
-
-test('universe selections record selected and skipped symbol rationale', () => {
-  const db = freshDb();
-  const cycleAt = '2026-06-18T14:00:00.000Z';
-  assert.equal(insertUniverseSelections(db, [
-    { cycleAt, symbol: 'aapl', selected: true, rankScore: 3.2, reasons: ['base universe'], source: 'base' },
-    { cycleAt, symbol: 'tsla', selected: false, rankScore: 0.4, reasons: ['fresh news'], skippedReason: 'cap reached', source: 'news' },
-  ]).inserted, 2);
-  const rows = listUniverseSelections(db, { cycleAt });
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0].symbol, 'AAPL');
-  assert.equal(rows[0].selected, 1);
-  assert.deepEqual(JSON.parse(rows[1].reasons_json), ['fresh news']);
-  assert.equal(rows[1].skipped_reason, 'cap reached');
-  closeDatabase(db);
-});

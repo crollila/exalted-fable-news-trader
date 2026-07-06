@@ -114,14 +114,10 @@ function seedSufficientLosingSession(db) {
 
 // --- arg parsing -----------------------------------------------------------
 
-test('parseArgs defaults to a local dry run (no send), recommendations on', () => {
+test('parseArgs defaults to a local dry run (no send)', () => {
   assert.deepEqual(parseArgs([]), {
     day: null, sessionId: null, send: false, testMessage: false, dryRun: false,
-    includeRecommendations: true, includeStrategyRecommendations: true,
   });
-  assert.equal(parseArgs(['--no-constraint-recommendations']).includeRecommendations, false);
-  assert.equal(parseArgs(['--include-constraint-recommendations']).includeRecommendations, true);
-  assert.equal(parseArgs(['--no-strategy-recommendations']).includeStrategyRecommendations, false);
 });
 
 test('parseArgs reads --day, --send-discord, --test-message, --dry-run', () => {
@@ -537,48 +533,9 @@ test('the full path runs with zero real network', async () => {
   }
 });
 
-// --- constraint recommendations section ------------------------------------
+// --- data quality ------------------------------------------------------------
 
-const SAMPLE_REC = {
-  variable: 'MAX_TRADE_NOTIONAL_PCT', action: 'decrease', currentValue: 0.01, recommendedValue: 0.0075,
-  reason: 'losing day; reduce per-trade notional', confidence: 'medium', urgency: 'recommended',
-  evidence: { winningTrades: 0, losingTrades: 2, ordersSubmitted: 2, rejectedCount: 1 },
-  manualEditLine: 'MAX_TRADE_NOTIONAL_PCT=0.0075',
-};
-
-test('buildEodReport renders the recommendations section + caution when recommendations are passed', () => {
-  const db = freshDb();
-  seedActivity(db);
-  const text = buildEodReport(collectEodData(db, { day: null }), { recommendations: [SAMPLE_REC] }).join('\n');
-  assert.match(text, /Recommended manual \.env changes/);
-  assert.match(text, /MAX_TRADE_NOTIONAL_PCT=0.0075/);
-  assert.match(text, /The bot did not edit \.env\. These are recommendations only\./);
-  closeDatabase(db);
-});
-
-test('buildEodReport shows the no-change message for an empty recommendations array', () => {
-  const db = freshDb();
-  const text = buildEodReport(collectEodData(db, { day: null }), { recommendations: [] }).join('\n');
-  assert.match(text, /No manual \.env constraint changes recommended today\./);
-  closeDatabase(db);
-});
-
-test('runEodReport includes a recommendations section by default and can suppress it', async () => {
-  const db = freshDb();
-  seedActivity(db); // limited/uncorrelated sample; must not trigger threshold recommendations
-  const withRecs = await runEodReport(db, { day: null });
-  assert.match(withRecs.content, /Recommended manual \.env changes/);
-  assert.ok(Array.isArray(withRecs.recommendations));
-  assert.deepEqual(withRecs.recommendations, []);
-  assert.match(withRecs.content, /data quality:\s+limited/);
-
-  const without = await runEodReport(db, { day: null, includeRecommendations: false });
-  assert.ok(!without.content.includes('Recommended manual .env changes'));
-  assert.equal(without.recommendations, null);
-  closeDatabase(db);
-});
-
-test('duplicate event replay contaminates evidence and suppresses recommendations', async () => {
+test('duplicate event replay is flagged as limited data quality', async () => {
   const db = freshDb();
   const sessionId = Number(db.prepare(
     `INSERT INTO paper_runtime_sessions
@@ -600,25 +557,11 @@ test('duplicate event replay contaminates evidence and suppresses recommendation
   const r = await runEodReport(db, { day: '2026-06-18', sessionId });
   assert.equal(r.dataQuality.status, 'limited');
   assert.match(r.content, /duplicate\/stale event replay/);
-  assert.deepEqual(r.recommendations, []);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_recommendation_audits').get().n, 0);
   closeDatabase(db);
 });
 
-test('recommendations never enable live trading (even if currently enabled, recommend false)', async () => {
+test('the report adds no secrets/raw content', async () => {
   const db = freshDb();
-  seedActivity(db);
-  const r = await runEodReport(db, { day: null, currentConstraints: { LIVE_TRADING_ENABLED: 'true' } });
-  assert.match(r.content, /LIVE_TRADING_ENABLED=false/);
-  assert.ok(!r.content.includes('LIVE_TRADING_ENABLED=true'));
-  // No recommendation line may ever propose enabling live trading.
-  for (const rec of r.recommendations) assert.notEqual(rec.manualEditLine, 'LIVE_TRADING_ENABLED=true');
-  closeDatabase(db);
-});
-
-test('the recommendations section adds no secrets/raw content to the report', async () => {
-  const db = freshDb();
-  // Seed a sentiment score with raw text; the report (incl. recommendations) must not surface it.
   db.prepare(
     `INSERT INTO news_events (provider, provider_event_id, ticker, headline, published_at, received_at, news_type)
      VALUES ('t','e1','AAPL','SECRET-HEADLINE-MUST-NOT-PRINT','2026-06-18T14:00:00.000Z','2026-06-18T14:00:00.000Z','other')`
@@ -631,34 +574,6 @@ test('the recommendations section adds no secrets/raw content to the report', as
   const r = await runEodReport(db, { day: null });
   assert.ok(!r.content.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
   assert.ok(!r.content.includes('RAW-MODEL-RESPONSE-MUST-NOT-PRINT'));
-  closeDatabase(db);
-});
-
-test('runEodReport suppresses strategy recommendations when data quality is limited', async () => {
-  const db = freshDb();
-  seedActivity(db);
-  const r = await runEodReport(db, { day: null });
-  assert.ok(!r.content.includes('Strategy setting recommendations'));
-  assert.equal(r.strategy, null);
-  // Suppressible.
-  const off = await runEodReport(db, { day: null, includeStrategyRecommendations: false });
-  assert.ok(!off.content.includes('Strategy setting recommendations'));
-  closeDatabase(db);
-});
-
-test('sufficient unique session evidence can emit recommendations and audit them', async () => {
-  const db = freshDb();
-  const sessionId = seedSufficientLosingSession(db);
-  const r = await runEodReport(db, {
-    day: '2026-06-18',
-    sessionId,
-    currentConstraints: { MAX_TRADE_NOTIONAL_PCT: 0.01, LIVE_TRADING_ENABLED: 'false' },
-  });
-  assert.equal(r.dataQuality.status, 'sufficient');
-  assert.ok(r.recommendations.some((rec) => rec.variable === 'MAX_TRADE_NOTIONAL_PCT'));
-  assert.match(r.content, /MAX_TRADE_NOTIONAL_PCT=0\.0075/);
-  const audits = db.prepare('SELECT kind, sample_size, data_quality FROM paper_recommendation_audits').all();
-  assert.ok(audits.some((a) => a.kind === 'constraint_suggestion' && a.sample_size === 10 && a.data_quality === 'sufficient'));
   closeDatabase(db);
 });
 

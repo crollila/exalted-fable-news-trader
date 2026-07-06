@@ -173,14 +173,13 @@ test('parseArgs defaults are conservative, dry-run, no shorts', () => {
 test('parseArgs reads advanced flags + caps and clamps qty', () => {
   const a = parseArgs([
     '--symbols', 'aapl,msft', '--qty', '99999', '--allow-shorts',
-    '--max-order-notional', '500', '--max-gross-exposure', '5000', '--max-symbols-per-cycle', '2', '--execute-paper',
+    '--max-order-notional', '500', '--max-gross-exposure', '5000', '--execute-paper',
   ]);
   assert.deepEqual(a.symbols, ['AAPL', 'MSFT']);
   assert.equal(a.qty, MAX_QTY);
   assert.equal(a.qtyExplicit, true);
   assert.equal(a.allowShorts, true);
   assert.equal(a.caps.maxOrderNotional, 500);
-  assert.equal(a.maxSymbolsPerCycle, 2);
   assert.equal(a.caps.maxGrossExposure, 5000);
   assert.equal(a.executePaper, true);
 });
@@ -401,8 +400,6 @@ test('fresh ingest/classify/trade cycle reaches the fake PAPER submit client', a
   assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED);
   assert.equal(cycle.ingestion.inserted, 1);
   assert.equal(cycle.classification.stored, 1);
-  assert.deepEqual(cycle.universe.selectedSymbols, ['AAPL']);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_universe_selections').get().n, 1);
   assert.equal(client.calls.equity.length, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 1);
   const hb = oneLineDecisionSummary(cycle, Date.parse('2026-06-18T14:30:00.000Z'));

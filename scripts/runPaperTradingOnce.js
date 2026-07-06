@@ -64,11 +64,6 @@ import {
   scoreBucket,
   SIZING_MODES,
 } from '../src/paper/equitySizing.js';
-import {
-  selectCandidateUniverse,
-  DEFAULT_MAX_SYMBOLS_PER_CYCLE,
-  MAX_SYMBOLS_PER_CYCLE,
-} from '../src/paper/candidateUniverse.js';
 import { MODEL_PROMPT_VERSION } from '../src/sentiment/modelClassifier.js';
 
 export { DEFAULT_QTY, MAX_QTY, DEFAULT_THRESHOLDS, DEFAULT_CAPS };
@@ -83,7 +78,6 @@ export const DEFAULT_PAPER_INGEST_LIMIT = 20;
 export const MAX_PAPER_INGEST_LIMIT = 50;
 export const DEFAULT_PAPER_CLASSIFY_LIMIT = 5;
 export const MAX_PAPER_CLASSIFY_LIMIT = 5;
-export { DEFAULT_MAX_SYMBOLS_PER_CYCLE, MAX_SYMBOLS_PER_CYCLE };
 export const DEFAULT_NEWS_LOOKBACK_MINUTES = 60;
 export const MAX_NEWS_LOOKBACK_MINUTES = 390;
 
@@ -187,7 +181,6 @@ export function parseArgs(argv, defaults = {}) {
     classifier: defaults.classifier ?? null,
     ingestLimit: clampInt(defaults.ingestLimit, DEFAULT_PAPER_INGEST_LIMIT, 1, MAX_PAPER_INGEST_LIMIT),
     classifyLimit: clampInt(defaults.classifyLimit, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT),
-    maxSymbolsPerCycle: clampInt(defaults.maxSymbolsPerCycle, DEFAULT_MAX_SYMBOLS_PER_CYCLE, 1, MAX_SYMBOLS_PER_CYCLE),
     newsLookbackMinutes: clampInt(defaults.newsLookbackMinutes, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES),
     allowShorts: defaults.allowShorts === true,
     thresholds: { ...(defaults.thresholds ?? {}) },
@@ -214,7 +207,6 @@ export function parseArgs(argv, defaults = {}) {
     else if (flag === '--classifier' && next) { args.classifier = next.trim(); i += 1; }
     else if (flag === '--ingest-limit' && next) { args.ingestLimit = clampInt(next, DEFAULT_PAPER_INGEST_LIMIT, 1, MAX_PAPER_INGEST_LIMIT); i += 1; }
     else if (flag === '--classify-limit' && next) { args.classifyLimit = clampInt(next, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT); i += 1; }
-    else if (flag === '--max-symbols-per-cycle' && next) { args.maxSymbolsPerCycle = clampInt(next, DEFAULT_MAX_SYMBOLS_PER_CYCLE, 1, MAX_SYMBOLS_PER_CYCLE); i += 1; }
     else if (flag === '--news-lookback-minutes' && next) { args.newsLookbackMinutes = clampInt(next, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES); i += 1; }
     else if (flag === '--allow-shorts') { args.allowShorts = true; }
     else if (flag === '--max-order-notional' && next) { setCap('maxOrderNotional', next); i += 1; }
@@ -902,7 +894,6 @@ export async function runPaperDecisionCycle(
     mode: args.executePaper ? 'execute_paper' : 'dry_run',
     outcome: null,
     skipReason: null,
-    universe: null,
     ingestion: null,
     classification: null,
     freshCandidates: [],
@@ -911,14 +902,7 @@ export async function runPaperDecisionCycle(
     lines: [],
   };
   const since = new Date(nowMs - args.newsLookbackMinutes * 60_000).toISOString();
-  const universe = selectCandidateUniverse(db, {
-    baseSymbols: args.symbols,
-    since,
-    maxSymbols: args.maxSymbolsPerCycle,
-    cycleAt: new Date(nowMs).toISOString(),
-  });
-  const cycleArgs = { ...args, symbols: universe.selectedSymbols.length > 0 ? universe.selectedSymbols : args.symbols };
-  base.universe = universe;
+  const cycleArgs = args;
 
   if (Number.isInteger(args.eventId) && args.eventId > 0) {
     const selected = selectRecentScoredEvent(db, {
@@ -1038,11 +1022,8 @@ export function oneLineDecisionSummary(cycle, nowMs = Date.now()) {
   const selected = cycle?.selected
     ? `event=${cycle.selected.event.id} ${cycle.selected.event.ticker} age=${ageLabel(cycle.selected.freshness?.receivedAt, nowMs)}`
     : 'event=(none)';
-  const universe = cycle?.universe
-    ? `universe selected=${cycle.universe.selectedSymbols.join(',') || '(none)'}`
-    : 'universe skipped';
   const skip = cycle?.skipReason ? `skip=${cycle.skipReason}` : oneLineSummary(cycle?.trade?.result);
-  return `${cycle?.outcome ?? 'unknown'}; ${universe}; ${ing}; ${cls}; ${selected}; ${skip}`;
+  return `${cycle?.outcome ?? 'unknown'}; ${ing}; ${cls}; ${selected}; ${skip}`;
 }
 
 export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
@@ -1054,13 +1035,6 @@ export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
     lines.push(
       `  ingest:     fetched=${cycle.ingestion.fetched} inserted=${cycle.ingestion.inserted} ` +
         `duplicates=${cycle.ingestion.duplicates} failed=${cycle.ingestion.failed}`
-    );
-  }
-  if (cycle.universe) {
-    const skipped = cycle.universe.ranked.filter((r) => !r.selected).map((r) => `${r.symbol}:${r.skippedReason}`);
-    lines.push(
-      `  universe:   selected=${cycle.universe.selectedSymbols.join(',') || '(none)'} ` +
-        `skipped=${skipped.join(',') || '(none)'}`
     );
   }
   if (cycle.classification) {

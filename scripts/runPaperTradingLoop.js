@@ -52,7 +52,7 @@ import {
   paperFeaturesFromConfig,
 } from './runPaperTradingOnce.js';
 import { buildClassifier } from './classifyNewsOnce.js';
-import { runEodReport, currentConstraintsFromConfig } from './sendPaperEodReport.js';
+import { runEodReport } from './sendPaperEodReport.js';
 
 export { MIN_INTERVAL_MINUTES };
 
@@ -364,7 +364,6 @@ async function main() {
           sessionId: stats.sessionId,
           send: true,
           discordClient,
-          currentConstraints: currentConstraintsFromConfig(config),
           sessionStats: stats,
         });
         for (const line of eod.lines) console.log(line);

@@ -4,8 +4,8 @@
 // SCOPE — conservative equity proposals (long AND short):
 // - Equity LONG (direction up -> market BUY) and SHORT (direction down ->
 //   market SELL, only when --allow-shorts is enabled). Whole shares only.
-// - Options live in optionsProposal.js; margin/notional sizing lives in
-//   paperRisk.js. assessProposal stays a PURE score/direction gate.
+// - Margin/notional sizing lives in paperRisk.js. assessProposal stays a
+//   PURE score/direction gate.
 // - assessProposal is a PURE function (no DB, no network, no clock): given an
 //   event + its sentiment score, it returns an accept/reject decision with a
 //   human-readable reason. The script decides whether to persist/execute.

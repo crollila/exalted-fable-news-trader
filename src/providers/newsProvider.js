@@ -1,5 +1,5 @@
 // src/providers/newsProvider.js — The provider contract every news source
-// must satisfy (Alpaca News, Benzinga, Polygon/Massive, Alpha Vantage, ...).
+// must satisfy (Alpaca News, Benzinga, and any future source).
 //
 // JavaScript has no interfaces, so the contract is documented as JSDoc
 // typedefs plus runtime validation helpers. Future providers should be

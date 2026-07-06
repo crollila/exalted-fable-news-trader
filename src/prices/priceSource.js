@@ -3,8 +3,8 @@
 // Mirrors the provider/classifier injection pattern: the contract is JSDoc
 // typedefs plus runtime validation, and the fixture source is backed by
 // injected trade data with a throwing default — structurally incapable of
-// calling a market-data API or needing keys. Real Alpaca/Polygon price
-// clients are a later, separately reviewed step behind this same interface.
+// calling a market-data API or needing keys. Real price clients sit behind
+// this same interface.
 
 /**
  * @typedef {object} Trade

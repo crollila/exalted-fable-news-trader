@@ -5,13 +5,9 @@
 import {
   createAlpacaNewsProvider,
   createBenzingaNewsProvider,
-  createAlphaVantageNewsProvider,
-  createPolygonNewsProvider,
 } from '../../src/providers/index.js';
 import { ALPACA_NEWS_FIXTURES } from '../fixtures/alpacaNews.js';
 import { BENZINGA_NEWS_FIXTURES } from '../fixtures/benzingaNews.js';
-import { ALPHA_VANTAGE_NEWS_FIXTURES } from '../fixtures/alphaVantageNews.js';
-import { POLYGON_NEWS_FIXTURES } from '../fixtures/polygonNews.js';
 
 /**
  * One entry per real (non-mock) provider adapter.
@@ -20,8 +16,6 @@ import { POLYGON_NEWS_FIXTURES } from '../fixtures/polygonNews.js';
 export const PROVIDER_REGISTRY = [
   { expectedName: 'alpaca', factory: createAlpacaNewsProvider, fixtures: ALPACA_NEWS_FIXTURES },
   { expectedName: 'benzinga', factory: createBenzingaNewsProvider, fixtures: BENZINGA_NEWS_FIXTURES },
-  { expectedName: 'alpha_vantage', factory: createAlphaVantageNewsProvider, fixtures: ALPHA_VANTAGE_NEWS_FIXTURES },
-  { expectedName: 'polygon', factory: createPolygonNewsProvider, fixtures: POLYGON_NEWS_FIXTURES },
 ];
 
 /** Build a provider wired to its static fixtures (no network). */

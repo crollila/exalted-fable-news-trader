@@ -13,11 +13,9 @@ const EXPECTED_FACTORY_EXPORTS = [
   'createMockProvider',
   'createAlpacaNewsProvider',
   'createBenzingaNewsProvider',
-  'createAlphaVantageNewsProvider',
-  'createPolygonNewsProvider',
 ];
 
-const EXPECTED_NAMES = ['alpaca', 'benzinga', 'alpha_vantage', 'polygon'];
+const EXPECTED_NAMES = ['alpaca', 'benzinga'];
 
 test('all planned provider factories are exported from src/providers/index.js', () => {
   for (const name of EXPECTED_FACTORY_EXPORTS) {

@@ -1,124 +1,40 @@
 # BUILD_PLAN.md — ExaltedFable
 
-## Phase 0 — Setup
+## Delivered (Phases 0–7, plus the 2026-07 simplification)
 
-Goal: Create a clean V2 repo without touching V1.
+The original 8-phase build plan is complete and its scope was then re-cut by
+the 2026-07 simplification (see `STATUS.md`):
 
-Tasks:
-1. Create `ExaltedFable` folder.
-2. Initialize Git.
-3. Add project source files.
-4. Add `.gitignore`.
-5. Add `.env.example`.
-6. Add initial README.
-7. Make first commit.
+- **Phase 0 — Setup:** clean V2 repo, `.env.example`, tests-first workflow.
+- **Phase 1 — Measurement foundation:** SQLite migrations for `news_events`,
+  `sentiment_scores`, `price_reactions`, `paper_trades`, `risk_state`,
+  `rejected_trades`.
+- **Phase 2 — Provider abstraction:** pluggable `NewsProvider` contract;
+  Alpaca (primary) + Benzinga (optional plug-in) survived the simplification.
+- **Phase 3 — Sentiment/classification:** versioned prompts, OpenAI/Anthropic
+  classifiers, strict parsing with failures-as-data.
+- **Phase 4 — Event study:** price reactions at 10s/1m/5m/30m/1h/EOD with
+  unavailable-price outcomes recorded as data.
+- **Phase 5 — Paper trading journal:** paper-only Alpaca client (hard-wired
+  paper endpoint), fills, slippage-ready journal, broker-truth reconciliation.
+- **Phase 6 — Risk engine:** notional/exposure/daily caps, shorts/margin
+  gating, and (added 2026-07) the daily-loss kill switch over `risk_state`.
+- **Phase 7 — Reporting:** sanitized EOD report with SPY-benchmark
+  performance, Discord delivery.
+- **Phase 8 (superseded):** "strategy improvements" grew into options trading,
+  advisory recommendation engines, universe ranking, and scraper planning —
+  all removed by the 2026-07 simplification. The two learning layers that
+  survived are learned equity sizing and the event study; data retention
+  (`scripts/compactDatabase.js`) keeps the DB lean forever.
 
-## Phase 1 — Measurement Foundation
+## Roadmap
 
-Goal: Log everything before changing strategy logic.
-
-Tasks:
-1. Add SQLite database layer.
-2. Add schema/migrations for:
-   - news_events
-   - sentiment_scores
-   - price_reactions
-   - paper_trades
-   - risk_state
-   - rejected_trades
-3. Add database utility functions.
-4. Add basic validation tests.
-
-## Phase 2 — News Provider Abstraction
-
-Goal: Avoid hard-coded Benzinga dependence.
-
-Tasks:
-1. Define standard `NewsProvider` interface.
-2. Add provider result normalization.
-3. Add Alpaca News provider.
-4. Add Benzinga provider if key available.
-5. Add Alpha Vantage provider for slower research/news sentiment.
-6. Add Polygon/Massive provider if useful.
-7. Store provider metadata in database.
-
-## Phase 3 — Sentiment + Classification
-
-Goal: Score and classify every event.
-
-Tasks:
-1. Create model prompt versioning.
-2. Classify news type.
-3. Score sentiment/impact.
-4. Store raw model response.
-5. Store confidence and parser status.
-6. Add fallback handling when model output is malformed.
-
-## Phase 4 — Event Study
-
-Goal: Prove whether the signal predicts price movement.
-
-Tasks:
-1. Record price at event time.
-2. Record price after:
-   - 10s
-   - 1m
-   - 5m
-   - 30m
-   - 1h
-   - EOD
-3. Calculate reaction returns.
-4. Group results by score bucket, news type, ticker, provider, time of day.
-
-## Phase 5 — Paper Trading Journal
-
-Goal: Compare theoretical trades against actual paper fills.
-
-Tasks:
-1. Log signal time and theoretical entry price.
-2. Submit paper orders only.
-3. Record actual fill price/time.
-4. Calculate slippage.
-5. Record exits.
-6. Calculate realized P&L.
-7. Track max adverse/favorable excursion.
-
-## Phase 6 — Risk Engine
-
-Goal: Prevent dumb losses in paper and later live-small testing.
-
-Tasks:
-1. Max position size.
-2. Max total exposure.
-3. Max daily loss.
-4. Max trades per day.
-5. Kill switch.
-6. Rejected-trade logging.
-
-## Phase 7 — Reporting
-
-Goal: Decide what actually has edge.
-
-Reports:
-1. Expectancy by score bucket.
-2. Expectancy by news type.
-3. Expectancy by provider.
-4. Expectancy by ticker.
-5. Expectancy by time of day.
-6. Fill quality.
-7. Slippage.
-8. Long vs short performance.
-9. Liquidity bucket performance.
-
-## Phase 8 — Strategy Improvements
-
-Only start after measurement exists.
-
-Possible improvements:
-1. Remove weak news categories.
-2. Tune thresholds.
-3. Separate long and short logic.
-4. Add liquidity/spread filters.
-5. Add duplicate suppression.
-6. Optimize exits.
-7. Add walk-forward validation.
+1. **Prove/deny edge with data.** Run the paper loop through real market-hours
+   sessions and accumulate enough broker-confirmed outcomes to read the
+   event-study expectancy by news type / score bucket.
+2. **Tune the signal, not the machinery.** Adjust thresholds and the
+   classifier prompt based on measured expectancy; drop news types with no
+   edge.
+3. **Exits.** Today positions are entered and reconciled but exits are
+   manual/held; a measured exit policy (profit target / stop / time stop, as
+   V1 had) is the next real feature — designed against event-study evidence.

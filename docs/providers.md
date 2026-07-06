@@ -4,12 +4,11 @@ How ExaltedFable ingests news without being hard-coded to any single source.
 
 ## Purpose
 
-Every news source (Alpaca, Benzinga, Alpha Vantage, Polygon/Massive, future
-providers) has its own field names, timestamp formats, and quirks. The
-provider abstraction confines those differences to one small adapter file per
-source. Everything downstream — persistence, event study, sentiment,
-reporting — sees exactly one canonical event shape and never a
-provider-specific field.
+Every news source (Alpaca, Benzinga, future providers) has its own field
+names, timestamp formats, and quirks. The provider abstraction confines those
+differences to one small adapter file per source. Everything downstream —
+persistence, event study, sentiment, reporting — sees exactly one canonical
+event shape and never a provider-specific field.
 
 ## The canonical path
 
@@ -48,34 +47,31 @@ const provider = createAlpacaNewsProvider({
 **By default no transport is configured and `fetchNews()` rejects with
 "no transport configured".** This is deliberate: an adapter skeleton is
 structurally incapable of making network calls or needing API keys. Tests
-inject fixture-backed stubs; a real HTTP client becomes the default transport
-in a later phase without changing any mapping logic. The registry test
+inject fixture-backed stubs; the scripts inject the real HTTP client
+explicitly when credentials exist. The registry test
 (`tests/providerRegistry.test.js`) verifies every adapter rejects by default
 while a fetch stub proves zero network attempts.
 
 ## Current providers
 
-| Name            | Factory                          | Notes                                                          |
-| --------------- | -------------------------------- | -------------------------------------------------------------- |
-| `mock`          | `createMockProvider`             | In-memory items, supports symbol/since/until/limit filtering    |
-| `alpaca`        | `createAlpacaNewsProvider`       | v1beta1 shape; dedicated numeric id                             |
-| `benzinga`      | `createBenzingaNewsProvider`     | RFC-2822 timestamps; object-wrapped stocks/channels             |
-| `alpha_vantage` | `createAlphaVantageNewsProvider` | No dedicated id → derived from article URL; compact timestamps  |
-| `polygon`       | `createPolygonNewsProvider`      | String hash ids; published_utc already ISO; insights in raw     |
+| Name       | Factory                      | Notes                                                                 |
+| ---------- | ---------------------------- | --------------------------------------------------------------------- |
+| `mock`     | `createMockProvider`         | In-memory items, supports symbol/since/until/limit filtering           |
+| `alpaca`   | `createAlpacaNewsProvider`   | Primary source; real transport `createAlpacaNewsHttpTransport`         |
+| `benzinga` | `createBenzingaNewsProvider` | Optional plug-in; working HTTP transport parked on `backup/pre-cleanup` |
 
 All factories are exported from `src/providers/index.js`; the registry test
 fails if one goes missing or a name changes.
 
 ## Current limitations (deliberate)
 
-- No real API clients yet — adapters are fixture/transport-injection only.
-- No API keys or `.env` use anywhere in the provider layer.
-- Provider-supplied sentiment (Alpha Vantage scores, Polygon insights) stays
-  in `raw_payload` only; nothing writes to `sentiment_scores`. Our own
-  sentiment/classification engine is Phase 3.
-- `receivedAt` is stamped at normalization time; true wire-receipt timestamps
-  arrive with the real transports.
-- `dedup_group` remains null until cross-provider story grouping is built.
+- Only Alpaca has a wired real transport; Benzinga runs on injected/fixture
+  transports until its parked transport returns with a key.
+- Provider-supplied sentiment stays in `raw_payload` only; nothing writes to
+  `sentiment_scores` except ExaltedFable's own classifiers.
+- `receivedAt` is stamped at normalization time.
+- `dedup_group` remains null until cross-provider story grouping is built
+  (a candidate for cherry-picking from `backup/pre-cleanup`).
 
 ## Adding a provider
 

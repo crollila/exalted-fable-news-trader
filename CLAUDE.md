@@ -35,13 +35,13 @@ Use modular components:
 
 ## News providers
 
-The system should support pluggable news providers:
+The system supports pluggable news providers through the `NewsProvider`
+contract:
 
-- Alpaca News
-- Benzinga
-- Polygon/Massive
-- Alpha Vantage
-- future providers
+- Alpaca News (primary; real HTTP transport)
+- Benzinga (optional plug-in; its HTTP transport is parked on
+  `backup/pre-cleanup`)
+- future providers (one adapter file + one registry entry each)
 
 Do not hard-code the system around one source.
 

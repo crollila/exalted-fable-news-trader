@@ -164,6 +164,9 @@ export function parseArgs(argv, defaults = {}) {
     newsLookbackMinutes: clampInt(defaults.newsLookbackMinutes, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES),
     allowShorts: defaults.allowShorts === true,
     maxDailyLossUsd: parsePosNum(defaults.maxDailyLossUsd),
+    maxDailyLossPct: parsePosNum(defaults.maxDailyLossPct) !== null && Number(defaults.maxDailyLossPct) <= 1
+      ? Number(defaults.maxDailyLossPct)
+      : null,
     thresholds: { ...(defaults.thresholds ?? {}) },
     caps: { ...(defaults.caps ?? {}) },
     sizingSettings: { ...(defaults.sizingSettings ?? {}) },
@@ -191,6 +194,9 @@ export function parseArgs(argv, defaults = {}) {
     else if (flag === '--news-lookback-minutes' && next) { args.newsLookbackMinutes = clampInt(next, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES); i += 1; }
     else if (flag === '--allow-shorts') { args.allowShorts = true; }
     else if (flag === '--max-daily-loss' && next) { args.maxDailyLossUsd = parsePosNum(next); i += 1; }
+    else if (flag === '--max-daily-loss-pct' && next) {
+      const p = parsePosNum(next); if (p !== null && p <= 1) args.maxDailyLossPct = p; i += 1;
+    }
     else if (flag === '--max-order-notional' && next) { setCap('maxOrderNotional', next); i += 1; }
     else if (flag === '--max-symbol-exposure' && next) { setCap('maxSymbolExposure', next); i += 1; }
     else if (flag === '--max-gross-exposure' && next) { setCap('maxGrossExposure', next); i += 1; }
@@ -210,6 +216,7 @@ async function main() {
     ...defaults,
     caps: { ...riskCapDefaultsFromConfig(config), ...(defaults.caps ?? {}) },
     maxDailyLossUsd: config.risk?.maxDailyLossUsd,
+    maxDailyLossPct: config.risk?.maxDailyLossPct,
     paperFeatures: paperFeaturesFromConfig(config),
   });
 

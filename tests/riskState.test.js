@@ -11,6 +11,7 @@ import {
   computeRealizedDailyPnl,
   getRiskState,
   isKillSwitchActive,
+  resolveDailyLossCap,
   tradingDay,
   tripKillSwitch,
   updateDailyLossState,
@@ -60,6 +61,25 @@ test('assessDailyLoss trips only when the realized loss breaches the cap', () =>
   assert.equal(assessDailyLoss({ realizedPnlUsd: 50, maxDailyLossUsd: 100 }).exceeded, false);
   assert.equal(assessDailyLoss({ realizedPnlUsd: -9999, maxDailyLossUsd: null }).exceeded, false); // no cap
   assert.equal(assessDailyLoss({ realizedPnlUsd: null, maxDailyLossUsd: 100 }).exceeded, false); // unknown pnl
+});
+
+test('resolveDailyLossCap prefers percent-of-equity and falls back to fixed USD', () => {
+  // $1M account at 1% -> $10,000/day, NOT the $100 fallback.
+  const pct = resolveDailyLossCap({
+    account: { equity: 1_000_000 },
+    maxDailyLossPct: 0.01,
+    maxDailyLossUsd: 100,
+  });
+  assert.equal(pct.capUsd, 10000);
+  assert.match(pct.basis, /1\.00% of equity/);
+
+  // No broker equity (keyless dry run) -> fixed USD fallback.
+  const usd = resolveDailyLossCap({ account: null, maxDailyLossPct: 0.01, maxDailyLossUsd: 100 });
+  assert.equal(usd.capUsd, 100);
+  assert.match(usd.basis, /equity unavailable/);
+
+  // Nothing configured -> no cap.
+  assert.equal(resolveDailyLossCap({}).capUsd, null);
 });
 
 // --- risk_state persistence --------------------------------------------------

@@ -113,6 +113,9 @@ export function loadConfig(env = process.env) {
       channelId: env.DISCORD_CHANNEL_ID || null,
     }),
     risk: Object.freeze({
+      // Percent-of-equity daily loss cap (fraction, 0.01 = 1%). Preferred when
+      // broker equity is known; the USD cap is the fallback (keyless dry runs).
+      maxDailyLossPct: Number(env.MAX_DAILY_LOSS_PCT ?? 0.01),
       maxDailyLossUsd: Number(env.MAX_DAILY_LOSS_USD ?? 100),
       maxPositionSizeUsd: Number(env.MAX_POSITION_SIZE_USD ?? 500),
       maxTradesPerDay: Number(env.MAX_TRADES_PER_DAY ?? 10),

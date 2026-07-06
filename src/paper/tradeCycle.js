@@ -46,6 +46,7 @@ import {
 import {
   getRiskState,
   isKillSwitchActive,
+  resolveDailyLossCap,
   tradingDay,
   updateDailyLossState,
 } from './riskState.js';
@@ -759,8 +760,18 @@ export async function executeSelectedPaperTrade(
   });
 
   // After the attempt, refresh the day's realized-loss state and trip the
-  // switch when MAX_DAILY_LOSS_USD is breached (halts the REST of the day).
-  const lossState = updateDailyLossState(db, { day, maxDailyLossUsd: args.maxDailyLossUsd ?? null });
+  // switch when the daily loss cap is breached (halts the REST of the day).
+  // Percent-of-equity is preferred; fixed USD is the keyless fallback.
+  const lossCap = resolveDailyLossCap({
+    account,
+    maxDailyLossPct: args.maxDailyLossPct ?? null,
+    maxDailyLossUsd: args.maxDailyLossUsd ?? null,
+  });
+  const lossState = updateDailyLossState(db, {
+    day,
+    maxDailyLossUsd: lossCap.capUsd,
+    capBasis: lossCap.basis,
+  });
   result.killSwitch = {
     active: lossState.tripped || lossState.alreadyActive,
     tripped: lossState.tripped,

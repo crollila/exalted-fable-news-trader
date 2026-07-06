@@ -106,10 +106,34 @@ export function computeRealizedDailyPnl(db, day) {
   };
 }
 
+/**
+ * Resolve the effective daily-loss cap in USD. Percent-of-equity is preferred
+ * (scales with the account, e.g. 1% of a $1M paper account = $10,000); the
+ * fixed USD cap is the fallback when broker equity is unavailable (keyless
+ * dry runs). Returns { capUsd, basis } — basis is a human-readable label.
+ */
+export function resolveDailyLossCap({ account = null, maxDailyLossPct = null, maxDailyLossUsd = null } = {}) {
+  const pct = finiteOrNull(maxDailyLossPct);
+  const usd = finiteOrNull(maxDailyLossUsd);
+  const equity = finiteOrNull(account?.equity ?? account?.portfolioValue);
+  if (pct !== null && pct > 0 && equity !== null && equity > 0) {
+    const capUsd = Math.round(equity * pct * 100) / 100;
+    return {
+      capUsd,
+      basis: `MAX_DAILY_LOSS_PCT ${(pct * 100).toFixed(2)}% of equity $${equity.toFixed(2)} = $${capUsd.toFixed(2)}`,
+    };
+  }
+  if (usd !== null && usd > 0) {
+    return { capUsd: usd, basis: `MAX_DAILY_LOSS_USD $${usd.toFixed(2)} (equity unavailable for percent cap)` };
+  }
+  return { capUsd: null, basis: 'no daily loss cap configured' };
+}
+
 /** Pure daily-loss assessment: exceeded when realized loss > cap. */
-export function assessDailyLoss({ realizedPnlUsd, maxDailyLossUsd } = {}) {
+export function assessDailyLoss({ realizedPnlUsd, maxDailyLossUsd, capBasis = null } = {}) {
   const pnl = finiteOrNull(realizedPnlUsd);
   const cap = finiteOrNull(maxDailyLossUsd);
+  const label = capBasis ?? (cap !== null ? `MAX_DAILY_LOSS_USD $${cap.toFixed(2)}` : null);
   if (cap === null || cap <= 0) {
     return { exceeded: false, reason: 'no daily loss cap configured', realizedPnlUsd: pnl, maxDailyLossUsd: cap };
   }
@@ -120,8 +144,8 @@ export function assessDailyLoss({ realizedPnlUsd, maxDailyLossUsd } = {}) {
   return {
     exceeded,
     reason: exceeded
-      ? `daily realized loss $${Math.abs(pnl).toFixed(2)} breached MAX_DAILY_LOSS_USD $${cap.toFixed(2)}`
-      : `daily realized P&L $${pnl.toFixed(2)} within MAX_DAILY_LOSS_USD $${cap.toFixed(2)}`,
+      ? `daily realized loss $${Math.abs(pnl).toFixed(2)} breached ${label}`
+      : `daily realized P&L $${pnl.toFixed(2)} within ${label}`,
     realizedPnlUsd: pnl,
     maxDailyLossUsd: cap,
   };
@@ -132,10 +156,10 @@ export function assessDailyLoss({ realizedPnlUsd, maxDailyLossUsd } = {}) {
  * risk_state, and trip the kill switch when the loss cap is breached. Returns
  * the assessment plus whether this call tripped the switch.
  */
-export function updateDailyLossState(db, { day, maxDailyLossUsd } = {}) {
+export function updateDailyLossState(db, { day, maxDailyLossUsd, capBasis = null } = {}) {
   const d = requiredDay(day);
   const { realizedPnlUsd } = computeRealizedDailyPnl(db, d);
-  const assessment = assessDailyLoss({ realizedPnlUsd, maxDailyLossUsd });
+  const assessment = assessDailyLoss({ realizedPnlUsd, maxDailyLossUsd, capBasis });
   const already = isKillSwitchActive(db, d);
   if (assessment.exceeded && !already) {
     tripKillSwitch(db, { day: d, reason: assessment.reason, realizedPnlUsd });

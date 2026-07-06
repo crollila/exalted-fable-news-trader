@@ -35,6 +35,9 @@ the 2026-07 simplification (see `STATUS.md`):
 2. **Tune the signal, not the machinery.** Adjust thresholds and the
    classifier prompt based on measured expectancy; drop news types with no
    edge.
-3. **Exits.** Today positions are entered and reconciled but exits are
-   manual/held; a measured exit policy (profit target / stop / time stop, as
-   V1 had) is the next real feature — designed against event-study evidence.
+3. ~~**Exits.**~~ Delivered 2026-07-06: a learned exit policy
+   (stop-loss / take-profit / max-hold in `src/paper/exitPolicy.js` +
+   `positionMonitor.js`) closes positions every cycle, with the stop/target
+   adapting to broker-confirmed win/loss sizes inside hard rails. Next
+   refinement candidate: per-news-type exit parameters once the event study
+   shows they differ.

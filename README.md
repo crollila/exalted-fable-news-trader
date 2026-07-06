@@ -19,36 +19,49 @@ with the measurement, risk, and learning discipline V1 lacked.
 - **DRY RUN IS THE DEFAULT.** Real paper orders go out only with
   `--execute-paper` and configured Alpaca keys.
 - **Hard risk rails:** per-order notional, per-symbol and gross exposure,
-  daily order-count and notional caps, and a **daily-loss kill switch**
-  (`MAX_DAILY_LOSS_USD`) that halts all new trades for the rest of the UTC day
-  when the day's broker-confirmed realized loss breaches the cap. Every
-  refused trade is logged to `rejected_trades` with the reason.
+  daily order-count and notional caps, and a **daily-loss kill switch** that
+  halts all new trades for the rest of the UTC day when the day's
+  broker-confirmed realized loss breaches the cap. The cap is
+  percent-of-equity (`MAX_DAILY_LOSS_PCT`, default 1% — $10,000/day on a $1M
+  paper account) with `MAX_DAILY_LOSS_USD` as the fixed fallback when equity
+  is unknown. Every refused trade is logged to `rejected_trades` with the
+  reason.
+- **Managed exits:** every cycle checks open positions BEFORE new entries and
+  closes them on stop-loss, take-profit, or a max-hold clock. The stop and
+  target **adapt as the system learns** — re-derived each cycle from
+  broker-confirmed win/loss sizes, hard-clamped to rails so learning can tune
+  the protection but never remove it.
 - **Sanitized output only.** No raw model responses, provider payloads, API
   keys, or webhook URLs in logs or reports. The bot never writes `.env`.
 
 ## The pipeline
 
 ```
+exit monitor (close open positions first: learned stop-loss / take-profit / max-hold)
+  ← runs at the start of every cycle, before any new entry
 news (Alpaca / Benzinga plug-in)
   → news_events (SQLite, deduped)
   → LLM classification (OpenAI production, Anthropic optional)
       sentiment / impact / confidence / direction / news type
   → equity proposal (long on up; short on down when enabled)
   → learned position sizing (evidence-weighted from broker-confirmed outcomes)
-  → risk gate (caps + kill switch)
+  → risk gate (caps + percent-of-equity kill switch)
   → Alpaca PAPER market order  →  paper_trades / rejected_trades
   → broker-truth reconciliation (fills, realized P&L, SPY benchmark)
   → event-study measurement (price reactions at 10s/1m/5m/30m/1h/EOD)
   → end-of-day report (console or Discord webhook)
 ```
 
-Two learning layers persist forever:
+Three learning layers persist forever:
 
 - **Event study** (`price_reactions`): which news types/scores actually move
   prices — the evidence for edge.
 - **Learned equity sizing** (`paper_equity_sizing_decisions`): position sizes
   scale with broker-confirmed historical outcomes for comparable signals, and
   abstain without evidence.
+- **Learned exits** (`src/paper/exitPolicy.js`): stop-loss and take-profit
+  levels adapt to the observed win/loss distribution once enough confirmed
+  outcomes exist (`exit_*` strategy settings; bounded by hard rails).
 
 `scripts/compactDatabase.js` keeps the database from bloating: old raw
 payloads/model responses are nulled after `RETENTION_RAW_DAYS` (default 90),
@@ -96,13 +109,14 @@ snapshot), `runMvpPipelineOnce.js` (whole research loop, never trades),
 ## Configuration
 
 - `.env` (secrets + risk knobs — see `.env.example`): Alpaca/OpenAI keys,
-  `MAX_DAILY_LOSS_USD` (kill switch), `MAX_POSITION_SIZE_USD`,
-  `MAX_TRADES_PER_DAY`, `MAX_TOTAL_EXPOSURE_USD` (cap defaults),
-  `PAPER_ENABLE_SHORTS` / `PAPER_ENABLE_MARGIN` (off by default),
-  `RETENTION_RAW_DAYS`, optional `DISCORD_WEBHOOK_URL`.
+  `MAX_DAILY_LOSS_PCT` / `MAX_DAILY_LOSS_USD` (kill switch),
+  `MAX_POSITION_SIZE_USD`, `MAX_TRADES_PER_DAY`, `MAX_TOTAL_EXPOSURE_USD`
+  (cap defaults), `PAPER_ENABLE_SHORTS` / `PAPER_ENABLE_MARGIN` (off by
+  default), `RETENTION_RAW_DAYS`, optional `DISCORD_WEBHOOK_URL`.
 - `config/strategy-settings.example.json` → copy to
   `data/strategy-settings.json` for non-secret runtime defaults (symbols,
-  thresholds, caps, sizing knobs). Explicit CLI flags always win.
+  thresholds, caps, sizing knobs, `exit_*` exit policy). Explicit CLI flags
+  always win.
 
 ## News providers
 
@@ -121,9 +135,10 @@ changes.
 
 ```
 scripts/                thin CLIs (parse flags, build clients, print reports)
-src/paper/tradeCycle.js the decision cycle (ingest→classify→size→risk→order→record)
+src/paper/tradeCycle.js the decision cycle (exits→ingest→classify→size→risk→order→record)
 src/paper/              alpacaPaperClient (paper-only), paperTradeProposal,
                         paperRisk, riskState (kill switch), equitySizing,
+                        exitPolicy + positionMonitor (learned exits),
                         brokerTruth (+SPY benchmark), accountCapabilities,
                         marketHours, paperTradingLoop
 src/providers/          NewsProvider contract + Alpaca/Benzinga/mock adapters

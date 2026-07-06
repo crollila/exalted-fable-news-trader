@@ -5,12 +5,12 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
 
-- Current phase: **2026-07 simplification COMPLETE** — the project was cut back
-  to the core loop (news → LLM score → paper trade → measure → learn → report)
-  in a 9-commit series ending with the documentation-alignment commit that
-  ships this checkpoint. Latest code commit before docs: `8cf57ce`
-  (`feat(db): add data-retention compaction`).
-- Verification: full `npm test` passes at 459/459 with zero live network calls.
+- Current phase: **simplified core + managed exits, running research
+  sessions.** The 2026-07 simplification (pushed as `b9ab7d3..50250f4`) was
+  followed by two features requested on review: a percent-of-equity daily-loss
+  kill switch (`92b2c34`) and the self-adjusting exit engine (`f161bf2`), plus
+  this docs refresh.
+- Verification: full `npm test` passes at 476/476 with zero live network calls.
 - The system is a PAPER-only AI news event-study and Alpaca paper-trading
   research system. Live trading remains disabled by default and impossible
   through the paper client: order submission is hard-wired to
@@ -50,7 +50,14 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   strict JSON parsing; failures recorded as data (`parser_status`).
 - Trading: equities only (long by default; shorts behind
   `PAPER_ENABLE_SHORTS` + `--allow-shorts`), learned equity sizing with
-  broker-confirmed evidence, margin-aware risk caps, per-day kill switch.
+  broker-confirmed evidence, margin-aware risk caps, per-day kill switch
+  (percent-of-equity via `MAX_DAILY_LOSS_PCT`, USD fallback).
+- Exits: every cycle manages open positions BEFORE new entries — stop-loss /
+  take-profit / max-hold (`exitPolicy.js` + `positionMonitor.js`, migration
+  012 exit-order columns). Stop/target re-derive from broker-confirmed
+  win/loss sizes each cycle, clamped to hard rails; exits run even while the
+  kill switch is active. Closed exits write broker-confirmed realized P&L,
+  which feeds the kill switch and both learning layers.
 - Truth & measurement: broker-truth reconciliation with SPY-benchmark
   performance snapshots; event-study price reactions at 10s/1m/5m/30m/1h/EOD.
 - Reporting: sanitized end-of-day report (console dry-run default; Discord
@@ -73,9 +80,10 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 ## Next Recommended Task
 
 Run the paper loop through several real market-hours sessions
-(`--classifier openai --execute-paper`) to validate learned sizing and the
-kill switch against live paper data, then review the event-study summary for
-the first edge/no-edge evidence before considering any strategy changes.
+(`--classifier openai --execute-paper`). The first execute run will also
+close the 6 stale open positions from earlier sessions via max-hold exits.
+Then review the event-study summary and exit-reason breakdown for the first
+edge/no-edge evidence before considering any strategy changes.
 
 ## Maintenance Rule
 

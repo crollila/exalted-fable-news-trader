@@ -196,6 +196,7 @@ async function main() {
     caps: { ...riskCapDefaultsFromConfig(config), ...(paperDefaults.caps ?? {}) },
     maxDailyLossUsd: config.risk?.maxDailyLossUsd,
     maxDailyLossPct: config.risk?.maxDailyLossPct,
+    optionConfig: config.optionExecution,
     paperFeatures: paperFeaturesFromConfig(config),
   });
   const hasPaperCreds = Boolean(config.alpacaPaper.keyId && config.alpacaPaper.secretKey);

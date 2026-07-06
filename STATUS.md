@@ -5,12 +5,13 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 
 ## Current Status
 
-- Current phase: **simplified core + managed exits, running research
-  sessions.** The 2026-07 simplification (pushed as `b9ab7d3..50250f4`) was
-  followed by two features requested on review: a percent-of-equity daily-loss
-  kill switch (`92b2c34`) and the self-adjusting exit engine (`f161bf2`), plus
-  this docs refresh.
-- Verification: full `npm test` passes at 476/476 with zero live network calls.
+- Current phase: **simplified core + managed exits + restored PAPER options,
+  running research sessions.** After the 2026-07 simplification, three
+  user-requested features landed: the percent-of-equity daily-loss kill switch
+  (`92b2c34`), the self-adjusting exit engine (`f161bf2`), and restored
+  options trading (long calls/puts, migration 013) rebuilt on top of the exit
+  engine — options are ON by default for paper.
+- Verification: full `npm test` passes at 526/526 with zero live network calls.
 - The system is a PAPER-only AI news event-study and Alpaca paper-trading
   research system. Live trading remains disabled by default and impossible
   through the paper client: order submission is hard-wired to
@@ -48,16 +49,21 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
   transport-injected plug-in) behind the pluggable `NewsProvider` contract.
 - Classification: OpenAI (production) / Anthropic (optional) classifiers with
   strict JSON parsing; failures recorded as data (`parser_status`).
-- Trading: equities only (long by default; shorts behind
-  `PAPER_ENABLE_SHORTS` + `--allow-shorts`), learned equity sizing with
-  broker-confirmed evidence, margin-aware risk caps, per-day kill switch
-  (percent-of-equity via `MAX_DAILY_LOSS_PCT`, USD fallback).
+- Trading: equities (long by default; shorts behind `PAPER_ENABLE_SHORTS` +
+  `--allow-shorts`) AND options (long calls/puts, ON by default via
+  `PAPER_ENABLE_OPTIONS`/`allow_options`; bounded limit entries, premium cap,
+  session/pre-close entry gate, contract discovery + quote validation).
+  Learned equity sizing with broker-confirmed evidence, margin-aware risk
+  caps, per-day kill switch (percent-of-equity via `MAX_DAILY_LOSS_PCT`, USD
+  fallback) that counts BOTH equity and option realized P&L.
 - Exits: every cycle manages open positions BEFORE new entries — stop-loss /
-  take-profit / max-hold (`exitPolicy.js` + `positionMonitor.js`, migration
-  012 exit-order columns). Stop/target re-derive from broker-confirmed
-  win/loss sizes each cycle, clamped to hard rails; exits run even while the
-  kill switch is active. Closed exits write broker-confirmed realized P&L,
-  which feeds the kill switch and both learning layers.
+  take-profit / max-hold for equities (`exitPolicy.js` + `positionMonitor.js`)
+  and the option monitor (`optionExits.js` + `optionMonitor.js`: TP/SL,
+  max-hold, forced same-day flatten, sell-to-close requoting). Stop/target
+  re-derive from broker-confirmed win/loss sizes each cycle (option exits
+  learn against wider option rails), clamped so learning can never remove
+  protection; exits run even while the kill switch is active. Closed exits
+  write broker-confirmed realized P&L, feeding the kill switch and learning.
 - Truth & measurement: broker-truth reconciliation with SPY-benchmark
   performance snapshots; event-study price reactions at 10s/1m/5m/30m/1h/EOD.
 - Reporting: sanitized end-of-day report (console dry-run default; Discord
@@ -81,9 +87,13 @@ Keep this file short and factual. It is a checkpoint, not a changelog.
 
 Run the paper loop through several real market-hours sessions
 (`--classifier openai --execute-paper`). The first execute run will also
-close the 6 stale open positions from earlier sessions via max-hold exits.
-Then review the event-study summary and exit-reason breakdown for the first
-edge/no-edge evidence before considering any strategy changes.
+close the stale open equity positions from earlier sessions via max-hold
+exits, and strong signals will now open bounded long calls/puts alongside
+stock. Then review the event-study summary, exit-reason breakdown, and the
+options-execution section for the first edge/no-edge evidence before
+considering any strategy changes. NOTE: if the local `.env` still contains
+`PAPER_ENABLE_OPTIONS=false` from the earlier era, flip it to true (or delete
+the line) — the bot never edits `.env`.
 
 ## Maintenance Rule
 

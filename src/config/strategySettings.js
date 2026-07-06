@@ -28,8 +28,10 @@ export const NOTES_CAP = 50;
 export const DEFAULT_SETTINGS = Object.freeze({
   symbols: ['AAPL', 'MSFT', 'NVDA'],
   allow_shorts: false,
+  allow_options: true,
   allow_margin: false,
   max_order_notional: 500,
+  max_option_premium: 250,
   max_symbol_exposure: 1000,
   max_gross_exposure: 5000,
   max_daily_paper_orders: 10,
@@ -55,8 +57,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
 export const SETTING_SPECS = Object.freeze({
   symbols: { kind: 'symbols' },
   allow_shorts: { kind: 'bool' },
+  allow_options: { kind: 'bool' },
   allow_margin: { kind: 'bool' },
   max_order_notional: { kind: 'num', min: 1, max: 100000 },
+  max_option_premium: { kind: 'num', min: 1, max: 100000 },
   max_symbol_exposure: { kind: 'num', min: 1, max: 1000000 },
   max_gross_exposure: { kind: 'num', min: 1, max: 1000000 },
   max_daily_paper_orders: { kind: 'int', min: 1, max: 500 },

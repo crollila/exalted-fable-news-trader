@@ -227,6 +227,24 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     )
     .all(...dayParams);
 
+  const optionRows = db
+    .prepare(
+      `SELECT news_event_id, underlying, option_symbol, right, quantity, premium_entry, notional_entry,
+              premium_exit, notional_exit, realized_pnl_usd, strategy, exit_reason,
+              lifecycle_state, status, opened_at, closed_at, created_at
+         FROM paper_option_trades ${dayClause}
+        ORDER BY id DESC`
+    )
+    .all(...dayParams);
+  const optionLifecycle = (o) =>
+    o.lifecycle_state || (o.status === 'closed' ? 'closed' : o.status === 'canceled' ? 'canceled' : 'open');
+  const OPTION_OPEN_STATES = new Set(['pending_entry', 'open', 'pending_exit', 'unresolved']);
+  const optionsClosed = optionRows.filter((o) => optionLifecycle(o) === 'closed').length;
+  const optionsCanceled = optionRows.filter((o) => optionLifecycle(o) === 'canceled').length;
+  const optionsOpenRows = optionRows.filter((o) => OPTION_OPEN_STATES.has(optionLifecycle(o)));
+  const optionsUnresolvedRows = optionRows.filter((o) => optionLifecycle(o) === 'unresolved');
+  const optionsRealizedPnl = round2(optionRows.reduce((s, o) => s + (Number(o.realized_pnl_usd) || 0), 0));
+
   // Exits closed in this window, grouped by policy reason (take_profit /
   // stop_loss / max_hold / other).
   const exitReasonRows = db
@@ -355,6 +373,31 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     evidenceScope: filter.label,
     riskState: day ? getRiskState(db, day) : null,
     exits,
+    optionsCount: optionRows.length,
+    optionsOpened: optionRows.length,
+    optionsClosed,
+    optionsCanceled,
+    optionsOpenUnresolved: optionsOpenRows.length,
+    optionsRealizedPnl,
+    options: optionRows.slice(0, LIST_CAP).map((o) => ({
+      underlying: o.underlying,
+      optionSymbol: o.option_symbol,
+      right: o.right,
+      qty: o.quantity,
+      premiumEntry: o.premium_entry,
+      premiumExit: o.premium_exit,
+      realizedPnl: o.realized_pnl_usd,
+      strategy: o.strategy,
+      status: o.status,
+      lifecycleState: optionLifecycle(o),
+      exitReason: o.exit_reason,
+    })),
+    optionsUnresolved: optionsUnresolvedRows.map((o) => ({
+      optionSymbol: o.option_symbol,
+      qty: o.quantity,
+      lifecycleState: optionLifecycle(o),
+      exitReason: o.exit_reason,
+    })),
     ...evidence,
     ordersSubmitted: trades.length,
     longCount,
@@ -398,6 +441,49 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
       samples: sizingSamples,
     },
   };
+}
+
+/**
+ * Sanitized options-execution section: opened/closed/open/unresolved counts,
+ * realized option P&L, exit reasons, a per-position sample, and a LOUD warning
+ * for any unresolved position (long calls/puts only).
+ */
+function optionExecutionSection(data = {}) {
+  const lines = ['— Options execution (PAPER, long calls/puts only) —'];
+  const opened = data.optionsOpened ?? 0;
+  if (opened === 0) {
+    lines.push('  No bot option entries in this window. Options are monitored and flattened before close.');
+    return lines;
+  }
+  lines.push(
+    `  opened:              ${opened}`,
+    `  closed:              ${data.optionsClosed ?? 0}`,
+    `  canceled (no fill):  ${data.optionsCanceled ?? 0}`,
+    `  open / unresolved:   ${data.optionsOpenUnresolved ?? 0}`,
+    `  realized option P&L: ${data.optionsRealizedPnl ?? 0}`,
+  );
+  const exitReasons = {};
+  for (const o of data.options ?? []) if (o.exitReason) exitReasons[o.exitReason] = (exitReasons[o.exitReason] ?? 0) + 1;
+  const reasonStr = Object.entries(exitReasons).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(' ') || '(none yet)';
+  lines.push(`  exit reasons:        ${reasonStr}`);
+  for (const o of (data.options ?? []).slice(0, LIST_CAP)) {
+    lines.push(
+      `  ${o.optionSymbol} ${o.strategy ?? '?'} ${o.right ?? '?'} qty=${o.qty} ${o.lifecycleState ?? o.status} ` +
+        `entry=${o.premiumEntry ?? '?'} exit=${o.premiumExit ?? '—'} pnl=${o.realizedPnl ?? '—'}` +
+        `${o.exitReason ? ` reason=${o.exitReason}` : ''}`
+    );
+  }
+  const unresolved = data.optionsUnresolved ?? [];
+  if (unresolved.length > 0) {
+    lines.push('', `  ⚠ WARNING: ${unresolved.length} UNRESOLVED option position(s) NOT confirmed closed:`);
+    for (const o of unresolved.slice(0, LIST_CAP)) {
+      lines.push(`    ${o.optionSymbol} qty=${o.qty} state=${o.lifecycleState} reason=${o.exitReason ?? '(none)'}`);
+    }
+    lines.push('    These remain OPEN/uncertain at the broker — review and flatten manually.');
+  } else if ((data.optionsOpenUnresolved ?? 0) > 0) {
+    lines.push(`  Note: ${data.optionsOpenUnresolved} option position(s) still open/pending; monitored next cycle.`);
+  }
+  return lines;
 }
 
 function brokerTruthSection(data = {}) {
@@ -536,12 +622,13 @@ export function buildEodReport(data, { day = null } = {}) {
     '',
   ];
 
-  if (data.proposals === 0 && (session.cycles ?? 0) === 0 && (data.sizing?.decisions ?? 0) === 0) {
+  if (data.proposals === 0 && (session.cycles ?? 0) === 0 && (data.optionsOpened ?? 0) === 0 && (data.sizing?.decisions ?? 0) === 0) {
     lines.push(
       'No paper-trading records for this day yet.',
       'This report still proves Discord delivery; once the paper loop runs and',
       'writes paper_trades / rejected_trades, the full narrative appears here.',
     );
+    lines.push('', ...optionExecutionSection(data));
     lines.push('', ...brokerTruthSection(data));
     lines.push('', ...equitySizingSection(data));
     return lines;
@@ -560,6 +647,7 @@ export function buildEodReport(data, { day = null } = {}) {
     `  order statuses:                  ${fmtMap(data.orderStatus)}`,
     `  local fills (legacy/approx):      ${data.fills}`,
     `  equity long / short:             ${data.longCount} / ${data.shortCount}`,
+    `  option entries (calls/puts):     ${data.optionsCount ?? 0}`,
     `  rejected:                        ${data.rejectedCount}`,
     `  realized P&L (local approx, USD): ${data.realizedPnl}`,
     `  broker-confirmed owned P&L:      ${moneyOrUnavailable(data.brokerTruth?.exposure?.realizedPnlUsd)}`,
@@ -642,6 +730,7 @@ export function buildEodReport(data, { day = null } = {}) {
       lines.push(`  ${p.ticker} ${p.side} qty=${p.qty} approxExposure=${p.exposure}`);
     }
   }
+  lines.push('', ...optionExecutionSection(data));
   lines.push('', ...brokerTruthSection(data));
   lines.push('', ...equitySizingSection(data));
   return lines;

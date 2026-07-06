@@ -42,6 +42,7 @@ import {
   DEFAULT_NEWS_LOOKBACK_MINUTES,
   MAX_NEWS_LOOKBACK_MINUTES,
 } from '../src/paper/tradeCycle.js';
+import { DEFAULT_OPTION_CONTRACT_LIMIT } from '../src/paper/optionsProposal.js';
 
 // The trade cycle's public surface stays importable from this script so the
 // loop script and existing tests keep working unchanged.
@@ -97,6 +98,7 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
   const defaults = {};
   if (Array.isArray(settings.symbols)) defaults.symbols = cleanSymbols(settings.symbols);
   if (typeof settings.allow_shorts === 'boolean') defaults.allowShorts = settings.allow_shorts;
+  if (typeof settings.allow_options === 'boolean') defaults.allowOptions = settings.allow_options;
 
   defaults.thresholds = {};
   if (parseUnitFloat(settings.confidence_threshold) !== null) defaults.thresholds.minConfidence = Number(settings.confidence_threshold);
@@ -110,6 +112,10 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
   if (parsePosNum(settings.max_gross_exposure) !== null) defaults.caps.maxGrossExposure = Number(settings.max_gross_exposure);
   if (parsePosNum(settings.max_daily_paper_orders) !== null) defaults.caps.maxDailyPaperOrders = Number(settings.max_daily_paper_orders);
   if (parsePosNum(settings.max_daily_paper_notional) !== null) defaults.caps.maxDailyPaperNotional = Number(settings.max_daily_paper_notional);
+  if (parsePosNum(settings.max_option_premium) !== null) {
+    defaults.caps.maxOptionPremium = Number(settings.max_option_premium);
+    defaults.optionMaxPremium = Number(settings.max_option_premium);
+  }
   if (Object.keys(defaults.caps).length === 0) delete defaults.caps;
   defaults.sizingSettings = {};
   for (const key of [
@@ -139,6 +145,7 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
 export function paperFeaturesFromConfig(config = {}) {
   return {
     enableShorts: config?.paperCapabilities?.enableShorts === true,
+    enableOptions: config?.paperCapabilities?.enableOptions !== false,
     enableMargin: config?.paperCapabilities?.enableMargin === true,
   };
 }
@@ -175,6 +182,13 @@ export function parseArgs(argv, defaults = {}) {
     classifyLimit: clampInt(defaults.classifyLimit, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT),
     newsLookbackMinutes: clampInt(defaults.newsLookbackMinutes, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES),
     allowShorts: defaults.allowShorts === true,
+    allowOptions: defaults.allowOptions !== false,
+    optionSymbol: defaults.optionSymbol ?? null,
+    optionExpiryDaysMin: parsePosInt(defaults.optionExpiryDaysMin),
+    optionExpiryDaysMax: parsePosInt(defaults.optionExpiryDaysMax),
+    optionMaxPremium: parsePosNum(defaults.optionMaxPremium),
+    optionContractLimit: parsePosInt(defaults.optionContractLimit) ?? DEFAULT_OPTION_CONTRACT_LIMIT,
+    optionConfig: { ...(defaults.optionConfig ?? {}) },
     maxDailyLossUsd: parsePosNum(defaults.maxDailyLossUsd),
     maxDailyLossPct: parsePosNum(defaults.maxDailyLossPct) !== null && Number(defaults.maxDailyLossPct) <= 1
       ? Number(defaults.maxDailyLossPct)
@@ -206,6 +220,16 @@ export function parseArgs(argv, defaults = {}) {
     else if (flag === '--classify-limit' && next) { args.classifyLimit = clampInt(next, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT); i += 1; }
     else if (flag === '--news-lookback-minutes' && next) { args.newsLookbackMinutes = clampInt(next, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES); i += 1; }
     else if (flag === '--allow-shorts') { args.allowShorts = true; }
+    else if (flag === '--allow-options') { args.allowOptions = true; }
+    else if (flag === '--no-options') { args.allowOptions = false; }
+    else if (flag === '--option-symbol' && next) { args.optionSymbol = next.trim().toUpperCase(); i += 1; }
+    else if (flag === '--option-expiry-days-min' && next) { args.optionExpiryDaysMin = parsePosInt(next); i += 1; }
+    else if (flag === '--option-expiry-days-max' && next) { args.optionExpiryDaysMax = parsePosInt(next); i += 1; }
+    else if (flag === '--option-max-premium' && next) {
+      const n = parsePosNum(next); if (n !== null) { args.optionMaxPremium = n; args.caps.maxOptionPremium = n; } i += 1;
+    } else if (flag === '--option-contract-limit' && next) {
+      args.optionContractLimit = parsePosInt(next) ?? DEFAULT_OPTION_CONTRACT_LIMIT; i += 1;
+    }
     else if (flag === '--max-daily-loss' && next) { args.maxDailyLossUsd = parsePosNum(next); i += 1; }
     else if (flag === '--max-daily-loss-pct' && next) {
       const p = parsePosNum(next); if (p !== null && p <= 1) args.maxDailyLossPct = p; i += 1;
@@ -230,6 +254,7 @@ async function main() {
     caps: { ...riskCapDefaultsFromConfig(config), ...(defaults.caps ?? {}) },
     maxDailyLossUsd: config.risk?.maxDailyLossUsd,
     maxDailyLossPct: config.risk?.maxDailyLossPct,
+    optionConfig: config.optionExecution,
     paperFeatures: paperFeaturesFromConfig(config),
   });
 
@@ -266,7 +291,7 @@ async function main() {
     }
     if (!result) return;
 
-    const orderErr = result.equity?.orderError;
+    const orderErr = result.equity?.orderError || result.option?.orderError;
     if (orderErr) {
       console.log('Paper trading completed WITH AN ORDER ERROR (see above).');
       process.exitCode = 1;

@@ -34,8 +34,14 @@ import {
   getOwnedEquityExposureSnapshot,
   getPaperEventAttemptStats,
   insertEquitySizingDecision,
+  insertPaperOptionTrade,
   listBrokerConfirmedEquityOutcomes,
+  listClosedOptionOutcomes,
 } from '../database/paperRuntime.js';
+import { proposeOption, DEFAULT_OPTION_CONTRACT_LIMIT } from './optionsProposal.js';
+import { enrichOptionProposal } from './optionContracts.js';
+import { entryLimitPrice, optionEntryBlocked } from './optionExits.js';
+import { reconcileBotOptions } from './optionMonitor.js';
 import {
   decideEquitySizing,
   formatSizingDecision,
@@ -50,7 +56,7 @@ import {
   tradingDay,
   updateDailyLossState,
 } from './riskState.js';
-import { resolveExitSettings, resolveLearnedExitParams } from './exitPolicy.js';
+import { resolveExitSettings, resolveLearnedExitParams, OPTION_EXIT_RAILS } from './exitPolicy.js';
 import { monitorOpenEquityPositions } from './positionMonitor.js';
 import { MODEL_PROMPT_VERSION } from '../sentiment/modelClassifier.js';
 
@@ -58,6 +64,7 @@ export const DEFAULT_SYMBOLS = Object.freeze(['AAPL']);
 export const PAPER_CLASSIFIERS = Object.freeze(['openai', 'anthropic', 'real_model']);
 export const DEFAULT_PAPER_FEATURES = Object.freeze({
   enableShorts: false,
+  enableOptions: true, // PAPER long calls/puts with monitored exits
   enableMargin: false,
 });
 export const DEFAULT_PAPER_INGEST_LIMIT = 20;
@@ -93,6 +100,7 @@ export function clampInt(value, fallback, lo, hi) {
 export function resolvePaperFeatures(features = {}) {
   return {
     enableShorts: features.enableShorts === true,
+    enableOptions: features.enableOptions !== false, // default ON (paper-only)
     enableMargin: features.enableMargin === true,
   };
 }
@@ -110,6 +118,13 @@ function defaultCycleArgs() {
     classifyLimit: DEFAULT_PAPER_CLASSIFY_LIMIT,
     newsLookbackMinutes: DEFAULT_NEWS_LOOKBACK_MINUTES,
     allowShorts: false,
+    allowOptions: true,
+    optionSymbol: null,
+    optionMaxPremium: null,
+    optionContractLimit: DEFAULT_OPTION_CONTRACT_LIMIT,
+    optionExpiryDaysMin: null,
+    optionExpiryDaysMax: null,
+    optionConfig: {},
     thresholds: {},
     caps: {},
     sizingSettings: {},
@@ -196,8 +211,10 @@ export function getDailyCounters(db, day = new Date().toISOString().slice(0, 10)
 }
 
 /** Map a proposal to the shape paperRisk expects. */
-function riskShape(proposal) {
-  return { assetClass: 'equity', side: proposal.side, ticker: proposal.ticker, quantity: proposal.quantity };
+function riskShape(proposal, kind) {
+  return kind === 'option'
+    ? { assetClass: 'option', side: 'buy', ticker: proposal.underlying, quantity: proposal.contracts }
+    : { assetClass: 'equity', side: proposal.side, ticker: proposal.ticker, quantity: proposal.quantity };
 }
 
 function finiteNum(value) {
@@ -461,12 +478,13 @@ async function processProposal(db, proposal, ctx) {
     kind, capabilities, account, positions, caps, daily, referencePrice,
     executePaper, paperClient, paperFeatures = DEFAULT_PAPER_FEATURES,
     asset = null,
+    optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
     nowMs = Date.now(), sizingDecision = null, manualQtyOverride = false,
     currentOwnedExposure = 0, dataQualityWarnings = [],
   } = ctx;
   const sub = {
     kind, proposal, risk: null, decision: 'rejected',
-    rejectedTradeId: null, paperTradeId: null,
+    rejectedTradeId: null, paperTradeId: null, paperOptionTradeId: null,
     order: null, orderError: null,
     brokerTruthState: null, brokerHasFill: false,
     sizingDecision, manualQtyOverride, sizingAuditId: null,
@@ -476,9 +494,9 @@ async function processProposal(db, proposal, ctx) {
   if (!proposal.accepted) {
     sub.rejectedTradeId = insertRejectedTrade(db, {
       newsEventId: proposal.eventId,
-      ticker: proposal.ticker,
-      side: proposal.side,
-      quantity: proposal.quantity ?? null,
+      ticker: proposal.underlying ?? proposal.ticker,
+      side: kind === 'option' ? 'buy' : proposal.side,
+      quantity: proposal.contracts ?? proposal.quantity ?? null,
       reason: proposal.reason,
     }).id;
     insertSizingAuditIfPresent(db, sub, {
@@ -490,10 +508,10 @@ async function processProposal(db, proposal, ctx) {
   // Margin-aware risk gate (run when we have an account snapshot, or when we are
   // about to execute — a real order is never sent without a risk pass).
   const haveAccount = Boolean(capabilities && capabilities.available);
-  const needsMandatoryRisk = proposal.side === 'sell';
+  const needsMandatoryRisk = kind === 'option' || proposal.side === 'sell';
   if (haveAccount || executePaper || needsMandatoryRisk) {
     sub.risk = assessRisk({
-      proposal: riskShape(proposal),
+      proposal: riskShape(proposal, kind),
       capabilities: capabilities ?? { available: false },
       account, positions, caps, daily, referencePrice, executePaper,
       asset,
@@ -502,9 +520,9 @@ async function processProposal(db, proposal, ctx) {
     if (!sub.risk.approved) {
       sub.rejectedTradeId = insertRejectedTrade(db, {
         newsEventId: proposal.eventId,
-        ticker: proposal.ticker,
-        side: proposal.side,
-        quantity: proposal.quantity ?? null,
+        ticker: proposal.underlying ?? proposal.ticker,
+        side: kind === 'option' ? 'buy' : proposal.side,
+        quantity: proposal.contracts ?? proposal.quantity ?? null,
         reason: sub.risk.reason,
       }).id;
       insertSizingAuditIfPresent(db, sub, {
@@ -526,6 +544,59 @@ async function processProposal(db, proposal, ctx) {
     insertSizingAuditIfPresent(db, sub, {
       account, referencePrice, currentOwnedExposure, dataQualityWarnings, manualQtyOverride,
     });
+    return sub;
+  }
+
+  // OPTION entry: a bounded LONG buy/limit/day, persisted as `pending_entry` for
+  // the monitor to reconcile (fills, stale-cancel, deterministic exits). It is
+  // NEVER a market order and is gated by a valid session / pre-close cutoff.
+  if (kind === 'option') {
+    if (optionEntry && optionEntry.blocked) {
+      sub.decision = 'rejected';
+      sub.rejectedTradeId = insertRejectedTrade(db, {
+        newsEventId: proposal.eventId, ticker: proposal.underlying ?? proposal.ticker,
+        side: 'buy', quantity: proposal.contracts ?? null, reason: optionEntry.reason,
+      }).id;
+      return sub;
+    }
+    const ask = proposal.premiumEntry ?? proposal.quoteAsk ?? null;
+    const limitPrice = entryLimitPrice({ ask, slippagePct: optionConfig.limitSlippagePct });
+    if (limitPrice === null) {
+      sub.decision = 'rejected';
+      sub.rejectedTradeId = insertRejectedTrade(db, {
+        newsEventId: proposal.eventId, ticker: proposal.underlying ?? proposal.ticker,
+        side: 'buy', quantity: proposal.contracts ?? null,
+        reason: 'option entry blocked: no usable ask to price a bounded limit',
+      }).id;
+      return sub;
+    }
+    try {
+      const order = await paperClient.submitOptionLimitOrder({
+        optionSymbol: proposal.optionSymbol, qty: proposal.contracts, side: 'buy', limitPrice,
+      });
+      sub.order = order;
+      sub.paperOptionTradeId = insertPaperOptionTrade(db, {
+        newsEventId: proposal.eventId,
+        underlying: proposal.underlying,
+        optionSymbol: proposal.optionSymbol,
+        expiry: proposal.expiry,
+        strike: proposal.strike,
+        right: proposal.right,
+        quantity: proposal.contracts,
+        premiumEntry: proposal.premiumEntry,
+        notionalEntry: proposal.notionalEntry,
+        strategy: proposal.strategy,
+        strategyRationale: proposal.strategyRationale,
+        exitPolicy: proposal.exitPolicy,
+        status: 'open',
+        lifecycleState: 'pending_entry',
+        entryOrderId: order.id,
+        entryOrderStatus: order.status,
+        entryLimitPrice: limitPrice,
+      }).id;
+    } catch (err) {
+      sub.orderError = err.message; // already sanitized by the client
+    }
     return sub;
   }
 
@@ -580,13 +651,19 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
   const {
     paperClient = null, qty = DEFAULT_QTY, allowedSymbols = [], thresholds = {}, allowShorts = false,
     qtyExplicit = false, sizingSettings = {},
+    allowOptions = true, optionSymbol = null, optionMaxPremium = null,
+    optionContractLimit = DEFAULT_OPTION_CONTRACT_LIMIT, optionExpiryDaysMin = null, optionExpiryDaysMax = null,
     caps = {}, account = null, positions = [], capabilities = null, referencePrice = null,
-    daily = { orders: 0, notional: 0 }, executePaper = false,
+    optionReferencePrice = null, daily = { orders: 0, notional: 0 }, executePaper = false,
     nowMs = Date.now(), paperFeatures = DEFAULT_PAPER_FEATURES, asset = null,
+    optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {},
     historicalEquityOutcomes = [], ownedEquityExposure = null, eventAttemptStats = null,
   } = deps;
   const features = resolvePaperFeatures(paperFeatures);
-  const effectiveCaps = caps;
+  const effectiveCaps =
+    optionMaxPremium !== null && optionMaxPremium !== undefined
+      ? { ...caps, maxOptionPremium: optionMaxPremium }
+      : caps;
   const normalizedSizingSettings = resolveEquitySizingSettings(sizingSettings);
   let learnedEquityCapContext = null;
   let equityCapsForRisk = effectiveCaps;
@@ -598,6 +675,7 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
     capabilities: capabilities ? summarizeCapabilities(capabilities) : null,
     referencePrice,
     equity: null,
+    option: null,
   };
 
   let equityProposal = assessProposal({
@@ -668,7 +746,62 @@ export async function runPaperTradeOnce(db, { event, score }, deps = {}) {
     currentOwnedExposure,
     dataQualityWarnings,
   });
+
+  // OPTION leg: long call on up / long put on down, discovered + quote-validated
+  // through the paper client, then risk-gated like everything else.
+  let optionProposal = proposeOption({
+    event, score, allowOptions, optionsEnabled: features.enableOptions, optionSymbol, allowedSymbols, thresholds,
+    optionContractLimit, optionExpiryDaysMin, optionExpiryDaysMax, optionMaxPremium, nowMs,
+  });
+  if (optionProposal.enabled && optionProposal.accepted) {
+    optionProposal = await enrichOptionProposal({
+      proposal: optionProposal,
+      paperClient,
+      underlyingAsset: resolvedAsset,
+      optionSymbol,
+      optionMaxPremium,
+      optionExpiryDaysMin,
+      optionExpiryDaysMax,
+      nowMs,
+    });
+  }
+  if (optionProposal.enabled) {
+    result.option = await processProposal(db, optionProposal, {
+      kind: 'option', capabilities, account, positions, caps: effectiveCaps, daily,
+      referencePrice: optionProposal.premiumEntry ?? optionReferencePrice, executePaper, paperClient,
+      paperFeatures: features,
+      asset: resolvedAsset, optionEntry, optionConfig,
+    });
+  } else {
+    result.option = {
+      kind: 'option', proposal: optionProposal, risk: null, decision: 'disabled',
+      rejectedTradeId: null, paperTradeId: null, paperOptionTradeId: null, order: null, orderError: null,
+    };
+  }
   return result;
+}
+
+/**
+ * Resolve whether a NEW option entry is allowed right now via the broker
+ * clock. Fail-closed: no client / clock failure => entries stay blocked
+ * (existing positions are still monitored and closed).
+ */
+export async function fetchOptionEntryGate(paperClient, { nowMs = Date.now(), optionConfig = {} } = {}) {
+  if (!paperClient) {
+    return { blocked: true, reason: 'option entry blocked: paper client unavailable (fail closed)' };
+  }
+  try {
+    const clock = await paperClient.getClock();
+    const closeMs = Date.parse(clock?.nextClose);
+    return optionEntryBlocked({
+      nowMs,
+      sessionOpen: clock?.isOpen === true,
+      sessionCloseMs: Number.isFinite(closeMs) ? closeMs : null,
+      noEntryBeforeCloseMinutes: optionConfig?.noEntryBeforeCloseMinutes ?? 30,
+    });
+  } catch {
+    return { blocked: true, reason: 'option entry blocked: market clock unavailable (fail closed)' };
+  }
 }
 
 /** Best-effort latest reference price via the existing trades source. null on any issue. */
@@ -750,15 +883,21 @@ export async function executeSelectedPaperTrade(
   const historicalEquityOutcomes = listBrokerConfirmedEquityOutcomes(db);
   const ownedEquityExposure = getOwnedEquityExposureSnapshot(db);
   const eventAttemptStats = getPaperEventAttemptStats(db, selected.event.id);
+  const optionEntry = await fetchOptionEntryGate(paperClient, { nowMs, optionConfig: args.optionConfig });
   const result = await runPaperTradeOnce(db, selected, {
     paperClient, account, positions, capabilities, referencePrice,
     daily, nowMs,
     qty: args.qty, qtyExplicit: args.qtyExplicit, sizingSettings: args.sizingSettings,
     allowedSymbols: args.symbols, thresholds: args.thresholds, allowShorts: args.allowShorts,
+    allowOptions: args.allowOptions !== false, optionSymbol: args.optionSymbol ?? null,
+    optionMaxPremium: args.optionMaxPremium ?? null,
+    optionContractLimit: args.optionContractLimit ?? DEFAULT_OPTION_CONTRACT_LIMIT,
+    optionExpiryDaysMin: args.optionExpiryDaysMin ?? null, optionExpiryDaysMax: args.optionExpiryDaysMax ?? null,
     caps: args.caps, executePaper: args.executePaper,
     historicalEquityOutcomes, ownedEquityExposure, eventAttemptStats,
     asset,
     paperFeatures: args.paperFeatures ?? DEFAULT_PAPER_FEATURES,
+    optionEntry, optionConfig: args.optionConfig ?? {},
   });
 
   // After the attempt, refresh the day's realized-loss state and trip the
@@ -789,7 +928,8 @@ export async function executeSelectedPaperTrade(
 /**
  * One exit-monitor pass with learned parameters: exits run BEFORE new entries
  * every cycle and regardless of the kill switch (closing risk is always
- * allowed). Returns the monitor result (never throws).
+ * allowed). Covers equities AND bot-owned options. Returns the monitor result
+ * (never throws).
  */
 export async function runExitMonitor(db, { paperClient = null, nowMs = Date.now(), args = {} } = {}) {
   const base = resolveExitSettings(args.exitSettings ?? {});
@@ -806,7 +946,49 @@ export async function runExitMonitor(db, { paperClient = null, nowMs = Date.now(
     exitParams: learned.params,
     exitParamsExplanation: learned.mode === 'learned' ? learned.explanation : null,
   });
-  return { ...monitor, exitParams: learned.params, exitParamsMode: learned.mode };
+  const result = { ...monitor, exitParams: learned.params, exitParamsMode: learned.mode, options: null };
+
+  // OPTION positions: the option monitor submits sell-to-close limit orders,
+  // so it runs only in execute mode with a live paper client (a dry run never
+  // sends orders). Learned TP/SL are re-derived from closed option outcomes
+  // against the wider option rails.
+  const optionConfig = args.optionConfig ?? {};
+  if (paperClient && args.executePaper === true) {
+    const optionBase = {
+      takeProfitPct: optionConfig.takeProfitPct ?? 0.5,
+      stopLossPct: optionConfig.stopLossPct ?? 0.5,
+      maxHoldMinutes: optionConfig.maxHoldMinutes ?? 240,
+    };
+    const learnedOption = resolveLearnedExitParams({
+      closedOutcomes: listClosedOptionOutcomes(db),
+      base: optionBase,
+      learningEnabled: base.learningEnabled,
+      minSampleSize: base.minSampleSize,
+      rails: OPTION_EXIT_RAILS,
+    });
+    let session = { isOpen: false, sessionCloseMs: null };
+    try {
+      const clock = await paperClient.getClock();
+      const closeMs = Date.parse(clock?.nextClose);
+      session = { isOpen: clock?.isOpen === true, sessionCloseMs: Number.isFinite(closeMs) ? closeMs : null };
+    } catch { /* clock unavailable -> monitor still reconciles, forced-close stays off */ }
+    const optionSummary = await reconcileBotOptions(db, {
+      paperClient,
+      config: { optionExecution: { ...optionConfig, ...learnedOption.params } },
+      nowMs,
+      session,
+      onLog: (line) => result.lines.push(`  [options] ${line}`),
+    });
+    result.options = { ...optionSummary, exitParams: learnedOption.params, exitParamsMode: learnedOption.mode };
+    result.checked += optionSummary.checked;
+    result.exitsSubmitted += optionSummary.exitsSubmitted;
+    result.exitsFilled += optionSummary.exitsFilled;
+    result.errors += optionSummary.errors.length;
+    if (optionSummary.unresolved > 0) {
+      result.lines.push(`  [options] WARNING: ${optionSummary.unresolved} UNRESOLVED option position(s) — see EOD report.`);
+    }
+  }
+  return result;
 }
 
 function hasSignalPass(selected, args) {
@@ -825,7 +1007,7 @@ function hasSignalPass(selected, args) {
 
 function tradeOutcome(result) {
   if (result?.killSwitch?.active && !result?.equity) return PAPER_DECISION_OUTCOMES.KILL_SWITCH_ACTIVE;
-  const subs = [result?.equity].filter(Boolean);
+  const subs = [result?.equity, result?.option].filter((s) => s && s.decision !== 'disabled');
   if (subs.some((s) => s.orderError)) return PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR;
   if (subs.some((s) => s.decision === 'rejected' && s.risk && !s.risk.approved)) {
     return PAPER_DECISION_OUTCOMES.RISK_REJECTION;
@@ -1037,7 +1219,7 @@ export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
   return lines;
 }
 
-/** One short sanitized summary line for loop heartbeats. */
+/** One short sanitized summary line per asset class, for loop heartbeats. */
 export function oneLineSummary(result) {
   if (result?.killSwitch?.active && !result?.equity) return 'kill switch active — proposal refused';
   const e = result.equity;
@@ -1047,15 +1229,27 @@ export function oneLineSummary(result) {
       ? ` size=${e.sizingDecision.mode} qty=${e.proposal?.quantity ?? e.sizingDecision.requestedQuantity ?? '?'}`
       : '';
   const eqTxt = `equity ${e?.proposal?.side ?? '?'} ${e?.decision ?? '?'}${sizeTxt}`;
-  return eqTxt;
+  let opTxt = 'option off';
+  if (result.option && result.option.decision !== 'disabled') {
+    opTxt = `option ${result.option.proposal?.intent ?? '?'} ${result.option.decision}`;
+  }
+  return `${eqTxt}; ${opTxt}`;
 }
 
 function subLines(label, sub, result = {}) {
   if (!sub) return [];
+  if (sub.decision === 'disabled') return [`  ${label}:     disabled (allow_options=false)`];
   const p = sub.proposal;
   const lines = [
     `  ${label}:     ${sub.decision.toUpperCase()} — ${p.reason}`,
   ];
+  if (label === 'option' && p.optionSymbol) {
+    lines.push(
+      `    contract:   ${p.optionSymbol} ${p.right ?? '?'} strike ${p.strike ?? '?'} exp ${p.expiry ?? '?'}`,
+      `    premium:    entry=${p.premiumEntry ?? '?'} notional=${p.notionalEntry ?? '?'} bid=${p.quoteBid ?? '?'} ask=${p.quoteAsk ?? '?'}`,
+      `    exit:       ${p.exitPolicy ?? '(monitored: learned tp/sl, max-hold, forced same-day close)'}`
+    );
+  }
   if (label === 'equity' && sub.sizingDecision) {
     const approvedQty = sub.decision === 'accepted' ? p.quantity : 0;
     const approved = approvedSizingValues(sub, result);
@@ -1086,6 +1280,7 @@ function subLines(label, sub, result = {}) {
   if (sub.rejectedTradeId !== null) lines.push(`    logged:     rejected_trades id ${sub.rejectedTradeId}`);
   if (sub.order) lines.push(`    order:      id ${sub.order.id ?? '?'} status ${sub.order.status ?? '?'}${sub.order.filledAvgPrice !== null ? ` filledAvgPrice ${sub.order.filledAvgPrice}` : ''}`);
   if (sub.paperTradeId !== null) lines.push(`    logged:     paper_trades id ${sub.paperTradeId}`);
+  if (sub.paperOptionTradeId !== null && sub.paperOptionTradeId !== undefined) lines.push(`    logged:     paper_option_trades id ${sub.paperOptionTradeId}`);
   if (sub.orderError) lines.push(`    order error: ${sub.orderError}`);
   return lines;
 }
@@ -1108,6 +1303,7 @@ export function buildPaperReport(result, selected) {
       `sentiment=${s.sentiment ?? '?'} impact=${s.impact ?? '?'} confidence=${s.confidence ?? '?'}`,
   ];
   lines.push(...subLines('equity', result.equity, result));
+  lines.push(...subLines('option', result.option, result));
   if (result.mode === 'dry_run') {
     lines.push('  (DRY RUN — pass --execute-paper to actually submit PAPER orders)');
   }

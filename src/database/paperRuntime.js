@@ -28,6 +28,163 @@ function positiveInt(name, value) {
   return n;
 }
 
+export function insertPaperOptionTrade(
+  db,
+  {
+    paperTradeId = null,
+    newsEventId = null,
+    underlying,
+    optionSymbol,
+    expiry,
+    strike,
+    right,
+    quantity,
+    premiumEntry = null,
+    notionalEntry = null,
+    strategy,
+    strategyRationale = null,
+    exitPolicy,
+    exitReason = null,
+    status = 'open',
+    lifecycleState = null,
+    entryOrderId = null,
+    entryOrderStatus = null,
+    entryLimitPrice = null,
+    openedAt = null,
+  } = {}
+) {
+  const run = db
+    .prepare(
+      `INSERT INTO paper_option_trades
+         (paper_trade_id, news_event_id, underlying, option_symbol, expiry,
+          strike, right, quantity, premium_entry, notional_entry, strategy,
+          strategy_rationale, exit_policy, exit_reason, status,
+          lifecycle_state, entry_order_id, entry_order_status, entry_limit_price, opened_at)
+       VALUES
+         (@paperTradeId, @newsEventId, @underlying, @optionSymbol, @expiry,
+          @strike, @right, @quantity, @premiumEntry, @notionalEntry, @strategy,
+          @strategyRationale, @exitPolicy, @exitReason, @status,
+          @lifecycleState, @entryOrderId, @entryOrderStatus, @entryLimitPrice, @openedAt)`
+    )
+    .run({
+      paperTradeId,
+      newsEventId,
+      underlying: requiredString('underlying', underlying).toUpperCase(),
+      optionSymbol: requiredString('optionSymbol', optionSymbol).toUpperCase(),
+      expiry: requiredString('expiry', expiry),
+      strike: finiteOrNull(strike),
+      right: requiredString('right', right),
+      quantity: positiveInt('quantity', quantity),
+      premiumEntry: finiteOrNull(premiumEntry),
+      notionalEntry: finiteOrNull(notionalEntry),
+      strategy: requiredString('strategy', strategy),
+      strategyRationale,
+      exitPolicy: requiredString('exitPolicy', exitPolicy),
+      exitReason,
+      status,
+      lifecycleState: lifecycleState ?? null,
+      entryOrderId: entryOrderId ?? null,
+      entryOrderStatus: entryOrderStatus ?? null,
+      entryLimitPrice: finiteOrNull(entryLimitPrice),
+      openedAt: openedAt ?? null,
+    });
+  return { id: Number(run.lastInsertRowid) };
+}
+
+/** Whitelisted lifecycle columns for updatePaperOptionTrade. */
+const OPTION_UPDATE_COLUMNS = Object.freeze({
+  status: 'status',
+  lifecycleState: 'lifecycle_state',
+  entryOrderId: 'entry_order_id',
+  entryOrderStatus: 'entry_order_status',
+  entryLimitPrice: 'entry_limit_price',
+  entryFilledQty: 'entry_filled_qty',
+  entryFilledAvgPrice: 'entry_filled_avg_price',
+  entryFilledAt: 'entry_filled_at',
+  openedAt: 'opened_at',
+  premiumEntry: 'premium_entry',
+  notionalEntry: 'notional_entry',
+  exitOrderId: 'exit_order_id',
+  exitOrderStatus: 'exit_order_status',
+  exitLimitPrice: 'exit_limit_price',
+  exitFilledQty: 'exit_filled_qty',
+  exitFilledAvgPrice: 'exit_filled_avg_price',
+  exitFilledAt: 'exit_filled_at',
+  premiumExit: 'premium_exit',
+  notionalExit: 'notional_exit',
+  realizedPnlUsd: 'realized_pnl_usd',
+  exitReason: 'exit_reason',
+  exitAttempts: 'exit_attempts',
+  closedAt: 'closed_at',
+  lastCheckedAt: 'last_checked_at',
+  brokerPositionQty: 'broker_position_qty',
+  brokerPositionMarketValue: 'broker_position_market_value',
+  brokerUnrealizedPl: 'broker_unrealized_pl',
+});
+
+/** Generic whitelisted update for one bot option row's lifecycle fields. */
+export function updatePaperOptionTrade(db, id, updates = {}) {
+  const rowId = positiveInt('id', id);
+  const sets = [];
+  const values = {};
+  for (const [key, column] of Object.entries(OPTION_UPDATE_COLUMNS)) {
+    if (!Object.prototype.hasOwnProperty.call(updates, key)) continue;
+    sets.push(`${column} = @${key}`);
+    values[key] = updates[key] === undefined ? null : updates[key];
+  }
+  if (sets.length === 0) return { changes: 0 };
+  values.id = rowId;
+  const run = db.prepare(`UPDATE paper_option_trades SET ${sets.join(', ')} WHERE id = @id`).run(values);
+  return { changes: run.changes };
+}
+
+/** One bot option row by id (or null). */
+export function getPaperOptionTradeById(db, id) {
+  return db.prepare('SELECT * FROM paper_option_trades WHERE id = ?').get(positiveInt('id', id)) ?? null;
+}
+
+/** Active (still-monitored) bot-owned option rows: pending_entry/open/pending_exit/unresolved. */
+export function listActiveBotOptionTrades(db, { limit = 200 } = {}) {
+  return db
+    .prepare(
+      `SELECT * FROM paper_option_trades
+        WHERE lifecycle_state IN ('pending_entry','open','pending_exit','unresolved')
+           OR (lifecycle_state IS NULL AND status = 'open')
+        ORDER BY id ASC
+        LIMIT ?`
+    )
+    .all(Number.parseInt(limit, 10) || 200);
+}
+
+export function listPaperOptionTrades(db, { limit = 50 } = {}) {
+  return db
+    .prepare('SELECT * FROM paper_option_trades ORDER BY id DESC LIMIT ?')
+    .all(Number.parseInt(limit, 10) || 50);
+}
+
+/**
+ * Closed option outcomes with confirmed realized P&L, mapped to the shape
+ * resolveLearnedExitParams() consumes (per-unit notional as "price" so
+ * return = pnl / (price * qty)).
+ */
+export function listClosedOptionOutcomes(db, { limit = 500 } = {}) {
+  return db
+    .prepare(
+      `SELECT quantity, premium_entry, realized_pnl_usd
+         FROM paper_option_trades
+        WHERE status = 'closed'
+          AND realized_pnl_usd IS NOT NULL
+          AND premium_entry IS NOT NULL AND premium_entry > 0
+        ORDER BY id DESC
+        LIMIT ?`
+    )
+    .all(Number.parseInt(limit, 10) || 500)
+    .map((row) => ({
+      broker_filled_avg_price: Number(row.premium_entry) * 100,
+      broker_filled_qty: Number(row.quantity),
+      broker_realized_pnl_usd: Number(row.realized_pnl_usd),
+    }));
+}
 
 export function startPaperRuntimeSession(
   db,

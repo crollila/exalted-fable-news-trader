@@ -31,6 +31,10 @@ with the measurement, risk, and learning discipline V1 lacked.
   target **adapt as the system learns** — re-derived each cycle from
   broker-confirmed win/loss sizes, hard-clamped to rails so learning can tune
   the protection but never remove it.
+- **Options are bounded by construction:** long calls/puts only (buy to open,
+  sell to close) — no spreads, no naked writes, no unbounded market orders.
+  Premium per order is capped (`max_option_premium`), entries are blocked near
+  the close, and every option position is force-flattened before market close.
 - **Sanitized output only.** No raw model responses, provider payloads, API
   keys, or webhook URLs in logs or reports. The bot never writes `.env`.
 
@@ -44,9 +48,11 @@ news (Alpaca / Benzinga plug-in)
   → LLM classification (OpenAI production, Anthropic optional)
       sentiment / impact / confidence / direction / news type
   → equity proposal (long on up; short on down when enabled)
+  → option proposal (long CALL on up / long PUT on down; contract discovery + quote validation)
   → learned position sizing (evidence-weighted from broker-confirmed outcomes)
-  → risk gate (caps + percent-of-equity kill switch)
-  → Alpaca PAPER market order  →  paper_trades / rejected_trades
+  → risk gate (caps + option premium cap + percent-of-equity kill switch)
+  → Alpaca PAPER orders (equity market / option bounded limit)
+      →  paper_trades / paper_option_trades / rejected_trades
   → broker-truth reconciliation (fills, realized P&L, SPY benchmark)
   → event-study measurement (price reactions at 10s/1m/5m/30m/1h/EOD)
   → end-of-day report (console or Discord webhook)
@@ -61,7 +67,9 @@ Three learning layers persist forever:
   abstain without evidence.
 - **Learned exits** (`src/paper/exitPolicy.js`): stop-loss and take-profit
   levels adapt to the observed win/loss distribution once enough confirmed
-  outcomes exist (`exit_*` strategy settings; bounded by hard rails).
+  outcomes exist (`exit_*` strategy settings; bounded by hard rails). Applies
+  to equities AND options — option exits learn from closed option outcomes
+  against wider option-specific rails.
 
 `scripts/compactDatabase.js` keeps the database from bloating: old raw
 payloads/model responses are nulled after `RETENTION_RAW_DAYS` (default 90),
@@ -111,7 +119,8 @@ snapshot), `runMvpPipelineOnce.js` (whole research loop, never trades),
 - `.env` (secrets + risk knobs — see `.env.example`): Alpaca/OpenAI keys,
   `MAX_DAILY_LOSS_PCT` / `MAX_DAILY_LOSS_USD` (kill switch),
   `MAX_POSITION_SIZE_USD`, `MAX_TRADES_PER_DAY`, `MAX_TOTAL_EXPOSURE_USD`
-  (cap defaults), `PAPER_ENABLE_SHORTS` / `PAPER_ENABLE_MARGIN` (off by
+  (cap defaults), `PAPER_ENABLE_OPTIONS` (ON by default) + `PAPER_OPTION_*`
+  execution knobs, `PAPER_ENABLE_SHORTS` / `PAPER_ENABLE_MARGIN` (off by
   default), `RETENTION_RAW_DAYS`, optional `DISCORD_WEBHOOK_URL`.
 - `config/strategy-settings.example.json` → copy to
   `data/strategy-settings.json` for non-secret runtime defaults (symbols,
@@ -137,8 +146,10 @@ changes.
 scripts/                thin CLIs (parse flags, build clients, print reports)
 src/paper/tradeCycle.js the decision cycle (exits→ingest→classify→size→risk→order→record)
 src/paper/              alpacaPaperClient (paper-only), paperTradeProposal,
+                        optionsProposal + optionContracts (long calls/puts),
                         paperRisk, riskState (kill switch), equitySizing,
-                        exitPolicy + positionMonitor (learned exits),
+                        exitPolicy + positionMonitor (learned equity exits),
+                        optionExits + optionMonitor (learned option exits),
                         brokerTruth (+SPY benchmark), accountCapabilities,
                         marketHours, paperTradingLoop
 src/providers/          NewsProvider contract + Alpaca/Benzinga/mock adapters

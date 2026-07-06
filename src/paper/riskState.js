@@ -87,11 +87,13 @@ export function clearKillSwitch(db, { day, reason = 'manually cleared' } = {}) {
 }
 
 /**
- * Sum the day's broker-confirmed realized P&L over paper_trades. Rows without
- * a confirmed realized value contribute nothing (conservative: unknown != loss).
+ * Sum the day's broker-confirmed realized P&L over paper_trades AND closed
+ * paper option trades. Rows without a confirmed realized value contribute
+ * nothing (conservative: unknown != loss).
  */
 export function computeRealizedDailyPnl(db, day) {
-  const row = db
+  const d = requiredDay(day);
+  const equities = db
     .prepare(
       `SELECT COALESCE(SUM(broker_realized_pnl_usd), 0) AS pnl,
               COUNT(broker_realized_pnl_usd) AS confirmed
@@ -99,10 +101,19 @@ export function computeRealizedDailyPnl(db, day) {
         WHERE substr(created_at, 1, 10) = ?
           AND broker_realized_pnl_usd IS NOT NULL`
     )
-    .get(requiredDay(day));
+    .get(d);
+  const options = db
+    .prepare(
+      `SELECT COALESCE(SUM(realized_pnl_usd), 0) AS pnl,
+              COUNT(realized_pnl_usd) AS confirmed
+         FROM paper_option_trades
+        WHERE substr(COALESCE(closed_at, created_at), 1, 10) = ?
+          AND realized_pnl_usd IS NOT NULL`
+    )
+    .get(d);
   return {
-    realizedPnlUsd: Number(row?.pnl ?? 0),
-    confirmedRows: Number(row?.confirmed ?? 0),
+    realizedPnlUsd: Number(equities?.pnl ?? 0) + Number(options?.pnl ?? 0),
+    confirmedRows: Number(equities?.confirmed ?? 0) + Number(options?.confirmed ?? 0),
   };
 }
 

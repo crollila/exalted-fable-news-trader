@@ -24,6 +24,17 @@ export const EXIT_RAILS = Object.freeze({
   maxHoldMinutes: { min: 5, max: 10080 },
 });
 
+/**
+ * Rails for OPTION premiums, which swing far wider than stock prices (a 50%
+ * premium move is routine). Same learning, wider bounds, and options are
+ * always flattened same-day by the monitor's forced close.
+ */
+export const OPTION_EXIT_RAILS = Object.freeze({
+  takeProfitPct: { min: 0.05, max: 5 },
+  stopLossPct: { min: 0.05, max: 1 },
+  maxHoldMinutes: { min: 5, max: 390 },
+});
+
 /** How far learning may pull a parameter away from its configured base. */
 const LEARNED_BASE_MULTIPLIER = Object.freeze({ min: 0.5, max: 2.5 });
 
@@ -105,6 +116,7 @@ export function resolveLearnedExitParams({
   base = DEFAULT_EXIT_PARAMS,
   learningEnabled = true,
   minSampleSize = 10,
+  rails = EXIT_RAILS,
 } = {}) {
   const out = (params, mode, diagnostics, explanation) => ({ params, mode, diagnostics, explanation });
 
@@ -139,13 +151,13 @@ export function resolveLearnedExitParams({
   const learnedStop = diagnostics.avgLossPct !== null
     ? clamp(
         clamp(diagnostics.avgLossPct * 1.5, base.stopLossPct * LEARNED_BASE_MULTIPLIER.min, base.stopLossPct * LEARNED_BASE_MULTIPLIER.max),
-        EXIT_RAILS.stopLossPct.min, EXIT_RAILS.stopLossPct.max
+        rails.stopLossPct.min, rails.stopLossPct.max
       )
     : base.stopLossPct;
   const learnedTp = diagnostics.avgWinPct !== null
     ? clamp(
         clamp(diagnostics.avgWinPct * 1.25, base.takeProfitPct * LEARNED_BASE_MULTIPLIER.min, base.takeProfitPct * LEARNED_BASE_MULTIPLIER.max),
-        EXIT_RAILS.takeProfitPct.min, EXIT_RAILS.takeProfitPct.max
+        rails.takeProfitPct.min, rails.takeProfitPct.max
       )
     : base.takeProfitPct;
 

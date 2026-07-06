@@ -8,6 +8,8 @@ export { normalizeNewsEvent, toUtcIso, upperOrNull, normalizeSymbols } from './n
 export { assertNormalizedNewsEvent, validateProvider } from './newsProvider.js';
 export { createMockProvider } from './mockProvider.js';
 export { createAlpacaNewsProvider } from './alpacaNewsProvider.js';
+export { createAlpacaNewsHttpTransport } from './alpacaNewsHttpTransport.js';
 export { createBenzingaNewsProvider } from './benzingaNewsProvider.js';
+export { createBenzingaNewsHttpTransport } from './benzingaNewsHttpTransport.js';
 export { createAlphaVantageNewsProvider } from './alphaVantageNewsProvider.js';
 export { createPolygonNewsProvider } from './polygonNewsProvider.js';

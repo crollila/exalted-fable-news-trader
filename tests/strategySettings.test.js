@@ -28,6 +28,14 @@ test('validateStrategySettings caps invalid values and drops unknown/forbidden k
     sizing_min_comparable_sample_size: 1,
     sizing_cold_start_target_weight: 9,
     sizing_max_target_weight: 9,
+    enabled_news_providers: ['alpaca', 'unknown', 'benzinga', 'alpaca'],
+    max_events_classified_per_cycle: 999,
+    max_qualifying_events_attempted_per_cycle: 999,
+    provider_cooldown_minutes: 99999,
+    provider_max_failures_before_cooldown: 999,
+    duplicate_story_window_minutes: 999,
+    max_queue_age_minutes: 99999,
+    provider_max_pages_per_cycle: 999,
     options_mode: 'yolo', symbols: ['aapl', 'aapl', 'msft'],
     UNKNOWN_KEY: 'x', ALPACA_API_SECRET_KEY: 'leak', LIVE_TRADING_ENABLED: 'true',
   });
@@ -37,12 +45,34 @@ test('validateStrategySettings caps invalid values and drops unknown/forbidden k
   assert.equal(settings.sizing_min_comparable_sample_size, 3); // floored
   assert.equal(settings.sizing_cold_start_target_weight, 0.01); // capped beneath hard risk caps
   assert.equal(settings.sizing_max_target_weight, 0.01);
+  assert.deepEqual(settings.enabled_news_providers, ['alpaca', 'benzinga']);
+  assert.equal(settings.max_events_classified_per_cycle, 50);
+  assert.equal(settings.max_qualifying_events_attempted_per_cycle, 25);
+  assert.equal(settings.provider_cooldown_minutes, 1440);
+  assert.equal(settings.provider_max_failures_before_cooldown, 20);
+  assert.equal(settings.duplicate_story_window_minutes, 390);
+  assert.equal(settings.max_queue_age_minutes, 1440); // capped
+  assert.equal(settings.provider_max_pages_per_cycle, 10); // capped
   assert.equal(settings.options_mode, 'plan_only'); // invalid enum -> default
   assert.deepEqual(settings.symbols, ['AAPL', 'MSFT']); // upper + dedup
   assert.ok(!('UNKNOWN_KEY' in settings));
   assert.ok(!('ALPACA_API_SECRET_KEY' in settings)); // forbidden secret-like key dropped
   assert.ok(!('LIVE_TRADING_ENABLED' in settings)); // never present
   assert.ok(warnings.some((w) => /forbidden/.test(w)));
+});
+
+test('durable-backlog knobs have conservative defaults and validate to sensible bounds', () => {
+  assert.equal(DEFAULT_SETTINGS.max_queue_age_minutes, 120);
+  assert.equal(DEFAULT_SETTINGS.provider_max_pages_per_cycle, 3);
+  const { settings } = validateStrategySettings({ max_queue_age_minutes: 45, provider_max_pages_per_cycle: 5 });
+  assert.equal(settings.max_queue_age_minutes, 45);
+  assert.equal(settings.provider_max_pages_per_cycle, 5);
+  // A positive-but-below-floor value is floored to the minimum (5).
+  const { settings: floored } = validateStrategySettings({ max_queue_age_minutes: 1 });
+  assert.equal(floored.max_queue_age_minutes, 5);
+  // Non-numeric junk falls back to the default.
+  const { settings: junk } = validateStrategySettings({ max_queue_age_minutes: 'nope' });
+  assert.equal(junk.max_queue_age_minutes, DEFAULT_SETTINGS.max_queue_age_minutes);
 });
 
 test('loadStrategySettings: example used when runtime missing; runtime overrides example', () => {

@@ -8,15 +8,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openMemoryDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
+import { getProviderCursor, listEventTerminals } from '../src/database/paperRuntime.js';
 import { deriveCapabilities } from '../src/paper/accountCapabilities.js';
 import { createMockProvider } from '../src/providers/mockProvider.js';
+import { createAlpacaNewsProvider } from '../src/providers/alpacaNewsProvider.js';
+import { createBenzingaNewsProvider } from '../src/providers/benzingaNewsProvider.js';
 import {
   parseArgs,
   listRecentScoredEvents,
   selectRecentScoredEvent,
   runPaperDecisionCycle,
   runPaperTradeOnce,
+  executeOneShot,
   buildPaperReport,
+  buildDecisionCycleReport,
   getDailyCounters,
   oneLineSummary,
   oneLineDecisionSummary,
@@ -127,7 +132,11 @@ function throwingPaperClient(message = 'sanitized submit failure') {
 function fakePriceSource(price = 200) {
   return {
     name: 'fake-price',
-    getTradesAround: async () => [{ price, at: '2026-06-18T14:15:00.000Z', size: 1 }],
+    getTradesAround: async (symbol) => [{
+      price: typeof price === 'object' ? price[symbol] ?? 200 : price,
+      at: '2026-06-18T14:15:00.000Z',
+      size: 1,
+    }],
   };
 }
 
@@ -143,13 +152,68 @@ function rawNews(id, over = {}) {
   };
 }
 
-function realModelClassifier({ direction = 'up', sentiment = 0.3, impact = 0.4, confidence = 0.6, parserStatus = 'parsed', onClassify = null } = {}) {
+function rawAlpacaNews(id, { ticker = 'AAPL', headline = 'SECRET-HEADLINE-MUST-NOT-PRINT', createdAt = '2026-06-18T14:00:00.000Z' } = {}) {
+  return {
+    id,
+    symbols: [ticker],
+    headline,
+    created_at: createdAt,
+    summary: '',
+    content: '',
+    url: `https://example.test/alpaca/${id}`,
+    author: 'Alpaca',
+  };
+}
+
+function rawBenzingaNews(id, { ticker = 'AAPL', headline = 'SECRET-HEADLINE-MUST-NOT-PRINT', createdAt = 'Thu, 18 Jun 2026 10:00:00 -0400' } = {}) {
+  return {
+    id,
+    stocks: [{ name: ticker }],
+    title: headline,
+    created: createdAt,
+    teaser: '',
+    body: '',
+    url: `https://example.test/benzinga/${id}`,
+    author: 'Benzinga',
+    channels: [{ name: 'News' }],
+  };
+}
+
+function alpacaProvider(items) {
+  return createAlpacaNewsProvider({ fetchRawNews: async () => items });
+}
+
+function benzingaProvider(items) {
+  return createBenzingaNewsProvider({ fetchRawNews: async () => items });
+}
+
+function failingProvider(name, message, status = null) {
+  let calls = 0;
+  const provider = {
+    name,
+    normalizeProviderItem: (x) => x,
+    fetchNews: async () => {
+      calls += 1;
+      const err = new Error(message);
+      if (status !== null) err.status = status;
+      throw err;
+    },
+  };
+  provider.calls = () => calls;
+  return provider;
+}
+
+function realModelClassifier({
+  direction = 'up', sentiment = 0.3, impact = 0.4, confidence = 0.6,
+  parserStatus = 'parsed', onClassify = null, byTicker = {},
+} = {}) {
   return {
     name: 'model',
     modelName: 'claude-opus-4-8',
     promptVersion: 'model_v1',
     classifyEvent: async (event) => {
       if (onClassify) await onClassify(event);
+      const overrides = byTicker[event.ticker] ?? {};
       if (parserStatus !== 'parsed') {
         return {
           promptVersion: 'model_v1',
@@ -164,14 +228,14 @@ function realModelClassifier({ direction = 'up', sentiment = 0.3, impact = 0.4, 
         promptVersion: 'model_v1',
         modelName: 'claude-opus-4-8',
         parserStatus: 'parsed',
-        output: {
-          newsType: 'earnings',
-          sentimentScore: sentiment,
-          impactScore: impact,
-          confidence,
-          direction,
+          output: {
+            newsType: 'earnings',
+          sentimentScore: overrides.sentiment ?? sentiment,
+          impactScore: overrides.impact ?? impact,
+          confidence: overrides.confidence ?? confidence,
+          direction: overrides.direction ?? direction,
           timeHorizon: 'intraday',
-          affectedSymbols: ['AAPL'],
+          affectedSymbols: [event.ticker],
           rationale: 'SECRET-RATIONALE-MUST-NOT-PRINT',
         },
         rawModelResponse: 'RAW-MODEL-RESPONSE-MUST-NOT-PRINT',
@@ -567,6 +631,476 @@ test('decision cycle distinguishes broker submission errors', async () => {
   closeDatabase(db);
 });
 
+test('Alpaca succeeds while Benzinga fails; cycle continues with sanitized provider health', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [
+        { name: 'alpaca', provider: alpacaProvider([rawAlpacaNews('alpaca-ok')]) },
+        { name: 'benzinga', provider: failingProvider('benzinga', 'HTTP 401 SECRET-KEY-MUST-NOT-PRINT', 401) },
+      ],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource(200),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.providerHealth.find((p) => p.name === 'alpaca').state, 'active');
+  assert.equal(cycle.providerHealth.find((p) => p.name === 'benzinga').reason, 'HTTP 401');
+  assert.equal(client.calls.equity.length, 1);
+  assert.ok(!buildDecisionCycleReport(cycle).join('\n').includes('SECRET-KEY-MUST-NOT-PRINT'));
+  closeDatabase(db);
+});
+
+test('Benzinga succeeds while Alpaca fails; cycle continues with Benzinga', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'MSFT', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [
+        { name: 'alpaca', provider: failingProvider('alpaca', 'HTTP 503 upstream noise', 503) },
+        { name: 'benzinga', provider: benzingaProvider([rawBenzingaNews('bz-ok', { ticker: 'MSFT', headline: 'Microsoft Raises Outlook' })]) },
+      ],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource({ MSFT: 200 }),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.providerHealth.find((p) => p.name === 'alpaca').reason, 'HTTP 503');
+  assert.equal(cycle.providerHealth.find((p) => p.name === 'benzinga').state, 'active');
+  assert.equal(client.calls.equity.length, 1);
+  assert.equal(client.calls.equity[0].symbol, 'MSFT');
+  closeDatabase(db);
+});
+
+test('both providers fail safely with no active provider result', async () => {
+  const db = freshDb();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [
+        { name: 'alpaca', provider: failingProvider('alpaca', 'HTTP 500 noisy body', 500) },
+        { name: 'benzinga', provider: failingProvider('benzinga', 'HTTP 429 rate limit token SECRET', 429) },
+      ],
+      classifier: realModelClassifier(),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.outcome, PAPER_DECISION_OUTCOMES.NO_ACTIVE_PROVIDER);
+  assert.equal(cycle.providerHealth.filter((p) => p.state === 'active').length, 0);
+  assert.ok(!JSON.stringify(cycle.providerHealth).includes('SECRET'));
+  closeDatabase(db);
+});
+
+test('cooldown skips repeatedly failing providers without hammering them', async () => {
+  const db = freshDb();
+  const providerStates = {};
+  const alpaca = failingProvider('alpaca', 'HTTP 500 first failure', 500);
+  const args = parseArgs([
+    '--symbols', 'AAPL', '--classifier', 'openai',
+    '--provider-max-failures-before-cooldown', '1',
+    '--provider-cooldown-minutes', '30',
+  ]);
+  await runPaperDecisionCycle(
+    db,
+    { providers: [{ name: 'alpaca', provider: alpaca }], classifier: realModelClassifier(), providerStates },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  const second = await runPaperDecisionCycle(
+    db,
+    { providers: [{ name: 'alpaca', provider: alpaca }], classifier: realModelClassifier(), providerStates },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:45:00.000Z') }
+  );
+  assert.equal(alpaca.calls(), 1);
+  assert.match(second.providerHealth[0].reason, /cooldown until/);
+  closeDatabase(db);
+});
+
+test('two independent qualified stories both reach paper risk evaluation', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL,MSFT', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [{
+        name: 'alpaca',
+        provider: alpacaProvider([
+          rawAlpacaNews('aapl-1', { ticker: 'AAPL', headline: 'Apple Raises Outlook' }),
+          rawAlpacaNews('msft-1', { ticker: 'MSFT', headline: 'Microsoft Raises Outlook' }),
+        ]),
+      }],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource({ AAPL: 100, MSFT: 100 }),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.batch.trades.length, 2);
+  assert.equal(cycle.batch.trades.filter((t) => t.result.equity.risk?.approved).length, 2);
+  assert.equal(client.calls.equity.length, 2);
+  closeDatabase(db);
+});
+
+test('first approved batch event can consume budget and reject a later event', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs([
+    '--symbols', 'AAPL,MSFT', '--classifier', 'openai', '--execute-paper', '--qty', '1',
+    '--max-daily-paper-notional', '500',
+  ]);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [{
+        name: 'alpaca',
+        provider: alpacaProvider([
+          rawAlpacaNews('aapl-budget', { ticker: 'AAPL', headline: 'Apple Wins Contract' }),
+          rawAlpacaNews('msft-budget', { ticker: 'MSFT', headline: 'Microsoft Wins Contract' }),
+        ]),
+      }],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource({ AAPL: 400, MSFT: 400 }),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.batch.trades.length, 2);
+  assert.equal(cycle.batch.trades[0].result.equity.decision, 'accepted');
+  assert.equal(cycle.batch.trades[1].result.equity.decision, 'rejected');
+  assert.match(cycle.batch.trades[1].result.equity.risk.reason, /daily paper notional/);
+  assert.equal(client.calls.equity.length, 1);
+  assert.equal(cycle.batch.budgetEffects.length, 1);
+  closeDatabase(db);
+});
+
+test('same story from Alpaca and Benzinga creates one attempt and one suppression audit', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const headline = 'SECRET-DUPLICATE-HEADLINE-MUST-NOT-PRINT';
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [
+        { name: 'alpaca', provider: alpacaProvider([rawAlpacaNews('same-1', { headline })]) },
+        { name: 'benzinga', provider: benzingaProvider([rawBenzingaNews('same-2', { headline })]) },
+      ],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource(200),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.duplicateSuppressions.length, 1);
+  assert.equal(cycle.batch.trades.length, 1);
+  assert.equal(client.calls.equity.length, 1);
+  const audit = db.prepare('SELECT * FROM paper_duplicate_suppression_audits').get();
+  assert.equal(audit.suppressed_provider, 'benzinga');
+  assert.equal(audit.kept_provider, 'alpaca');
+  assert.match(audit.reason, /suppressed because equivalent alpaca story/);
+  const printable = [
+    ...buildDecisionCycleReport(cycle),
+    JSON.stringify(audit),
+  ].join('\n');
+  assert.ok(!printable.includes(headline));
+  assert.ok(!printable.includes('SECRET-DUPLICATE'));
+  assert.ok(!printable.includes('raw_payload'));
+  closeDatabase(db);
+});
+
+test('manual one-shot behavior remains single-event', async () => {
+  const db = freshDb();
+  seedScoredEvent(db, { ticker: 'AAPL', sentiment: 0.3 });
+  seedScoredEvent(db, { ticker: 'MSFT', sentiment: 0.4 });
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL,MSFT', '--execute-paper', '--qty', '1']);
+  const one = await executeOneShot(db, {
+    args,
+    paperClient: client,
+    priceSource: fakePriceSource({ AAPL: 100, MSFT: 100 }),
+    nowMs: Date.parse('2026-06-18T14:30:00.000Z'),
+  });
+  assert.ok(one.selected);
+  assert.equal(client.calls.equity.length, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 1);
+  closeDatabase(db);
+});
+
+// --- batch accounting: failed submission must not hold a reservation --------
+
+test('a failed broker submission releases its provisional reservation for later batch events', async () => {
+  // AAA is risk-approved but its broker submit throws (no order placed); BBB is a
+  // separate valid event. With a daily order cap of 1, a phantom reservation from
+  // the FAILED AAA submission would wrongly reject the valid BBB order.
+  const db = freshDb();
+  const client = fakePaperClient();
+  let submits = 0;
+  client.submitMarketOrder = async (o) => {
+    submits += 1;
+    client.calls.equity.push(o);
+    if (submits === 1) throw new Error('sanitized submit failure');
+    return { id: `ord_${submits}`, status: 'accepted', submittedAt: '2026-06-18T14:30:01.000Z', filledAvgPrice: null };
+  };
+  const args = parseArgs([
+    '--symbols', 'AAA,BBB', '--classifier', 'openai', '--execute-paper', '--qty', '1',
+    '--max-daily-paper-orders', '1',
+  ]);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [{
+        name: 'alpaca',
+        provider: alpacaProvider([
+          rawAlpacaNews('aaa-fail', { ticker: 'AAA', headline: 'AAA Wins Major Contract One' }),
+          rawAlpacaNews('bbb-ok', { ticker: 'BBB', headline: 'BBB Wins Major Contract Two' }),
+        ]),
+      }],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource(100),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.batch.trades.length, 2);
+  const aaa = cycle.batch.trades.find((t) => t.selected.event.ticker === 'AAA').result.equity;
+  const bbb = cycle.batch.trades.find((t) => t.selected.event.ticker === 'BBB').result.equity;
+  assert.ok(aaa.orderError, 'AAA submission should have failed');
+  assert.ok(!aaa.order, 'AAA must not have an order');
+  assert.equal(bbb.decision, 'accepted');
+  assert.ok(bbb.order, 'BBB valid order must not be blocked by the failed AAA reservation');
+  assert.equal(cycle.batch.budgetEffects.length, 1); // only BBB reserved real budget
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 1); // BBB only
+  closeDatabase(db);
+});
+
+// --- provider cooldown expiry + recovery ------------------------------------
+
+test('a cooled-down provider is not hammered, then re-enters after cooldown expires', async () => {
+  const db = freshDb();
+  const providerStates = {};
+  const args = parseArgs([
+    '--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1',
+    '--provider-max-failures-before-cooldown', '1', '--provider-cooldown-minutes', '30',
+  ]);
+  let recoveredCalls = 0;
+  const recoveredProvider = createAlpacaNewsProvider({
+    fetchRawNews: async () => { recoveredCalls += 1; return [rawAlpacaNews('recovered', { ticker: 'AAPL', headline: 'Apple Wins Recovery Contract' })]; },
+  });
+  // Cycle 1: provider fails -> cooldown begins (T0+30m).
+  const c1 = await runPaperDecisionCycle(
+    db,
+    { providers: [{ name: 'alpaca', provider: failingProvider('alpaca', 'HTTP 500 boom', 500) }], classifier: realModelClassifier(), providerStates },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:00:00.000Z') }
+  );
+  assert.equal(c1.providerHealth[0].state, 'failed');
+  // Cycle 2 (within cooldown): even a now-working provider must be skipped, not called.
+  const c2 = await runPaperDecisionCycle(
+    db,
+    { providers: [{ name: 'alpaca', provider: recoveredProvider }], classifier: realModelClassifier(), paperClient: fakePaperClient(), priceSource: fakePriceSource(100), providerStates },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:15:00.000Z') }
+  );
+  assert.match(c2.providerHealth[0].reason, /cooldown until/);
+  assert.equal(recoveredCalls, 0, 'provider must not be hammered during cooldown');
+  // Cycle 3 (after cooldown): same-named provider recovers and ingests safely.
+  const c3 = await runPaperDecisionCycle(
+    db,
+    { providers: [{ name: 'alpaca', provider: recoveredProvider }], classifier: realModelClassifier(), paperClient: fakePaperClient(), priceSource: fakePriceSource(100), providerStates },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:31:00.000Z') }
+  );
+  assert.equal(recoveredCalls, 1, 'provider is retried once cooldown expires');
+  assert.equal(c3.providerHealth[0].state, 'active');
+  assert.equal(c3.providerHealth[0].reason, 'ok');
+  closeDatabase(db);
+});
+
+test('a provider missing its key shows unavailable/missing-key while the other provider continues', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [
+        { name: 'alpaca', provider: alpacaProvider([rawAlpacaNews('a1', { headline: 'Apple Wins Major Contract' })]) },
+        { name: 'benzinga', provider: null, unavailableReason: 'missing key' },
+      ],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource(100),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  const bz = cycle.providerHealth.find((p) => p.name === 'benzinga');
+  assert.equal(bz.state, 'unavailable');
+  assert.equal(bz.reason, 'missing key');
+  assert.equal(cycle.providerHealth.find((p) => p.name === 'alpaca').state, 'active');
+  assert.equal(client.calls.equity.length, 1); // alpaca continues
+  closeDatabase(db);
+});
+
+// --- "every qualifying story" queue integrity -------------------------------
+
+test('12 fresh events are processed in a bounded batch (classify<=10, attempt<=5, distinct, once each)', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const tickers = ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF', 'GGG', 'HHH', 'III', 'JJJ', 'KKK', 'LLL'];
+  const items = tickers.map((t, i) => rawAlpacaNews(`evt-${i}`, { ticker: t, headline: `${t} Wins Major Contract Number ${i}` }));
+  const args = parseArgs(['--symbols', tickers.join(','), '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    { providers: [{ name: 'alpaca', provider: alpacaProvider(items) }], classifier: realModelClassifier(), paperClient: client, priceSource: fakePriceSource(100) },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.ingestion.inserted, 12);
+  assert.equal(cycle.classification.selectedIds.length, 10); // classify cap
+  assert.equal(cycle.batch.trades.length, 5); // attempt cap
+  assert.equal(client.calls.equity.length, 5);
+  const tradedTickers = db.prepare('SELECT ticker FROM paper_trades ORDER BY ticker').all().map((r) => r.ticker);
+  assert.equal(tradedTickers.length, 5);
+  assert.equal(new Set(tradedTickers).size, 5); // distinct, none attempted twice
+  closeDatabase(db);
+});
+
+test('durable backlog carry-forward: deferred events drain across cycles, nothing lost, no resubmits', async () => {
+  // 12 fresh events with classify=10 / attempt=5. Cycle 1 processes only the caps;
+  // the rest enter a durable pending pipeline and drain in later cycles. No
+  // successfully submitted event is ever retried, and no event silently vanishes.
+  const db = freshDb();
+  const client = fakePaperClient();
+  const tickers = ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF', 'GGG', 'HHH', 'III', 'JJJ', 'KKK', 'LLL'];
+  const items = tickers.map((t, i) => rawAlpacaNews(`evt-${i}`, { ticker: t, headline: `${t} Wins Major Contract Number ${i}` }));
+  const opts = { providers: [{ name: 'alpaca', provider: alpacaProvider(items) }], classifier: realModelClassifier(), paperClient: client, priceSource: fakePriceSource(100) };
+  // Raise the daily ORDER cap (a separate hard risk limit) so this test exercises
+  // the attempt-cap carry-forward in isolation, not the daily cap.
+  const args = parseArgs(['--symbols', tickers.join(','), '--classifier', 'openai', '--execute-paper', '--qty', '1', '--max-daily-paper-orders', '50']);
+  const unscored = () => db.prepare('SELECT COUNT(*) AS n FROM news_events n WHERE NOT EXISTS (SELECT 1 FROM sentiment_scores s WHERE s.news_event_id = n.id)').get().n;
+  const trades = () => db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n;
+
+  // Cycle 1: only the caps run — classify 10, attempt 5. Deferred: 2 unscored, 5 scored-unattempted.
+  const c1 = await runPaperDecisionCycle(db, opts, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
+  assert.equal(c1.ingestion.inserted, 12);
+  assert.equal(c1.backlog.classified, 10);
+  assert.equal(c1.backlog.attempted, 5);
+  assert.equal(c1.backlog.deferredByClassificationCap, 2);
+  assert.equal(c1.backlog.deferredByAttemptCap, 5);
+  assert.equal(unscored(), 2);
+  assert.equal(trades(), 5);
+
+  // Cycle 2: re-poll SAME window — all 12 are DB-duplicates (0 new inserts), but the
+  // durable backlog still drains: the 2 remaining classify, 5 more attempt.
+  const c2 = await runPaperDecisionCycle(db, opts, args, { nowMs: Date.parse('2026-06-18T14:45:00.000Z') });
+  assert.equal(c2.ingestion.inserted, 0);
+  assert.notEqual(c2.outcome, PAPER_DECISION_OUTCOMES.NO_NEW_NEWS);
+  assert.equal(c2.outcome, PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED);
+  assert.ok(c2.backlog.carriedForward >= 7, `carried-forward backlog surfaced (${c2.backlog.carriedForward})`);
+  assert.equal(c2.backlog.classified, 2); // the last 2 unscored are drained
+  assert.equal(c2.backlog.attempted, 5);
+  assert.equal(unscored(), 0);
+  assert.equal(trades(), 10);
+
+  // Cycle 3: the final 2 deferred events attempt; the backlog is now empty.
+  const c3 = await runPaperDecisionCycle(db, opts, args, { nowMs: Date.parse('2026-06-18T15:00:00.000Z') });
+  assert.equal(c3.backlog.attempted, 2);
+  assert.equal(trades(), 12);
+
+  // No event silently disappeared and none was submitted twice: 12 distinct tickers.
+  const tradedTickers = db.prepare('SELECT ticker FROM paper_trades').all().map((r) => r.ticker);
+  assert.equal(tradedTickers.length, 12);
+  assert.equal(new Set(tradedTickers).size, 12);
+  closeDatabase(db);
+});
+
+// --- duplicate suppression correctness --------------------------------------
+
+test('cross-provider duplicates suppress despite case/punctuation/whitespace differences', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [
+        { name: 'alpaca', provider: alpacaProvider([rawAlpacaNews('a1', { headline: 'Apple Inc. Wins Huge Contract!' })]) },
+        { name: 'benzinga', provider: benzingaProvider([rawBenzingaNews('b1', { headline: '  apple inc,  wins   huge contract  ' })]) },
+      ],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource(100),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.duplicateSuppressions.length, 1);
+  assert.equal(cycle.batch.trades.length, 1);
+  assert.equal(client.calls.equity.length, 1);
+  closeDatabase(db);
+});
+
+test('genuinely different stories on the same ticker/bucket/direction are NOT suppressed', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(
+    db,
+    {
+      providers: [
+        { name: 'alpaca', provider: alpacaProvider([rawAlpacaNews('a1', { headline: 'Apple Wins Major Cloud Contract Today' })]) },
+        { name: 'benzinga', provider: benzingaProvider([rawBenzingaNews('b1', { headline: 'Apple Faces Fresh Antitrust Probe Abroad' })]) },
+      ],
+      classifier: realModelClassifier(),
+      paperClient: client,
+      priceSource: fakePriceSource(100),
+    },
+    args,
+    { nowMs: Date.parse('2026-06-18T14:30:00.000Z') }
+  );
+  assert.equal(cycle.duplicateSuppressions.length, 0);
+  assert.equal(cycle.independentCandidates.length, 2);
+  assert.equal(cycle.batch.trades.length, 2);
+  closeDatabase(db);
+});
+
+test('repeated cycles do not create duplicate suppression rows indefinitely', async () => {
+  const db = freshDb();
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const opts = {
+    providers: [
+      { name: 'alpaca', provider: alpacaProvider([rawAlpacaNews('a1', { headline: 'Apple Wins Huge Contract' })]) },
+      { name: 'benzinga', provider: benzingaProvider([rawBenzingaNews('b1', { headline: 'Apple Wins Huge Contract' })]) },
+    ],
+    classifier: realModelClassifier(),
+    paperClient: client,
+    priceSource: fakePriceSource(100),
+  };
+  await runPaperDecisionCycle(db, opts, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
+  await runPaperDecisionCycle(db, opts, args, { nowMs: Date.parse('2026-06-18T14:45:00.000Z') });
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_duplicate_suppression_audits').get().n, 1);
+  closeDatabase(db);
+});
+
 test('explicit --event-id override deliberately retests a processed scored event', async () => {
   const db = freshDb();
   const eventId = seedScoredEvent(db, { direction: 'up', impact: 0.4, sentiment: 0.3, confidence: 0.6 });
@@ -844,4 +1378,161 @@ test('the full path runs with zero real network', async () => {
 test('importing the script performs no network and requires no credentials', () => {
   assert.equal(typeof runPaperTradeOnce, 'function');
   assert.equal(typeof buildPaperReport, 'function');
+});
+
+// --- durable per-provider cursors + terminal dispositions -------------------
+
+function recordingAlpacaProvider(items) {
+  const seen = [];
+  const provider = createAlpacaNewsProvider({ fetchRawNews: async (opts) => { seen.push(opts); return items; } });
+  return { seen, provider };
+}
+
+function insertScoredEventAt(db, { ticker = 'AAPL', receivedAt, publishedAt = receivedAt, parserStatus = 'parsed' } = {}) {
+  const ev = db.prepare(INSERT_EVENT_SQL).run({
+    provider: 'alpaca', provider_event_id: `seed-${ticker}-${receivedAt}`, ticker,
+    headline: 'Seeded Headline', published_at: publishedAt, received_at: receivedAt, news_type: 'earnings',
+  });
+  const id = Number(ev.lastInsertRowid);
+  db.prepare(INSERT_SCORE_SQL).run({
+    news_event_id: id, model: 'claude-opus-4-8', prompt_version: 'model_v1', sentiment_score: 0.7,
+    news_type: 'earnings', confidence: 0.9, raw_response: 'x', parse_ok: 1, parser_status: parserStatus,
+    impact_score: 0.8, direction: 'up', time_horizon: 'intraday', detail: '{}',
+  });
+  return id;
+}
+
+test('per-provider cursor advances to the newest published watermark after a successful ingest', async () => {
+  const db = freshDb();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  await runPaperDecisionCycle(db, {
+    providers: [{ name: 'alpaca', provider: alpacaProvider([
+      rawAlpacaNews('a-old', { headline: 'Apple Older Contract News', createdAt: '2026-06-18T13:50:00.000Z' }),
+      rawAlpacaNews('a-new', { headline: 'Apple Newer Contract News', createdAt: '2026-06-18T14:05:00.000Z' }),
+    ]) }],
+    classifier: realModelClassifier(), paperClient: fakePaperClient(), priceSource: fakePriceSource(100),
+  }, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
+  const cursor = getProviderCursor(db, 'alpaca');
+  assert.equal(cursor.cursor_value, '2026-06-18T14:05:00.000Z'); // newest published_at persisted
+  assert.equal(cursor.last_status, 'ok');
+  closeDatabase(db);
+});
+
+test('failed/401/403/429/timeout/malformed responses all retain the prior cursor', async () => {
+  const seedArgs = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  const failArgs = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai']);
+  for (const [msg, status] of [
+    ['HTTP 401 unauthorized', 401],
+    ['HTTP 403 forbidden', 403],
+    ['HTTP 429 rate limit', 429],
+    ['request failed: timeout', null],
+    ['unexpected payload malformed response', null],
+  ]) {
+    const db = freshDb();
+    await runPaperDecisionCycle(db, {
+      providers: [{ name: 'alpaca', provider: alpacaProvider([rawAlpacaNews('seed', { createdAt: '2026-06-18T14:05:00.000Z' })]) }],
+      classifier: realModelClassifier(), paperClient: fakePaperClient(), priceSource: fakePriceSource(100),
+    }, seedArgs, { nowMs: Date.parse('2026-06-18T14:10:00.000Z') });
+    const before = getProviderCursor(db, 'alpaca').cursor_value;
+    assert.equal(before, '2026-06-18T14:05:00.000Z');
+    await runPaperDecisionCycle(db, {
+      providers: [{ name: 'alpaca', provider: failingProvider('alpaca', msg, status) }],
+      classifier: realModelClassifier(),
+    }, failArgs, { nowMs: Date.parse('2026-06-18T14:20:00.000Z') });
+    const after = getProviderCursor(db, 'alpaca');
+    assert.equal(after.cursor_value, before, `cursor retained after "${msg}"`);
+    assert.notEqual(after.last_status, 'ok');
+    closeDatabase(db);
+  }
+});
+
+test('a cooled-down provider retains its cursor and is not re-fetched', async () => {
+  const db = freshDb();
+  const providerStates = {};
+  const failing = failingProvider('alpaca', 'HTTP 500 boom', 500);
+  const args = parseArgs([
+    '--symbols', 'AAPL', '--classifier', 'openai',
+    '--provider-max-failures-before-cooldown', '1', '--provider-cooldown-minutes', '30',
+  ]);
+  await runPaperDecisionCycle(db, { providers: [{ name: 'alpaca', provider: failing }], classifier: realModelClassifier(), providerStates }, args, { nowMs: Date.parse('2026-06-18T14:00:00.000Z') });
+  const c2 = await runPaperDecisionCycle(db, { providers: [{ name: 'alpaca', provider: failing }], classifier: realModelClassifier(), providerStates }, args, { nowMs: Date.parse('2026-06-18T14:15:00.000Z') });
+  assert.match(c2.providerHealth[0].reason, /cooldown until/);
+  const cursor = getProviderCursor(db, 'alpaca');
+  assert.equal(cursor.cursor_value, null);
+  assert.equal(cursor.last_status, 'cooldown');
+  assert.equal(failing.calls(), 1); // not hammered during cooldown
+  closeDatabase(db);
+});
+
+test('a recovered provider resumes its delta fetch from the retained cursor', async () => {
+  const db = freshDb();
+  const rec = recordingAlpacaProvider([rawAlpacaNews('r1', { createdAt: '2026-06-18T14:25:00.000Z' })]);
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  await runPaperDecisionCycle(db, { providers: [{ name: 'alpaca', provider: rec.provider }], classifier: realModelClassifier(), paperClient: fakePaperClient(), priceSource: fakePriceSource(100) }, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
+  const cursorValue = getProviderCursor(db, 'alpaca').cursor_value;
+  assert.equal(cursorValue, '2026-06-18T14:25:00.000Z');
+  // Cycle 1 (no prior cursor) fetches from the lookback floor.
+  assert.equal(rec.seen[0].since, new Date(Date.parse('2026-06-18T14:30:00.000Z') - 60 * 60000).toISOString());
+  // Cycle 2 resumes from the retained cursor (newer than the lookback floor).
+  await runPaperDecisionCycle(db, { providers: [{ name: 'alpaca', provider: rec.provider }], classifier: realModelClassifier(), paperClient: fakePaperClient(), priceSource: fakePriceSource(100) }, args, { nowMs: Date.parse('2026-06-18T14:40:00.000Z') });
+  assert.equal(rec.seen[1].since, cursorValue);
+  assert.equal(rec.seen[1].maxPages, 3); // bounded pagination requested by default
+  closeDatabase(db);
+});
+
+test('Alpaca-only and Benzinga-only modes each ingest, advance their own cursor, and drain', async () => {
+  for (const [name, provider, ticker] of [
+    ['alpaca', alpacaProvider([rawAlpacaNews('solo', { ticker: 'AAPL', headline: 'Apple Solo Contract Win', createdAt: '2026-06-18T14:05:00.000Z' })]), 'AAPL'],
+    ['benzinga', benzingaProvider([rawBenzingaNews('solo', { ticker: 'MSFT', headline: 'Microsoft Solo Contract Win' })]), 'MSFT'],
+  ]) {
+    const db = freshDb();
+    const client = fakePaperClient();
+    const args = parseArgs(['--symbols', ticker, '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+    const cycle = await runPaperDecisionCycle(db, { providers: [{ name, provider }], classifier: realModelClassifier(), paperClient: client, priceSource: fakePriceSource({ [ticker]: 100 }) }, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
+    assert.equal(cycle.providerHealth.find((p) => p.name === name).state, 'active');
+    assert.equal(client.calls.equity.length, 1);
+    assert.ok(getProviderCursor(db, name).cursor_value);
+    closeDatabase(db);
+  }
+});
+
+test('one-shot --event-id still selects and trades the explicit event', async () => {
+  const db = freshDb();
+  const id = seedScoredEvent(db, { ticker: 'AAPL', sentiment: 0.7 });
+  const client = fakePaperClient();
+  const args = parseArgs(['--symbols', 'AAPL', '--event-id', String(id), '--execute-paper', '--qty', '1']);
+  const cycle = await runPaperDecisionCycle(db, { paperClient: client, priceSource: fakePriceSource(200) }, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
+  assert.equal(cycle.selected.event.id, id);
+  assert.equal(client.calls.equity.length, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades').get().n, 1);
+  closeDatabase(db);
+});
+
+test('stale backlog entries become terminal stale_expired with a sanitized reason and drop out', async () => {
+  const db = freshDb();
+  const nowMs = Date.parse('2026-06-18T14:30:00.000Z'); // queue age 120m => floor 12:30
+  const staleId = insertScoredEventAt(db, { ticker: 'AAPL', receivedAt: '2026-06-18T12:25:00.000Z' });
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai', '--execute-paper', '--qty', '1']);
+  await runPaperDecisionCycle(db, { providers: [{ name: 'alpaca', provider: alpacaProvider([]) }], classifier: realModelClassifier(), paperClient: fakePaperClient(), priceSource: fakePriceSource(200) }, args, { nowMs });
+  const terminals = listEventTerminals(db, { state: 'stale_expired' });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].news_event_id, staleId);
+  assert.equal(terminals[0].queue_age_minutes, 120);
+  assert.match(terminals[0].reason, /exceeded max queue age 120 minutes without a terminal paper decision/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_trades WHERE news_event_id = ?').get(staleId).n, 0);
+  closeDatabase(db);
+});
+
+test('an unusable model score becomes a terminal provider_invalid', async () => {
+  const db = freshDb();
+  const args = parseArgs(['--symbols', 'AAPL', '--classifier', 'openai']);
+  const cycle = await runPaperDecisionCycle(db, {
+    providers: [{ name: 'alpaca', provider: alpacaProvider([rawAlpacaNews('bad', { headline: 'Apple Ambiguous Item' })]) }],
+    classifier: realModelClassifier({ parserStatus: 'model_error' }),
+  }, args, { nowMs: Date.parse('2026-06-18T14:30:00.000Z') });
+  const terminals = listEventTerminals(db, { state: 'provider_invalid' });
+  assert.equal(terminals.length, 1);
+  assert.match(terminals[0].reason, /parser_status model_error not usable/);
+  assert.equal(cycle.backlog.providerInvalid, 1);
+  closeDatabase(db);
 });

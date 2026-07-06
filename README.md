@@ -449,14 +449,19 @@ check, prints the next wake time, and sleeps; it does not call OpenAI, news,
 price, option-contract, option-quote, or order endpoints while closed.
 
 Each open-market iteration ranks the configured base universe, ingests recent
-Alpaca news for the selected capped symbols, classifies newly inserted events
-when `--classifier openai` is requested, selects a fresh unprocessed `model_v1`
-score, and then reuses the one-shot PAPER proposal/risk/order path. It is
-**dry-run by default**, enforces a **>= 5-minute** interval, prints sanitized
-state transitions, cycle outcomes, and broker-truth/performance snapshots when
-paper credentials are available, sends one idempotent EOD report per completed
-session when requested, and exits cleanly on Ctrl+C. `--max-iterations` exists
-only as an explicit debug/test cap.
+news from enabled live providers (Alpaca and Benzinga when both are configured
+and healthy), classifies newly inserted events up to the configured cycle cap,
+suppresses cross-provider same-story duplicates, ranks independent qualifying
+signals, and then reuses the one-shot PAPER proposal/risk/order path for each
+attempted event. Batch risk is evaluated in deterministic order against a
+running simulated portfolio budget, so earlier approved proposals reserve daily
+notional, buying power, and exposure before later proposals are assessed.
+
+It is **dry-run by default**, enforces a **>= 5-minute** interval, prints
+sanitized provider health, provider counts, batch counts, cycle outcomes, and
+broker-truth/performance snapshots when paper credentials are available, sends
+one idempotent EOD report per completed session when requested, and exits
+cleanly on Ctrl+C. `--max-iterations` exists only as an explicit debug/test cap.
 
 Loop dry-run:
 
@@ -471,14 +476,19 @@ node --env-file=.env scripts/runPaperTradingLoop.js --symbols AAPL,MSFT,NVDA --c
 ```
 
 Extra loop flags: `--interval-minutes` (floored at 5), `--max-iterations N`
-(explicit debug/test cap), `--ingest-limit` (default 20, capped at 50),
-`--classify-limit` (default/cap 5), `--max-symbols-per-cycle` (cost cap),
-`--news-lookback-minutes` (default 60, capped at 390), and
-`--send-discord-eod-report` (posts the idempotent EOD summary after a completed
-session if `DISCORD_WEBHOOK_URL` is set). `--run-outside-market-hours` is
-deprecated and ignored. Heartbeats distinguish `no_new_news`,
-`no_fresh_real_model_score`, `all_fresh_scores_failed_signal_thresholds`,
-`already_processed_event`, `risk_rejection`, and `broker_submission_error`.
+(explicit debug/test cap), `--ingest-limit` (default 20, capped at 50, applied
+per provider), `--classify-limit` (legacy tighter cap when explicitly set),
+`--enabled-providers alpaca,benzinga`, `--max-events-classified-per-cycle`
+(default 10, capped at 50), `--max-qualifying-events-attempted-per-cycle`
+(default 5, capped at 25), `--provider-cooldown-minutes`,
+`--provider-max-failures-before-cooldown`, `--duplicate-story-window-minutes`,
+`--max-symbols-per-cycle` (cost cap), `--news-lookback-minutes` (default 60,
+capped at 390), and `--send-discord-eod-report` (posts the idempotent EOD
+summary after a completed session if `DISCORD_WEBHOOK_URL` is set).
+`--run-outside-market-hours` is deprecated and ignored. Heartbeats distinguish
+`no_active_provider`, `no_new_news`, `no_fresh_real_model_score`,
+`all_fresh_scores_failed_signal_thresholds`, `already_processed_event`,
+`risk_rejection`, and `broker_submission_error`.
 Never part of `npm test` (the loop core runs with injected clock/sleep/
 market-hours/fakes — no real timers, no network).
 
@@ -598,8 +608,12 @@ Settings include `symbols`, `allow_shorts`, `allow_options`, `options_mode`,
 the `*_threshold` knobs, learned equity sizing controls
 (`sizing_min_comparable_sample_size`, `sizing_cold_start_target_weight`,
 `sizing_max_target_weight`, and optional confidence/impact scaling),
-`interval_minutes`, an optional debug `max_iterations`, and research
-focus (`scrape_target_groups`, `scrape_symbol_focus`). All values are
+provider/batch controls (`enabled_news_providers`,
+`max_events_classified_per_cycle`,
+`max_qualifying_events_attempted_per_cycle`, `provider_cooldown_minutes`,
+`provider_max_failures_before_cooldown`, `duplicate_story_window_minutes`),
+`interval_minutes`, an optional debug `max_iterations`, and research focus
+(`scrape_target_groups`, `scrape_symbol_focus`). All values are
 validated/capped on load; secrets and `LIVE_TRADING_ENABLED` are never accepted.
 When `data/strategy-settings.json` exists, the PAPER one-shot/loop use these
 non-secret values as defaults; explicit CLI flags still override them, and the

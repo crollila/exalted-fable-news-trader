@@ -10,7 +10,9 @@ import { runMigrations } from '../src/database/migrations.js';
 import { insertPaperTrade, insertRejectedTrade } from '../src/paper/paperTradeProposal.js';
 import {
   insertBrokerAccountSnapshot,
+  insertDuplicateSuppressionAudit,
   insertEquitySizingDecision,
+  insertEventTerminal,
   insertPaperOptionTrade,
   insertStrategyPerformanceSnapshot,
   updatePaperOptionTrade,
@@ -193,6 +195,52 @@ test('collectEodData can isolate one runtime session from same-day history', () 
   assert.equal(scoped.ordersSubmitted, 1);
   assert.equal(scoped.session.sessionId, sessionId);
   assert.equal(scoped.evidenceScope, `session:${sessionId}`);
+  closeDatabase(db);
+});
+
+test('EOD report renders provider health, batch counts, and duplicate suppressions safely', () => {
+  const db = freshDb();
+  const sessionId = Number(db.prepare(
+    `INSERT INTO paper_runtime_sessions
+       (session_date, started_at, ended_at, status, cycles, fresh_news_count,
+        classification_count, classification_status_json, provider_status_json,
+        provider_counts_json, batch_counts_json)
+     VALUES
+       ('2026-06-18', '2026-06-18T13:30:00.000Z', '2026-06-18T20:00:00.000Z',
+        'closed', 1, 2, 2, '{"parsed":2}',
+        '{"alpaca:active":1,"benzinga:active":1}',
+        '{"alpaca.fetched":1,"alpaca.inserted":1,"alpaca.duplicates":0,"alpaca.failed":0,"benzinga.fetched":1,"benzinga.inserted":1,"benzinga.duplicates":0,"benzinga.failed":0}',
+        '{"independent":1,"attempted":1,"approved":1,"submitted":1,"risk_rejected":0,"duplicate_suppressed":1}')`
+  ).run().lastInsertRowid);
+  const kept = insertEvent(db, 'alpaca-kept');
+  const suppressed = insertEvent(db, 'benzinga-suppressed');
+  insertDuplicateSuppressionAudit(db, {
+    suppressedNewsEventId: suppressed,
+    suppressedProvider: 'benzinga',
+    suppressedProviderEventId: 'bz-secret-story',
+    keptNewsEventId: kept,
+    keptProvider: 'alpaca',
+    keptProviderEventId: 'ap-secret-story',
+    signalIdentityHash: 'abc123',
+    identitySummary: 'ticker=AAPL direction=up bucket=123 headlineHash=abc123',
+    duplicateWindowMinutes: 20,
+    reason: 'benzinga event bz-secret-story suppressed because equivalent alpaca story ap-secret-story was already processed',
+  });
+  db.prepare(
+    `UPDATE paper_duplicate_suppression_audits
+        SET created_at = '2026-06-18T14:30:00.000Z'
+      WHERE suppressed_news_event_id = ?`
+  ).run(suppressed);
+  const text = buildEodReport(collectEodData(db, { day: '2026-06-18', sessionId }), { day: '2026-06-18' }).join('\n');
+  assert.match(text, /provider health:\s+alpaca:active=1 benzinga:active=1|provider health:\s+benzinga:active=1 alpaca:active=1/);
+  assert.match(text, /provider counts:/);
+  assert.match(text, /alpaca\.inserted=1/);
+  assert.match(text, /batch counts:/);
+  assert.match(text, /duplicate_suppressed=1/);
+  assert.match(text, /Cross-provider duplicate suppressions/);
+  assert.match(text, /benzinga event bz-secret-story suppressed because equivalent alpaca story ap-secret-story was already processed/);
+  assert.ok(!text.includes('SECRET-HEADLINE-MUST-NOT-PRINT'));
+  assert.ok(!text.includes('raw_payload'));
   closeDatabase(db);
 });
 
@@ -702,6 +750,34 @@ test('sufficient unique session evidence can emit recommendations and audit them
   assert.match(r.content, /MAX_TRADE_NOTIONAL_PCT=0\.0075/);
   const audits = db.prepare('SELECT kind, sample_size, data_quality FROM paper_recommendation_audits').all();
   assert.ok(audits.some((a) => a.kind === 'constraint_suggestion' && a.sample_size === 10 && a.data_quality === 'sufficient'));
+  closeDatabase(db);
+});
+
+test('EOD report surfaces the durable backlog pipeline counters and stale-expired terminals', () => {
+  const db = freshDb();
+  db.prepare(
+    `INSERT INTO paper_runtime_sessions
+       (session_date, started_at, status, cycles, backlog_counts_json)
+     VALUES ('2026-06-18', '2026-06-18T13:30:00.000Z', 'closed', 3, ?)`
+  ).run(JSON.stringify({
+    carriedForward: 7, newlyInserted: 12, classified: 10, proposalEligible: 9, attempted: 5,
+    deferredByClassificationCap: 2, deferredByAttemptCap: 4, staleExpired: 1,
+    providerInvalid: 1, terminalRejections: 3, duplicateSuppressions: 2, submitted: 5,
+  }));
+  const staleEventId = insertEvent(db, 'stale-1');
+  insertEventTerminal(db, { newsEventId: staleEventId, provider: 'alpaca', terminalState: 'stale_expired', reason: 'exceeded max queue age 120 minutes without a terminal paper decision' });
+
+  const data = collectEodData(db, {}); // all-time scope (rows stamp real created_at)
+  assert.equal(data.backlog.carriedForward, 7);
+  assert.equal(data.backlog.deferredByAttemptCap, 4);
+  assert.equal(data.backlog.staleExpired, 1);
+  assert.equal(data.backlog.providerInvalid, 0); // none recorded
+
+  const text = buildEodReport(data, {}).join('\n');
+  assert.match(text, /Durable backlog \/ queue pipeline/);
+  assert.match(text, /carried-forward backlog:\s+7/);
+  assert.match(text, /deferred \(attempt cap\):\s+4/);
+  assert.match(text, /stale-expired \(terminal\):\s+1/);
   closeDatabase(db);
 });
 

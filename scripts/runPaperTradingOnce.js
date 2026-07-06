@@ -28,6 +28,7 @@
 //   headers, request configs, or webhook URLs.
 
 import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
 import { loadConfig } from '../src/config.js';
 import { loadStrategySettings } from '../src/config/strategySettings.js';
 import { openDatabase, closeDatabase } from '../src/database/db.js';
@@ -60,14 +61,30 @@ import {
   resolveLearnedEquityEffectiveCaps,
   DEFAULT_CAPS,
 } from '../src/paper/paperRisk.js';
-import { deriveCapabilities, summarizeCapabilities } from '../src/paper/accountCapabilities.js';
+import { deriveCapabilities, grossExposure, summarizeCapabilities } from '../src/paper/accountCapabilities.js';
 import {
   getOwnedEquityExposureSnapshot,
   getPaperEventAttemptStats,
+  insertDuplicateSuppressionAudit,
   insertEquitySizingDecision,
   insertPaperOptionTrade,
   listBrokerConfirmedEquityOutcomes,
+  sweepStaleQueueEvents,
+  markUnusableScoresTerminal,
+  selectClassificationBacklog,
+  countScoredInWindow,
+  getProviderCursor,
+  advanceProviderCursor,
+  retainProviderCursor,
+  maxPublishedAtForEvents,
 } from '../src/database/paperRuntime.js';
+import {
+  resolveProviderSince,
+  nextCursorValue,
+  clampMaxPages,
+  DEFAULT_PROVIDER_MAX_PAGES_PER_CYCLE,
+  MAX_PROVIDER_MAX_PAGES_PER_CYCLE,
+} from '../src/paper/providerCursors.js';
 import {
   decideEquitySizing,
   formatSizingDecision,
@@ -96,9 +113,26 @@ export const DEFAULT_PAPER_INGEST_LIMIT = 20;
 export const MAX_PAPER_INGEST_LIMIT = 50;
 export const DEFAULT_PAPER_CLASSIFY_LIMIT = 5;
 export const MAX_PAPER_CLASSIFY_LIMIT = 5;
+export const DEFAULT_ENABLED_NEWS_PROVIDERS = Object.freeze(['alpaca', 'benzinga']);
+export const SUPPORTED_LIVE_NEWS_PROVIDERS = Object.freeze(['alpaca', 'benzinga']);
+export const DEFAULT_MAX_EVENTS_CLASSIFIED_PER_CYCLE = 10;
+export const MAX_EVENTS_CLASSIFIED_PER_CYCLE_CAP = 50;
+export const DEFAULT_MAX_QUALIFYING_EVENTS_ATTEMPTED_PER_CYCLE = 5;
+export const MAX_QUALIFYING_EVENTS_ATTEMPTED_PER_CYCLE_CAP = 25;
+export const DEFAULT_PROVIDER_COOLDOWN_MINUTES = 30;
+export const DEFAULT_PROVIDER_MAX_FAILURES_BEFORE_COOLDOWN = 2;
+export const DEFAULT_DUPLICATE_STORY_WINDOW_MINUTES = 20;
+export const MAX_DUPLICATE_STORY_WINDOW_MINUTES = 390;
 export { DEFAULT_MAX_SYMBOLS_PER_CYCLE, MAX_SYMBOLS_PER_CYCLE };
 export const DEFAULT_NEWS_LOOKBACK_MINUTES = 60;
 export const MAX_NEWS_LOOKBACK_MINUTES = 390;
+// Durable backlog: max time an event may wait in the pending pipeline before it
+// becomes a terminal `stale_expired` (independent of the provider fetch window).
+export const DEFAULT_MAX_QUEUE_AGE_MINUTES = 120;
+export const MAX_QUEUE_AGE_MINUTES_CAP = 1440;
+export { DEFAULT_PROVIDER_MAX_PAGES_PER_CYCLE, MAX_PROVIDER_MAX_PAGES_PER_CYCLE };
+/** Bound on backlog rows selected per cycle (deferred remainder waits for later cycles). */
+export const BACKLOG_SELECT_LIMIT = 200;
 
 export const PAPER_DECISION_OUTCOMES = Object.freeze({
   TRADE_ATTEMPTED: 'trade_attempted',
@@ -108,6 +142,7 @@ export const PAPER_DECISION_OUTCOMES = Object.freeze({
   ALREADY_PROCESSED_EVENT: 'already_processed_event',
   RISK_REJECTION: 'risk_rejection',
   BROKER_SUBMISSION_ERROR: 'broker_submission_error',
+  NO_ACTIVE_PROVIDER: 'no_active_provider',
 });
 
 /** Reference-price lookup window (free IEX feed is restricted for very recent data). */
@@ -137,6 +172,15 @@ function cleanSymbols(value, fallback = DEFAULT_SYMBOLS) {
     ? value.map((s) => String(s).trim().toUpperCase()).filter(Boolean)
     : [];
   return symbols.length > 0 ? [...new Set(symbols)] : [...fallback];
+}
+
+function cleanProviders(value, fallback = DEFAULT_ENABLED_NEWS_PROVIDERS) {
+  const allowed = new Set(SUPPORTED_LIVE_NEWS_PROVIDERS);
+  const raw = Array.isArray(value) ? value : String(value ?? '').split(',');
+  const providers = [...new Set(raw
+    .map((s) => String(s).trim().toLowerCase())
+    .filter((s) => allowed.has(s)))];
+  return providers.length > 0 ? providers : [...fallback];
 }
 
 /** Map non-secret runtime strategy settings into paper script defaults. */
@@ -175,6 +219,28 @@ export function paperDefaultsFromStrategySettings(settings = {}) {
     if (Object.prototype.hasOwnProperty.call(settings, key)) defaults.sizingSettings[key] = settings[key];
   }
   if (Object.keys(defaults.sizingSettings).length === 0) delete defaults.sizingSettings;
+  if (Array.isArray(settings.enabled_news_providers)) defaults.enabledProviders = cleanProviders(settings.enabled_news_providers);
+  if (parsePosInt(settings.max_events_classified_per_cycle) !== null) {
+    defaults.maxEventsClassifiedPerCycle = Number(settings.max_events_classified_per_cycle);
+  }
+  if (parsePosInt(settings.max_qualifying_events_attempted_per_cycle) !== null) {
+    defaults.maxQualifyingEventsAttemptedPerCycle = Number(settings.max_qualifying_events_attempted_per_cycle);
+  }
+  if (parsePosInt(settings.provider_cooldown_minutes) !== null) {
+    defaults.providerCooldownMinutes = Number(settings.provider_cooldown_minutes);
+  }
+  if (parsePosInt(settings.provider_max_failures_before_cooldown) !== null) {
+    defaults.providerMaxFailuresBeforeCooldown = Number(settings.provider_max_failures_before_cooldown);
+  }
+  if (parsePosInt(settings.duplicate_story_window_minutes) !== null) {
+    defaults.duplicateStoryWindowMinutes = Number(settings.duplicate_story_window_minutes);
+  }
+  if (parsePosInt(settings.max_queue_age_minutes) !== null) {
+    defaults.maxQueueAgeMinutes = Number(settings.max_queue_age_minutes);
+  }
+  if (parsePosInt(settings.provider_max_pages_per_cycle) !== null) {
+    defaults.providerMaxPagesPerCycle = Number(settings.provider_max_pages_per_cycle);
+  }
   return defaults;
 }
 
@@ -208,6 +274,35 @@ export function parseArgs(argv, defaults = {}) {
     classifier: defaults.classifier ?? null,
     ingestLimit: clampInt(defaults.ingestLimit, DEFAULT_PAPER_INGEST_LIMIT, 1, MAX_PAPER_INGEST_LIMIT),
     classifyLimit: clampInt(defaults.classifyLimit, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT),
+    classifyLimitExplicit: Object.prototype.hasOwnProperty.call(defaults, 'classifyLimit'),
+    enabledProviders: cleanProviders(defaults.enabledProviders),
+    maxEventsClassifiedPerCycle: clampInt(
+      defaults.maxEventsClassifiedPerCycle,
+      DEFAULT_MAX_EVENTS_CLASSIFIED_PER_CYCLE,
+      1,
+      MAX_EVENTS_CLASSIFIED_PER_CYCLE_CAP
+    ),
+    maxQualifyingEventsAttemptedPerCycle: clampInt(
+      defaults.maxQualifyingEventsAttemptedPerCycle,
+      DEFAULT_MAX_QUALIFYING_EVENTS_ATTEMPTED_PER_CYCLE,
+      1,
+      MAX_QUALIFYING_EVENTS_ATTEMPTED_PER_CYCLE_CAP
+    ),
+    providerCooldownMinutes: clampInt(defaults.providerCooldownMinutes, DEFAULT_PROVIDER_COOLDOWN_MINUTES, 1, 1440),
+    providerMaxFailuresBeforeCooldown: clampInt(
+      defaults.providerMaxFailuresBeforeCooldown,
+      DEFAULT_PROVIDER_MAX_FAILURES_BEFORE_COOLDOWN,
+      1,
+      20
+    ),
+    duplicateStoryWindowMinutes: clampInt(
+      defaults.duplicateStoryWindowMinutes,
+      DEFAULT_DUPLICATE_STORY_WINDOW_MINUTES,
+      1,
+      MAX_DUPLICATE_STORY_WINDOW_MINUTES
+    ),
+    maxQueueAgeMinutes: clampInt(defaults.maxQueueAgeMinutes, DEFAULT_MAX_QUEUE_AGE_MINUTES, 5, MAX_QUEUE_AGE_MINUTES_CAP),
+    providerMaxPagesPerCycle: clampMaxPages(defaults.providerMaxPagesPerCycle, DEFAULT_PROVIDER_MAX_PAGES_PER_CYCLE),
     maxSymbolsPerCycle: clampInt(defaults.maxSymbolsPerCycle, DEFAULT_MAX_SYMBOLS_PER_CYCLE, 1, MAX_SYMBOLS_PER_CYCLE),
     newsLookbackMinutes: clampInt(defaults.newsLookbackMinutes, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES),
     allowShorts: defaults.allowShorts === true,
@@ -241,7 +336,29 @@ export function parseArgs(argv, defaults = {}) {
     else if (flag === '--sentiment-threshold' && next) { setThresh('minSentiment', next); i += 1; }
     else if (flag === '--classifier' && next) { args.classifier = next.trim(); i += 1; }
     else if (flag === '--ingest-limit' && next) { args.ingestLimit = clampInt(next, DEFAULT_PAPER_INGEST_LIMIT, 1, MAX_PAPER_INGEST_LIMIT); i += 1; }
-    else if (flag === '--classify-limit' && next) { args.classifyLimit = clampInt(next, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT); i += 1; }
+    else if (flag === '--classify-limit' && next) { args.classifyLimit = clampInt(next, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT); args.classifyLimitExplicit = true; i += 1; }
+    else if (flag === '--enabled-providers' && next) { args.enabledProviders = cleanProviders(next); i += 1; }
+    else if (flag === '--max-events-classified-per-cycle' && next) {
+      args.maxEventsClassifiedPerCycle = clampInt(next, DEFAULT_MAX_EVENTS_CLASSIFIED_PER_CYCLE, 1, MAX_EVENTS_CLASSIFIED_PER_CYCLE_CAP); i += 1;
+    }
+    else if (flag === '--max-qualifying-events-attempted-per-cycle' && next) {
+      args.maxQualifyingEventsAttemptedPerCycle = clampInt(next, DEFAULT_MAX_QUALIFYING_EVENTS_ATTEMPTED_PER_CYCLE, 1, MAX_QUALIFYING_EVENTS_ATTEMPTED_PER_CYCLE_CAP); i += 1;
+    }
+    else if (flag === '--provider-cooldown-minutes' && next) {
+      args.providerCooldownMinutes = clampInt(next, DEFAULT_PROVIDER_COOLDOWN_MINUTES, 1, 1440); i += 1;
+    }
+    else if (flag === '--provider-max-failures-before-cooldown' && next) {
+      args.providerMaxFailuresBeforeCooldown = clampInt(next, DEFAULT_PROVIDER_MAX_FAILURES_BEFORE_COOLDOWN, 1, 20); i += 1;
+    }
+    else if (flag === '--duplicate-story-window-minutes' && next) {
+      args.duplicateStoryWindowMinutes = clampInt(next, DEFAULT_DUPLICATE_STORY_WINDOW_MINUTES, 1, MAX_DUPLICATE_STORY_WINDOW_MINUTES); i += 1;
+    }
+    else if (flag === '--max-queue-age-minutes' && next) {
+      args.maxQueueAgeMinutes = clampInt(next, DEFAULT_MAX_QUEUE_AGE_MINUTES, 5, MAX_QUEUE_AGE_MINUTES_CAP); i += 1;
+    }
+    else if (flag === '--provider-max-pages-per-cycle' && next) {
+      args.providerMaxPagesPerCycle = clampMaxPages(next, DEFAULT_PROVIDER_MAX_PAGES_PER_CYCLE); i += 1;
+    }
     else if (flag === '--max-symbols-per-cycle' && next) { args.maxSymbolsPerCycle = clampInt(next, DEFAULT_MAX_SYMBOLS_PER_CYCLE, 1, MAX_SYMBOLS_PER_CYCLE); i += 1; }
     else if (flag === '--news-lookback-minutes' && next) { args.newsLookbackMinutes = clampInt(next, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES); i += 1; }
     else if (flag === '--allow-shorts') { args.allowShorts = true; }
@@ -275,6 +392,7 @@ export function listRecentScoredEvents(
     allowedSymbols = [],
     promptVersion = MODEL_PROMPT_VERSION,
     excludeProcessed = true,
+    sinceReceived = null,
     limit = 25,
   } = {}
 ) {
@@ -295,14 +413,25 @@ export function listRecentScoredEvents(
     conds.push(`n.ticker IN (${symbols.map(() => '?').join(', ')})`);
     params.push(...symbols);
   }
+  if (sinceReceived && !explicitEventId) {
+    conds.push('n.received_at >= ?');
+    params.push(sinceReceived);
+  }
   if (excludeProcessed && !explicitEventId) {
+    // Terminal via any durable source: submitted/pending (paper_trades),
+    // signal/risk rejected (rejected_trades), duplicate-suppressed, or
+    // stale_expired/provider_invalid (paper_event_terminals). Non-terminal
+    // scored events (incl. prior cycles) remain proposal-backlog eligible.
     conds.push('NOT EXISTS (SELECT 1 FROM paper_trades pt WHERE pt.news_event_id = n.id)');
     conds.push('NOT EXISTS (SELECT 1 FROM rejected_trades rt WHERE rt.news_event_id = n.id)');
+    conds.push('NOT EXISTS (SELECT 1 FROM paper_duplicate_suppression_audits d WHERE d.suppressed_news_event_id = n.id)');
+    conds.push('NOT EXISTS (SELECT 1 FROM paper_event_terminals te WHERE te.news_event_id = n.id)');
   }
-  const cap = clampInt(limit, 25, 1, 100);
+  const cap = clampInt(limit, 25, 1, 500);
   return db
     .prepare(
       `SELECT n.id AS event_id, n.ticker AS ticker,
+              n.provider AS provider, n.provider_event_id AS provider_event_id,
               n.published_at AS published_at, n.received_at AS received_at,
               s.model AS model, s.prompt_version AS prompt_version,
               s.sentiment_score AS sentiment_score, s.impact_score AS impact_score,
@@ -316,7 +445,12 @@ export function listRecentScoredEvents(
     )
     .all(...params, cap)
     .map((row) => ({
-    event: { id: row.event_id, ticker: row.ticker },
+    event: {
+      id: row.event_id,
+      ticker: row.ticker,
+      provider: row.provider,
+      providerEventId: row.provider_event_id,
+    },
       freshness: { publishedAt: row.published_at, receivedAt: row.received_at },
     score: {
       model: row.model, prompt_version: row.prompt_version,
@@ -1041,14 +1175,518 @@ function statusLine(statusCounts = {}) {
   return entries.sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => `${k}=${v}`).join(' ');
 }
 
+function batchCounts(cycle = {}) {
+  const trades = cycle?.batch?.trades ?? [];
+  const subs = trades.flatMap((t) => [t.result?.equity, t.result?.option].filter(Boolean));
+  return {
+    independent: cycle?.independentCandidates?.length ?? 0,
+    attempted: trades.length,
+    approved: subs.filter((s) => s.decision === 'accepted' || s.decision === 'plan').length,
+    submitted: subs.filter((s) => s.order).length,
+    riskRejected: subs.filter((s) =>
+      s.decision === 'rejected' && (
+        (s.risk && s.risk.approved === false) ||
+        s.sizingDecision?.mode === SIZING_MODES.ABSTAIN
+      )
+    ).length,
+    duplicateSuppressed: cycle?.duplicateSuppressions?.length ?? 0,
+  };
+}
+
+function providerFailureReason(err) {
+  const status = Number(err?.status);
+  const msg = String(err?.message ?? '').toLowerCase();
+  const statusMatch = msg.match(/http\s+(\d{3})/i);
+  const code = Number.isFinite(status) && status > 0
+    ? status
+    : statusMatch ? Number(statusMatch[1]) : null;
+  if (code === 401 || code === 403) return { state: 'failed', reason: `HTTP ${code}` };
+  if (code === 429) return { state: 'rate-limited', reason: 'HTTP 429' };
+  if (code !== null && code >= 500) return { state: 'failed', reason: `HTTP ${code}` };
+  if (/not configured|missing key|api key|credentials/.test(msg)) return { state: 'unavailable', reason: 'missing key' };
+  if (/timeout|abort/.test(msg)) return { state: 'failed', reason: 'timeout' };
+  if (/malformed|unexpected payload|not valid json|invalid json/.test(msg)) {
+    return { state: 'failed', reason: 'malformed response' };
+  }
+  return { state: 'failed', reason: 'request failed' };
+}
+
+function providerHealthLine(row = {}) {
+  const counts = `fetched=${row.fetched ?? 0} inserted=${row.inserted ?? 0} duplicate=${row.duplicates ?? 0} failed=${row.failed ?? 0}`;
+  const pages = row.pages ? ` pages=${row.pages}${row.truncated ? ' TRUNCATED' : ''}` : '';
+  const cursor = row.cursorAdvancedTo ? ` cursor->${row.cursorAdvancedTo}` : '';
+  return `${row.name ?? 'unknown'}=${row.state ?? 'unknown'} reason=${row.reason ?? 'ok'} ${counts}${pages}${cursor}`;
+}
+
+function normalizeProviderDescriptors({ provider = null, providers = null } = {}, args = {}) {
+  if (provider) {
+    return [{
+      name: provider.name,
+      provider,
+      enabled: true,
+      unavailableReason: null,
+    }];
+  }
+  const enabled = new Set(cleanProviders(args.enabledProviders));
+  const raw = Array.isArray(providers)
+    ? providers
+    : providers && typeof providers === 'object'
+      ? Object.entries(providers).map(([name, value]) => (
+        value?.provider || Object.prototype.hasOwnProperty.call(value ?? {}, 'enabled')
+          ? { name, ...value }
+          : { name, provider: value }
+      ))
+      : SUPPORTED_LIVE_NEWS_PROVIDERS.map((name) => ({ name, provider: null }));
+  return raw.map((entry) => {
+    const name = String(entry?.name ?? entry?.provider?.name ?? '').trim().toLowerCase();
+    return {
+      name,
+      provider: entry?.provider ?? null,
+      enabled: entry?.enabled === false ? false : enabled.has(name),
+      unavailableReason: entry?.unavailableReason ?? entry?.reason ?? null,
+    };
+  }).filter((entry) => entry.name);
+}
+
+function providerRuntimeState(providerStates, name) {
+  if (!providerStates[name]) {
+    providerStates[name] = { consecutiveFailures: 0, cooldownUntilMs: null, lastState: null };
+  }
+  return providerStates[name];
+}
+
+async function ingestFromProviders(db, descriptors, fetchOptions, args, { providerStates = {}, nowMs = Date.now() } = {}) {
+  const results = [];
+  const attemptedAt = new Date(nowMs).toISOString();
+  const maxPages = clampMaxPages(args.providerMaxPagesPerCycle);
+  for (const desc of descriptors) {
+    const state = providerRuntimeState(providerStates, desc.name);
+    // Durable per-provider cursor: resume delta fetch from the retained
+    // watermark (never widened past the lookback floor); advance only after a
+    // successful, persisted ingest; retain on any failure/cooldown.
+    const cursor = getProviderCursor(db, desc.name);
+    const cursorValue = cursor?.cursor_value ?? null;
+    const providerSince = resolveProviderSince({ cursorValue, fallbackSinceIso: fetchOptions.since, nowMs });
+    const base = {
+      name: desc.name,
+      state: 'unavailable',
+      reason: null,
+      fetched: 0,
+      inserted: 0,
+      duplicates: 0,
+      failed: 0,
+      insertedIds: [],
+      errors: [],
+      since: providerSince,
+      until: fetchOptions.until,
+      cursorValue,
+      cursorAdvancedTo: null,
+      pages: 0,
+      truncated: false,
+      cooldownUntil: state.cooldownUntilMs ? new Date(state.cooldownUntilMs).toISOString() : null,
+    };
+    if (!desc.enabled) {
+      // Never attempted a fetch: no cursor to touch.
+      results.push({ ...base, state: 'disabled', reason: 'disabled by configuration' });
+      continue;
+    }
+    if (!desc.provider) {
+      results.push({ ...base, state: 'unavailable', reason: desc.unavailableReason ?? 'missing key' });
+      continue;
+    }
+    if (state.cooldownUntilMs && state.cooldownUntilMs > nowMs) {
+      const cooldownState = state.lastState === 'rate-limited' ? 'rate-limited' : 'failed';
+      retainProviderCursor(db, { provider: desc.name, status: 'cooldown', attemptedAt });
+      results.push({
+        ...base,
+        state: cooldownState,
+        reason: `cooldown until ${new Date(state.cooldownUntilMs).toISOString()}`,
+        cooldownUntil: new Date(state.cooldownUntilMs).toISOString(),
+      });
+      continue;
+    }
+    try {
+      const summary = await ingestNews(db, desc.provider, { ...fetchOptions, since: providerSince, maxPages });
+      state.consecutiveFailures = 0;
+      state.cooldownUntilMs = null;
+      state.lastState = 'active';
+      const meta = desc.provider?.lastFetchMeta ?? { pages: 1, truncated: false };
+      const watermark = nextCursorValue({
+        priorCursor: cursorValue,
+        maxPublishedAt: maxPublishedAtForEvents(db, summary.insertedIds),
+      });
+      const advanced = watermark && watermark !== cursorValue ? watermark : null;
+      advanceProviderCursor(db, {
+        provider: desc.name,
+        cursorValue: advanced, // null => watermark unchanged (COALESCE keeps prior)
+        status: meta.truncated ? 'truncated' : summary.inserted > 0 ? 'ok' : 'empty',
+        pages: Number(meta.pages) || 1,
+        truncated: meta.truncated === true,
+        attemptedAt,
+      });
+      results.push({
+        ...base,
+        ...summary,
+        name: desc.name,
+        state: 'active',
+        reason: meta.truncated ? 'ok (truncated: more pages remain)' : 'ok',
+        pages: Number(meta.pages) || 1,
+        truncated: meta.truncated === true,
+        cursorAdvancedTo: advanced,
+      });
+    } catch (err) {
+      const failure = providerFailureReason(err);
+      state.consecutiveFailures += 1;
+      state.lastState = failure.state;
+      const shouldCooldown =
+        failure.state === 'rate-limited' ||
+        state.consecutiveFailures >= args.providerMaxFailuresBeforeCooldown;
+      if (shouldCooldown) {
+        state.cooldownUntilMs = nowMs + args.providerCooldownMinutes * 60_000;
+      }
+      // Failed/malformed/rate-limited response: retain the prior cursor.
+      retainProviderCursor(db, {
+        provider: desc.name,
+        status: failure.state === 'rate-limited' ? 'rate_limited' : 'failed',
+        attemptedAt,
+      });
+      results.push({
+        ...base,
+        state: failure.state,
+        reason: failure.reason,
+        failed: 1,
+        cooldownUntil: state.cooldownUntilMs ? new Date(state.cooldownUntilMs).toISOString() : null,
+      });
+    }
+  }
+  return results;
+}
+
+function classifyCap(args = {}) {
+  const maxEvents = Math.min(
+    Number(args.maxEventsClassifiedPerCycle) || DEFAULT_MAX_EVENTS_CLASSIFIED_PER_CYCLE,
+    MAX_EVENTS_CLASSIFIED_PER_CYCLE_CAP
+  );
+  return args.classifyLimitExplicit
+    ? Math.min(Number(args.classifyLimit) || DEFAULT_PAPER_CLASSIFY_LIMIT, maxEvents)
+    : maxEvents;
+}
+
+function absScore(score = {}) {
+  return Math.abs(Number(score.sentiment_score ?? score.sentimentScore ?? 0) || 0);
+}
+
+function rankFreshCandidates(candidates = []) {
+  return [...candidates].sort((a, b) => (
+    (Number(b.score?.impact_score) || 0) - (Number(a.score?.impact_score) || 0) ||
+    (Number(b.score?.confidence) || 0) - (Number(a.score?.confidence) || 0) ||
+    absScore(b.score) - absScore(a.score) ||
+    (Date.parse(a.freshness?.receivedAt) || 0) - (Date.parse(b.freshness?.receivedAt) || 0) ||
+    Number(a.event?.id ?? 0) - Number(b.event?.id ?? 0)
+  ));
+}
+
+const HEADLINE_STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'after', 'into', 'over',
+  'says', 'said', 'its', 'his', 'her', 'their', 'will', 'new', 'news', 'update',
+  'shares', 'stock', 'stocks', 'company', 'inc', 'corp', 'ltd', 'plc',
+]);
+
+function headlineFingerprint(headline) {
+  const tokens = String(headline ?? '')
+    .toLowerCase()
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&[a-z0-9#]+;/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 2 && !HEADLINE_STOP_WORDS.has(token))
+    .slice(0, 14);
+  return tokens.length > 0 ? tokens.join('-') : 'empty';
+}
+
+function signalIdentity(meta, score, windowMinutes) {
+  const publishedMs = Date.parse(meta?.published_at);
+  const windowMs = Math.max(1, Number(windowMinutes) || DEFAULT_DUPLICATE_STORY_WINDOW_MINUTES) * 60_000;
+  const bucket = Number.isFinite(publishedMs) ? Math.floor(publishedMs / windowMs) : 0;
+  const ticker = String(meta?.ticker ?? '').trim().toUpperCase();
+  const direction = String(score?.direction ?? '').trim().toLowerCase();
+  const headline = headlineFingerprint(meta?.headline);
+  const rawKey = [ticker, direction, bucket, headline].join('|');
+  const hash = createHash('sha256').update(rawKey).digest('hex').slice(0, 32);
+  return {
+    key: rawKey,
+    hash,
+    summary: `ticker=${ticker || 'unknown'} direction=${direction || 'unknown'} bucket=${bucket} headlineHash=${hash.slice(0, 12)}`,
+  };
+}
+
+function loadNewsMeta(db, eventId) {
+  return db
+    .prepare(
+      `SELECT id, provider, provider_event_id, ticker, headline, published_at, received_at
+         FROM news_events
+        WHERE id = ?`
+    )
+    .get(eventId) ?? null;
+}
+
+function suppressDuplicateSignals(db, candidates, { windowMinutes = DEFAULT_DUPLICATE_STORY_WINDOW_MINUTES } = {}) {
+  const kept = [];
+  const suppressions = [];
+  const seen = new Map();
+  for (const candidate of candidates) {
+    const meta = loadNewsMeta(db, candidate.event.id);
+    if (!meta) continue;
+    const identity = signalIdentity(meta, candidate.score, windowMinutes);
+    const existing = seen.get(identity.key);
+    if (existing && existing.meta.provider !== meta.provider) {
+      const reason =
+        `${meta.provider} event ${meta.provider_event_id ?? meta.id} suppressed because equivalent ` +
+        `${existing.meta.provider} story ${existing.meta.provider_event_id ?? existing.meta.id} was already processed`;
+      const audit = insertDuplicateSuppressionAudit(db, {
+        suppressedNewsEventId: meta.id,
+        suppressedProvider: meta.provider,
+        suppressedProviderEventId: meta.provider_event_id,
+        keptNewsEventId: existing.meta.id,
+        keptProvider: existing.meta.provider,
+        keptProviderEventId: existing.meta.provider_event_id,
+        signalIdentityHash: identity.hash,
+        identitySummary: identity.summary,
+        duplicateWindowMinutes: windowMinutes,
+        reason,
+      });
+      suppressions.push({
+        id: audit.id,
+        suppressedEventId: meta.id,
+        suppressedProvider: meta.provider,
+        suppressedProviderEventId: meta.provider_event_id,
+        keptEventId: existing.meta.id,
+        keptProvider: existing.meta.provider,
+        keptProviderEventId: existing.meta.provider_event_id,
+        signalIdentityHash: identity.hash,
+        reason,
+      });
+      continue;
+    }
+    seen.set(identity.key, { candidate, meta, identity });
+    kept.push(candidate);
+  }
+  return { kept, suppressions };
+}
+
+function cloneAccount(account) {
+  return account ? { ...account } : null;
+}
+
+function clonePositions(positions = []) {
+  return (positions ?? []).map((p) => ({ ...p }));
+}
+
+function cloneOwnedExposure(snapshot) {
+  return {
+    byTickerSide: { ...(snapshot?.byTickerSide ?? {}) },
+    grossExposure: Number(snapshot?.grossExposure ?? 0) || 0,
+    openPositionCount: Number(snapshot?.openPositionCount ?? 0) || 0,
+    dataQuality: snapshot?.dataQuality ?? 'unavailable',
+  };
+}
+
+function reserveNotionalFromSub(sub, referencePrice) {
+  const riskNotional = finiteNum(sub?.risk?.estNotional);
+  if (riskNotional !== null && riskNotional > 0) return riskNotional;
+  if (sub?.kind === 'equity') {
+    const px = finiteNum(referencePrice);
+    const qty = finiteNum(sub?.proposal?.quantity);
+    return px !== null && qty !== null ? round2(px * qty) : null;
+  }
+  return finiteNum(sub?.proposal?.notionalEntry);
+}
+
+function reserveBatchBudget(ledger, selected, result) {
+  const effects = [];
+  for (const sub of [result?.equity, result?.option].filter(Boolean)) {
+    if (sub.decision !== 'accepted') continue;
+    // A failed broker submission (orderError set, no order placed) consumed no
+    // buying power, exposure, or daily slots. Release its provisional reservation
+    // so later batch proposals are evaluated against real headroom rather than a
+    // phantom hold. Dry-run accepted subs have no orderError and still reserve so
+    // the simulated batch budget stays realistic for subsequent members.
+    if (sub.orderError) continue;
+    const estNotional = reserveNotionalFromSub(sub, result.referencePrice);
+    if (estNotional === null || estNotional <= 0) continue;
+    const symbol = String(sub.proposal?.ticker ?? sub.proposal?.underlying ?? selected?.event?.ticker ?? '').toUpperCase();
+    const side = sub.kind === 'option' ? 'buy' : sub.proposal?.side;
+    const before = {
+      dailyOrders: ledger.daily.orders,
+      dailyNotional: round2(ledger.daily.notional),
+      buyingPower: finiteNum(ledger.account?.buyingPower),
+      cash: finiteNum(ledger.account?.cash),
+      grossExposure: round2(grossExposure(ledger.positions)),
+    };
+    ledger.daily.orders += 1;
+    ledger.daily.notional = round2((ledger.daily.notional ?? 0) + estNotional);
+    ledger.positions.push({
+      symbol,
+      assetClass: sub.kind === 'option' ? 'us_option' : 'us_equity',
+      marketValue: side === 'sell' ? -estNotional : estNotional,
+    });
+    if (ledger.account && side !== 'sell') {
+      if (typeof ledger.account.buyingPower === 'number') {
+        ledger.account.buyingPower = round2(Math.max(0, ledger.account.buyingPower - estNotional));
+      }
+      if (typeof ledger.account.cash === 'number') {
+        ledger.account.cash = round2(Math.max(0, ledger.account.cash - estNotional));
+      }
+    }
+    if (sub.kind === 'equity') {
+      const key = `${symbol}|${side}`;
+      ledger.ownedEquityExposure.byTickerSide[key] = round2(
+        (ledger.ownedEquityExposure.byTickerSide[key] ?? 0) + estNotional
+      );
+      ledger.ownedEquityExposure.grossExposure = round2(
+        (ledger.ownedEquityExposure.grossExposure ?? 0) + estNotional
+      );
+    }
+    const after = {
+      dailyOrders: ledger.daily.orders,
+      dailyNotional: ledger.daily.notional,
+      buyingPower: finiteNum(ledger.account?.buyingPower),
+      cash: finiteNum(ledger.account?.cash),
+      grossExposure: round2(grossExposure(ledger.positions)),
+    };
+    effects.push({ eventId: selected?.event?.id, ticker: symbol, side, estNotional: round2(estNotional), before, after });
+  }
+  return effects;
+}
+
+async function executeBatchPaperTrades(
+  db,
+  candidates,
+  {
+    args,
+    paperClient = null,
+    priceSource = null,
+    nowMs = Date.now(),
+    optionEntry = { blocked: true, reason: 'option entry context unavailable' },
+    optionConfig = {},
+  }
+) {
+  const { account, positions, capabilities } = await fetchAccountState(paperClient);
+  const daily = getDailyCounters(db);
+  const ledger = {
+    account: cloneAccount(account),
+    positions: clonePositions(positions),
+    daily: { ...daily },
+    ownedEquityExposure: cloneOwnedExposure(getOwnedEquityExposureSnapshot(db)),
+  };
+  const historicalEquityOutcomes = listBrokerConfirmedEquityOutcomes(db);
+  const referenceCache = new Map();
+  const assetCache = new Map();
+  const trades = [];
+  const budgetEffects = [];
+  for (const selected of candidates.slice(0, args.maxQualifyingEventsAttemptedPerCycle)) {
+    const symbol = selected.event.ticker;
+    if (!referenceCache.has(symbol)) {
+      referenceCache.set(symbol, await fetchReferencePrice(priceSource, symbol, nowMs));
+    }
+    if (!assetCache.has(symbol)) {
+      assetCache.set(symbol, await fetchAssetState(paperClient, symbol));
+    }
+    const result = await runPaperTradeOnce(db, selected, {
+      paperClient,
+      account: ledger.account,
+      positions: ledger.positions,
+      capabilities,
+      referencePrice: referenceCache.get(symbol),
+      daily: ledger.daily,
+      nowMs,
+      qty: args.qty,
+      qtyExplicit: args.qtyExplicit,
+      sizingSettings: args.sizingSettings,
+      allowedSymbols: args.symbols,
+      thresholds: args.thresholds,
+      allowShorts: args.allowShorts,
+      allowOptions: args.allowOptions,
+      optionsMode: args.optionsMode,
+      optionSymbol: args.optionSymbol,
+      optionMaxPremium: args.optionMaxPremium,
+      optionContractLimit: args.optionContractLimit,
+      optionExpiryDaysMin: args.optionExpiryDaysMin,
+      optionExpiryDaysMax: args.optionExpiryDaysMax,
+      caps: args.caps,
+      executePaper: args.executePaper,
+      historicalEquityOutcomes,
+      ownedEquityExposure: ledger.ownedEquityExposure,
+      eventAttemptStats: getPaperEventAttemptStats(db, selected.event.id),
+      asset: assetCache.get(symbol),
+      paperFeatures: args.paperFeatures ?? DEFAULT_PAPER_FEATURES,
+      optionEntry,
+      optionConfig,
+    });
+    const effects = reserveBatchBudget(ledger, selected, result);
+    budgetEffects.push(...effects);
+    trades.push({ selected, result, lines: buildPaperReport(result, selected), budgetEffects: effects });
+  }
+  return {
+    trades,
+    budgetEffects,
+    attempted: trades.length,
+    finalDaily: ledger.daily,
+    finalBuyingPower: finiteNum(ledger.account?.buyingPower),
+    finalGrossExposure: round2(grossExposure(ledger.positions)),
+  };
+}
+
 /**
- * Fresh loop cycle: ingest recent Alpaca news, score newly inserted events with
- * the explicitly requested model classifier, then attempt a PAPER trade on
- * a fresh, unprocessed scored event. All collaborators are injected for tests.
+ * Durably terminalize signal-threshold failures. Each candidate here already
+ * failed BOTH the equity and option gates (hasSignalPass === false), so the
+ * equity reject reason is the signal-rejection reason. Recording a
+ * rejected_trades row makes the event terminal (never re-evaluated) and honors
+ * the log-every-rejection rule. No account/price/broker calls — pure gate.
+ * @returns {{ count: number, reasons: string[] }}
+ */
+function recordSignalRejections(db, candidates, args) {
+  const features = resolvePaperFeatures(args.paperFeatures ?? DEFAULT_PAPER_FEATURES);
+  const reasons = [];
+  for (const c of candidates ?? []) {
+    const equity = assessProposal({
+      event: c.event,
+      score: c.score,
+      qty: args.qty,
+      allowedSymbols: args.symbols,
+      thresholds: args.thresholds,
+      allowShorts: args.allowShorts,
+      shortsEnabled: features.enableShorts,
+    });
+    insertRejectedTrade(db, {
+      newsEventId: c.event.id,
+      ticker: c.event.ticker,
+      side: equity.side,
+      quantity: equity.quantity,
+      reason: equity.reason,
+    });
+    reasons.push(equity.reason);
+  }
+  return { count: reasons.length, reasons };
+}
+
+/**
+ * Fresh loop cycle: sweep aged-out queue entries, ingest recent live-news
+ * providers (per-provider cursor + bounded pagination), then classify and
+ * attempt the durable backlog (this cycle's inserts PLUS eligible prior-cycle
+ * events) under the per-cycle caps. All collaborators are injected for tests.
  */
 export async function runPaperDecisionCycle(
   db,
-  { provider = null, classifier = null, paperClient = null, priceSource = null, providerSkipReason = null } = {},
+  {
+    provider = null,
+    providers = null,
+    classifier = null,
+    paperClient = null,
+    priceSource = null,
+    providerSkipReason = null,
+    providerStates = {},
+  } = {},
   args = parseArgs([]),
   { nowMs = Date.now(), optionEntry = { blocked: true, reason: 'option entry context unavailable' }, optionConfig = {} } = {}
 ) {
@@ -1058,10 +1696,17 @@ export async function runPaperDecisionCycle(
     skipReason: null,
     universe: null,
     ingestion: null,
+    providerHealth: [],
     classification: null,
     freshCandidates: [],
+    independentCandidates: [],
+    duplicateSuppressions: [],
+    batch: null,
     selected: null,
     trade: null,
+    staleExpired: { count: 0 },
+    signalRejections: { count: 0, reasons: [] },
+    backlog: null,
     lines: [],
   };
   const since = new Date(nowMs - args.newsLookbackMinutes * 60_000).toISOString();
@@ -1091,98 +1736,222 @@ export async function runPaperDecisionCycle(
     return { ...base, outcome: tradeOutcome(trade.result), selected, trade, lines: trade.lines };
   }
 
-  if (!provider) {
-    return {
-      ...base,
-      outcome: PAPER_DECISION_OUTCOMES.NO_NEW_NEWS,
-      skipReason: providerSkipReason ?? 'Alpaca News provider not configured',
-    };
-  }
-
   const until = new Date(nowMs).toISOString();
-  const ingestion = await ingestNews(db, provider, {
+  // Durable stale sweep FIRST: aged-out, unresolved queue entries become a
+  // terminal stale_expired regardless of provider health, so backlog never
+  // accumulates forever even during a provider outage.
+  const staleFloorIso = new Date(nowMs - args.maxQueueAgeMinutes * 60_000).toISOString();
+  const staleLowerIso = new Date(nowMs - 2 * args.maxQueueAgeMinutes * 60_000).toISOString();
+  const staleExpired = sweepStaleQueueEvents(db, {
+    queueFloorIso: staleFloorIso,
+    lowerBoundIso: staleLowerIso,
+    queueAgeMinutes: args.maxQueueAgeMinutes,
+    promptVersion: MODEL_PROMPT_VERSION,
+  });
+  base.staleExpired = staleExpired;
+
+  const providerDescriptors = normalizeProviderDescriptors({ provider, providers }, cycleArgs);
+  const providerHealth = await ingestFromProviders(db, providerDescriptors, {
     symbols: cycleArgs.symbols,
     limit: args.ingestLimit,
     since,
     until,
+  }, cycleArgs, { providerStates, nowMs });
+  base.providerHealth = providerHealth;
+  const activeProviders = providerHealth.filter((p) => p.state === 'active').length;
+  const insertedIds = providerHealth.flatMap((p) => p.insertedIds ?? []);
+  const ingestion = {
+    provider: providerHealth.map((p) => p.name).join(',') || 'none',
+    fetched: providerHealth.reduce((s, p) => s + (Number(p.fetched) || 0), 0),
+    inserted: providerHealth.reduce((s, p) => s + (Number(p.inserted) || 0), 0),
+    duplicates: providerHealth.reduce((s, p) => s + (Number(p.duplicates) || 0), 0),
+    failed: providerHealth.reduce((s, p) => s + (Number(p.failed) || 0), 0),
+    insertedIds,
+    errors: providerHealth.flatMap((p) => p.errors ?? []),
+    since,
+    until,
+  };
+  base.ingestion = ingestion;
+
+  // Backlog carried INTO this cycle (before we classify/attempt). This is what
+  // makes carry-forward durable: eligibility is derived from the database, so
+  // prior-cycle unscored/scored events are re-selected until they reach a
+  // terminal state or age out. Recency-bounded to the max queue age.
+  const classifyBacklog = selectClassificationBacklog(db, {
+    promptVersion: MODEL_PROMPT_VERSION,
+    allowedSymbols: cycleArgs.symbols,
+    sinceReceivedIso: staleFloorIso,
+    limit: BACKLOG_SELECT_LIMIT,
   });
-  base.ingestion = { ...ingestion, since, until };
-  if ((ingestion.insertedIds ?? []).length === 0) {
+  const proposalBacklogPre = listRecentScoredEvents(db, {
+    allowedSymbols: cycleArgs.symbols,
+    promptVersion: MODEL_PROMPT_VERSION,
+    excludeProcessed: true,
+    sinceReceived: staleFloorIso,
+    limit: BACKLOG_SELECT_LIMIT,
+  }).filter((c) => ['parsed', 'fallback_used'].includes(c.score.parser_status));
+  const carriedForward = Math.max(0, classifyBacklog.length - insertedIds.length) + proposalBacklogPre.length;
+  const hasBacklog = classifyBacklog.length > 0 || proposalBacklogPre.length > 0;
+
+  const backlogCounts = (over = {}) => ({
+    carriedForward,
+    newlyInserted: insertedIds.length,
+    classified: 0,
+    proposalEligible: 0,
+    attempted: 0,
+    deferredByClassificationCap: 0,
+    deferredByAttemptCap: 0,
+    staleExpired: staleExpired.count,
+    providerInvalid: 0,
+    terminalRejections: 0,
+    duplicateSuppressions: 0,
+    submitted: 0,
+    ...over,
+  });
+
+  if (activeProviders === 0 && !hasBacklog) {
+    return {
+      ...base,
+      outcome: PAPER_DECISION_OUTCOMES.NO_ACTIVE_PROVIDER,
+      backlog: backlogCounts(),
+      skipReason: providerSkipReason ?? 'no active provider',
+    };
+  }
+  if (insertedIds.length === 0 && !hasBacklog) {
     return {
       ...base,
       outcome: PAPER_DECISION_OUTCOMES.NO_NEW_NEWS,
-      skipReason: `no new news inserted (fetched=${ingestion.fetched} duplicates=${ingestion.duplicates} failed=${ingestion.failed})`,
+      backlog: backlogCounts(),
+      skipReason: `no new news inserted and no backlog (fetched=${ingestion.fetched} duplicates=${ingestion.duplicates} failed=${ingestion.failed})`,
     };
   }
-
   if (!MODEL_CLASSIFIER_NAMES.has(args.classifier) || !classifier || classifier.promptVersion !== MODEL_PROMPT_VERSION) {
     return {
       ...base,
       outcome: PAPER_DECISION_OUTCOMES.NO_FRESH_REAL_MODEL_SCORE,
+      backlog: backlogCounts(),
       skipReason: 'model classifier was not requested/configured for this loop iteration',
     };
   }
 
-  const idsToClassify = ingestion.insertedIds.slice(0, args.classifyLimit);
-  const classification = await classifyAndStore(db, classifier, { eventIds: idsToClassify });
+  // CLASSIFICATION BACKLOG: process up to the per-cycle cap, oldest first. Events
+  // beyond the cap stay unscored and eligible next cycle. Freshly-classified
+  // events with an unusable score become a durable provider_invalid terminal.
+  const idsToClassify = classifyBacklog.slice(0, classifyCap(cycleArgs)).map((r) => r.id);
+  const classification = idsToClassify.length > 0
+    ? await classifyAndStore(db, classifier, { eventIds: idsToClassify })
+    : { requested: 0, classified: 0, stored: 0, skipped: 0, failed: 0, statusCounts: {}, errors: [] };
   base.classification = {
     ...classification,
     selectedIds: idsToClassify,
     model: classifier.modelName,
     promptVersion: classifier.promptVersion,
   };
+  const deferredByClassificationCap = Math.max(0, classifyBacklog.length - idsToClassify.length);
+  const providerInvalid = markUnusableScoresTerminal(db, idsToClassify, MODEL_PROMPT_VERSION).count;
 
-  const scored = listRecentScoredEvents(db, {
-    eventIds: idsToClassify,
-    allowedSymbols: cycleArgs.symbols,
-    promptVersion: MODEL_PROMPT_VERSION,
-    excludeProcessed: false,
-    limit: args.classifyLimit,
-  });
-  const usable = scored.filter((c) => ['parsed', 'fallback_used'].includes(c.score.parser_status));
-  if (usable.length === 0) {
-    return {
-      ...base,
-      outcome: PAPER_DECISION_OUTCOMES.NO_FRESH_REAL_MODEL_SCORE,
-      freshCandidates: scored,
-      skipReason: `no fresh usable ${MODEL_PROMPT_VERSION} score (statuses=${statusLine(classification.statusCounts)})`,
-    };
-  }
-
-  const unprocessed = listRecentScoredEvents(db, {
-    eventIds: idsToClassify,
+  // PROPOSAL BACKLOG: fresh scored-but-not-yet-terminal events (incl. prior
+  // cycles). This drains deferred work before losing it.
+  const proposalBacklog = listRecentScoredEvents(db, {
     allowedSymbols: cycleArgs.symbols,
     promptVersion: MODEL_PROMPT_VERSION,
     excludeProcessed: true,
-    limit: args.classifyLimit,
+    sinceReceived: staleFloorIso,
+    limit: BACKLOG_SELECT_LIMIT,
   }).filter((c) => ['parsed', 'fallback_used'].includes(c.score.parser_status));
-  if (unprocessed.length === 0) {
+
+  const backlogAfterClassify = (over = {}) => backlogCounts({
+    classified: classification.stored,
+    proposalEligible: proposalBacklog.length,
+    deferredByClassificationCap,
+    providerInvalid,
+    ...over,
+  });
+
+  if (proposalBacklog.length === 0) {
+    const scoredInWindow = countScoredInWindow(db, {
+      promptVersion: MODEL_PROMPT_VERSION,
+      allowedSymbols: cycleArgs.symbols,
+      sinceReceivedIso: staleFloorIso,
+    });
+    const alreadyTerminal = scoredInWindow > 0;
     return {
       ...base,
-      outcome: PAPER_DECISION_OUTCOMES.ALREADY_PROCESSED_EVENT,
-      freshCandidates: usable,
-      skipReason: 'all fresh scored events already have paper_trades or rejected_trades records',
+      outcome: alreadyTerminal
+        ? PAPER_DECISION_OUTCOMES.ALREADY_PROCESSED_EVENT
+        : PAPER_DECISION_OUTCOMES.NO_FRESH_REAL_MODEL_SCORE,
+      backlog: backlogAfterClassify(),
+      skipReason: alreadyTerminal
+        ? 'all in-window scored events already have paper_trades or rejected_trades (or duplicate-suppressed/stale) records'
+        : `no usable ${MODEL_PROMPT_VERSION} score available (statuses=${statusLine(classification.statusCounts)})`,
     };
   }
 
-  const selected = unprocessed.find((c) => hasSignalPass(c, cycleArgs, nowMs));
-  const candidate = selected ?? unprocessed[0];
-  const trade = await executeSelectedPaperTrade(db, candidate, { args: cycleArgs, paperClient, priceSource, nowMs, optionEntry, optionConfig });
-  const outcome = selected
-    ? tradeOutcome(trade.result)
-    : PAPER_DECISION_OUTCOMES.ALL_FRESH_SCORES_FAILED_SIGNAL_THRESHOLDS;
+  // Rank the proposal backlog, then durably terminalize signal failures so they
+  // are recorded once (log-everything rule) and never re-evaluated.
+  const ranked = rankFreshCandidates(proposalBacklog);
+  const signalPasses = ranked.filter((c) => hasSignalPass(c, cycleArgs, nowMs));
+  const signalFails = ranked.filter((c) => !hasSignalPass(c, cycleArgs, nowMs));
+  const signalRejections = recordSignalRejections(db, signalFails, cycleArgs);
+  base.signalRejections = signalRejections;
+
+  if (signalPasses.length === 0) {
+    return {
+      ...base,
+      outcome: PAPER_DECISION_OUTCOMES.ALL_FRESH_SCORES_FAILED_SIGNAL_THRESHOLDS,
+      skipReason: 'all usable scored backlog events failed signal thresholds',
+      freshCandidates: ranked,
+      backlog: backlogAfterClassify({ terminalRejections: signalRejections.count }),
+    };
+  }
+
+  const deduped = suppressDuplicateSignals(db, signalPasses, {
+    windowMinutes: cycleArgs.duplicateStoryWindowMinutes,
+  });
+  const independent = deduped.kept;
+  const batchCandidates = independent.slice(0, cycleArgs.maxQualifyingEventsAttemptedPerCycle);
+  const batch = await executeBatchPaperTrades(db, batchCandidates, {
+    args: cycleArgs, paperClient, priceSource, nowMs, optionEntry, optionConfig,
+  });
+  const selected = batch.trades[0]?.selected ?? independent[0] ?? null;
+  const trade = batch.trades[0] ?? null;
+  const outcomes = batch.trades.map((t) => tradeOutcome(t.result));
+  const outcome = outcomes.includes(PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR)
+    ? PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR
+    : outcomes.includes(PAPER_DECISION_OUTCOMES.RISK_REJECTION)
+      ? PAPER_DECISION_OUTCOMES.RISK_REJECTION
+      : PAPER_DECISION_OUTCOMES.TRADE_ATTEMPTED;
+  const batchSubs = batch.trades.flatMap((t) => [t.result?.equity, t.result?.option].filter(Boolean));
+  const submitted = batchSubs.filter((s) => s.order).length;
+  const riskRejected = batchSubs.filter((s) =>
+    s.decision === 'rejected' && ((s.risk && s.risk.approved === false) || s.sizingDecision?.mode === SIZING_MODES.ABSTAIN)
+  ).length;
   return {
     ...base,
     outcome,
-    skipReason: selected ? null : 'all fresh usable scores failed signal thresholds',
-    freshCandidates: unprocessed,
-    selected: candidate,
+    skipReason: batch.trades.length > 0 ? null : 'no independent qualifying event remained after duplicate suppression',
+    freshCandidates: ranked,
+    independentCandidates: independent,
+    duplicateSuppressions: deduped.suppressions,
+    batch,
+    selected,
     trade,
-    lines: trade.lines,
+    backlog: backlogAfterClassify({
+      attempted: batch.trades.length,
+      deferredByAttemptCap: Math.max(0, independent.length - batch.trades.length),
+      duplicateSuppressions: deduped.suppressions.length,
+      terminalRejections: signalRejections.count + riskRejected,
+      submitted,
+    }),
+    lines: batch.trades.flatMap((t) => t.lines),
   };
 }
 
 export function oneLineDecisionSummary(cycle, nowMs = Date.now()) {
+  const counts = batchCounts(cycle);
+  const providers = (cycle?.providerHealth ?? []).length > 0
+    ? `providers ${cycle.providerHealth.map((p) => `${p.name}=${p.state}`).join(',')}`
+    : 'providers skipped';
   const ing = cycle?.ingestion
     ? `ingest fetched=${cycle.ingestion.fetched} inserted=${cycle.ingestion.inserted} dup=${cycle.ingestion.duplicates}`
     : 'ingest skipped';
@@ -1195,15 +1964,28 @@ export function oneLineDecisionSummary(cycle, nowMs = Date.now()) {
   const universe = cycle?.universe
     ? `universe selected=${cycle.universe.selectedSymbols.join(',') || '(none)'}`
     : 'universe skipped';
-  const skip = cycle?.skipReason ? `skip=${cycle.skipReason}` : oneLineSummary(cycle?.trade?.result);
-  return `${cycle?.outcome ?? 'unknown'}; ${universe}; ${ing}; ${cls}; ${selected}; ${skip}`;
+  const batch = counts.attempted > 0
+    ? `batch independent=${counts.independent} attempted=${counts.attempted} approved=${counts.approved} submitted=${counts.submitted} riskRejected=${counts.riskRejected} dupSuppressed=${counts.duplicateSuppressed}`
+    : 'batch attempted=0';
+  const b = cycle?.backlog;
+  const backlog = b
+    ? `backlog carried=${b.carriedForward} new=${b.newlyInserted} classified=${b.classified} attempted=${b.attempted} ` +
+      `deferClassify=${b.deferredByClassificationCap} deferAttempt=${b.deferredByAttemptCap} stale=${b.staleExpired}`
+    : 'backlog n/a';
+  const skip = cycle?.skipReason ? `skip=${cycle.skipReason}` : cycle?.trade?.result ? oneLineSummary(cycle.trade.result) : batch;
+  return `${cycle?.outcome ?? 'unknown'}; ${universe}; ${providers}; ${ing}; ${cls}; ${backlog}; ${selected}; ${batch}; ${skip}`;
 }
 
 export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
+  const counts = batchCounts(cycle);
   const lines = [
-    'Paper trading decision cycle (fresh ingest/classify/trade, PAPER-only)',
+    'Paper trading decision cycle (fresh multi-provider batch, PAPER-only)',
     `  outcome:    ${cycle.outcome ?? 'unknown'}`,
   ];
+  if ((cycle.providerHealth ?? []).length > 0) {
+    lines.push('  providers:');
+    for (const row of cycle.providerHealth) lines.push(`    ${providerHealthLine(row)}`);
+  }
   if (cycle.ingestion) {
     lines.push(
       `  ingest:     fetched=${cycle.ingestion.fetched} inserted=${cycle.ingestion.inserted} ` +
@@ -1222,6 +2004,35 @@ export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
       `  classify:   selected=${cycle.classification.selectedIds?.length ?? 0} stored=${cycle.classification.stored} ` +
         `statuses=${statusLine(cycle.classification.statusCounts)}`
     );
+  }
+  if (cycle.backlog) {
+    const b = cycle.backlog;
+    lines.push(
+      `  backlog:    carriedForward=${b.carriedForward} newlyInserted=${b.newlyInserted} classified=${b.classified} ` +
+        `proposalEligible=${b.proposalEligible} attempted=${b.attempted} submitted=${b.submitted}`,
+      `              deferredByClassifyCap=${b.deferredByClassificationCap} deferredByAttemptCap=${b.deferredByAttemptCap} ` +
+        `staleExpired=${b.staleExpired} providerInvalid=${b.providerInvalid} terminalRejections=${b.terminalRejections} ` +
+        `duplicateSuppressed=${b.duplicateSuppressions}`
+    );
+  }
+  lines.push(
+    `  batch:      independent=${counts.independent} attempted=${counts.attempted} approved=${counts.approved} ` +
+      `submitted=${counts.submitted} riskRejected=${counts.riskRejected} duplicateSuppressed=${counts.duplicateSuppressed}`
+  );
+  if ((cycle.duplicateSuppressions ?? []).length > 0) {
+    lines.push('  suppressions:');
+    for (const s of cycle.duplicateSuppressions.slice(0, 10)) lines.push(`    ${s.reason}`);
+  }
+  if ((cycle.batch?.budgetEffects ?? []).length > 0) {
+    lines.push('  batch budget reservations:');
+    for (const b of cycle.batch.budgetEffects.slice(0, 10)) {
+      lines.push(
+        `    event ${b.eventId} ${b.ticker} ${b.side} reserved=${money(b.estNotional)} ` +
+        `daily=${money(b.before.dailyNotional)}->${money(b.after.dailyNotional)} ` +
+        `gross=${money(b.before.grossExposure)}->${money(b.after.grossExposure)} ` +
+        `buyingPower=${money(b.before.buyingPower)}->${money(b.after.buyingPower)}`
+      );
+    }
   }
   if (cycle.selected) {
     lines.push(

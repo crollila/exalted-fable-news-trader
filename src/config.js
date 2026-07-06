@@ -86,6 +86,12 @@ export function loadConfig(env = process.env) {
       keyId: env.ALPACA_API_KEY_ID || null,
       secretKey: env.ALPACA_API_SECRET_KEY || null,
     }),
+    // Benzinga News API credentials. Read ONLY here; held in memory only;
+    // never logged, printed, persisted, or normalized. The transport sends the
+    // key in an Authorization header (not the request URL).
+    benzingaNews: Object.freeze({
+      apiKey: env.BENZINGA_API_KEY || null,
+    }),
     // Model-backed classifier credentials/config. Read ONLY here; held in
     // memory only; never logged, printed, persisted, or normalized.
     // OpenAI is the production classifier. The OpenAI model id is intentionally

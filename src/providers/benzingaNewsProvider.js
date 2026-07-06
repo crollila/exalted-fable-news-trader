@@ -37,6 +37,10 @@ function namesOf(list) {
  * @returns {import('./newsProvider.js').NewsProvider}
  */
 export function createBenzingaNewsProvider({ fetchRawNews = noTransportConfigured } = {}) {
+  // Sanitized pagination metadata from the most recent fetch. A paginating
+  // transport returns { items, pages, truncated }; fixture stubs return a bare
+  // array (single page, never truncated). No headlines/payloads/keys here.
+  const meta = { truncated: false, pages: 1 };
   function normalizeProviderItem(rawItem) {
     const channels = namesOf(rawItem.channels);
     return normalizeNewsEvent({
@@ -57,9 +61,17 @@ export function createBenzingaNewsProvider({ fetchRawNews = noTransportConfigure
 
   /** @param {import('./newsProvider.js').FetchNewsOptions} [fetchOptions] */
   async function fetchNews(fetchOptions = {}) {
-    const rawItems = await fetchRawNews(fetchOptions);
+    const raw = await fetchRawNews(fetchOptions);
+    const rawItems = Array.isArray(raw) ? raw : raw?.items ?? [];
+    meta.truncated = Array.isArray(raw) ? false : raw?.truncated === true;
+    meta.pages = Array.isArray(raw) ? 1 : Number(raw?.pages) || 1;
     return rawItems.map(normalizeProviderItem);
   }
 
-  return { name: PROVIDER_NAME, fetchNews, normalizeProviderItem };
+  return {
+    name: PROVIDER_NAME,
+    fetchNews,
+    normalizeProviderItem,
+    get lastFetchMeta() { return { ...meta }; },
+  };
 }

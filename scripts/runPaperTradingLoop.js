@@ -30,6 +30,8 @@ import {
 } from '../src/database/paperRuntime.js';
 import { createAlpacaNewsHttpTransport } from '../src/providers/alpacaNewsHttpTransport.js';
 import { createAlpacaNewsProvider } from '../src/providers/alpacaNewsProvider.js';
+import { createBenzingaNewsHttpTransport } from '../src/providers/benzingaNewsHttpTransport.js';
+import { createBenzingaNewsProvider } from '../src/providers/benzingaNewsProvider.js';
 import { createAlpacaPaperClient } from '../src/paper/alpacaPaperClient.js';
 import { reconcileBotOptions } from '../src/paper/optionMonitor.js';
 import { optionEntryBlocked } from '../src/paper/optionExits.js';
@@ -89,6 +91,10 @@ function emptySessionStats(sessionDate, sessionId = null) {
     rejectedReasons: {},
     ordersSubmitted: 0,
     orderStatus: {},
+    providerStatus: {},
+    providerCounts: {},
+    batchCounts: {},
+    backlogCounts: {},
     modelRequestCount: 0,
     shortsUsed: 0,
     optionsUsed: 0,
@@ -96,6 +102,13 @@ function emptySessionStats(sessionDate, sessionId = null) {
     eodSent: false,
   };
 }
+
+/** Backlog counters accumulated across cycles for the EOD report. */
+const BACKLOG_COUNT_KEYS = [
+  'carriedForward', 'newlyInserted', 'classified', 'proposalEligible', 'attempted',
+  'deferredByClassificationCap', 'deferredByAttemptCap', 'staleExpired',
+  'providerInvalid', 'terminalRejections', 'duplicateSuppressions', 'submitted',
+];
 
 function inc(map, key, amount = 1) {
   const k = String(key ?? 'unknown');
@@ -124,6 +137,40 @@ function countTradeSub(stats, sub) {
   }
 }
 
+function recordProviderStats(stats, cycle) {
+  for (const row of cycle?.providerHealth ?? []) {
+    inc(stats.providerStatus, `${row.name}:${row.state}`);
+    for (const key of ['fetched', 'inserted', 'duplicates', 'failed']) {
+      inc(stats.providerCounts, `${row.name}.${key}`, Number(row[key]) || 0);
+    }
+  }
+}
+
+function recordBatchStats(stats, cycle) {
+  const batch = cycle?.batch;
+  const trades = batch?.trades ?? (cycle?.trade ? [cycle.trade] : []);
+  const suppressions = cycle?.duplicateSuppressions?.length ?? 0;
+  inc(stats.batchCounts, 'independent', Number(cycle?.independentCandidates?.length ?? 0));
+  inc(stats.batchCounts, 'attempted', trades.length);
+  inc(stats.batchCounts, 'duplicate_suppressed', suppressions);
+  for (const trade of trades) {
+    for (const sub of [trade?.result?.equity, trade?.result?.option].filter(Boolean)) {
+      if (sub.decision === 'accepted' || sub.decision === 'plan') inc(stats.batchCounts, 'approved');
+      if (sub.order) inc(stats.batchCounts, 'submitted');
+      if (sub.decision === 'rejected' && sub.risk && sub.risk.approved === false) inc(stats.batchCounts, 'risk_rejected');
+    }
+  }
+}
+
+function recordBacklogStats(stats, cycle) {
+  const backlog = cycle?.backlog;
+  if (!backlog) return;
+  for (const key of BACKLOG_COUNT_KEYS) inc(stats.backlogCounts, key, Number(backlog[key]) || 0);
+  // Signal-threshold rejections are terminalized directly (not via a trade
+  // result), so fold their sanitized reasons into the rejection tally too.
+  for (const reason of cycle?.signalRejections?.reasons ?? []) inc(stats.rejectedReasons, reason);
+}
+
 function applyCycleStats(stats, cycle, args) {
   stats.cycles += 1;
   stats.freshNewsCount += Number(cycle?.ingestion?.inserted ?? 0);
@@ -131,13 +178,19 @@ function applyCycleStats(stats, cycle, args) {
   stats.modelRequestCount += Number(cycle?.classification?.selectedIds?.length ?? 0);
   mergeCounts(stats.classificationStatus, cycle?.classification?.statusCounts);
   if (cycle?.skipReason) inc(stats.skippedReasons, cycle.skipReason);
-  countTradeSub(stats, cycle?.trade?.result?.equity);
-  countTradeSub(stats, cycle?.trade?.result?.option);
-  if (cycle?.trade?.result?.equity?.proposal?.side === 'sell' && cycle.trade.result.equity.decision === 'accepted') {
-    stats.shortsUsed += 1;
-  }
-  if (cycle?.trade?.result?.option && ['accepted', 'plan'].includes(cycle.trade.result.option.decision)) {
-    stats.optionsUsed += 1;
+  recordProviderStats(stats, cycle);
+  recordBatchStats(stats, cycle);
+  recordBacklogStats(stats, cycle);
+  const trades = cycle?.batch?.trades ?? (cycle?.trade ? [cycle.trade] : []);
+  for (const trade of trades) {
+    countTradeSub(stats, trade?.result?.equity);
+    countTradeSub(stats, trade?.result?.option);
+    if (trade?.result?.equity?.proposal?.side === 'sell' && trade.result.equity.decision === 'accepted') {
+      stats.shortsUsed += 1;
+    }
+    if (trade?.result?.option && ['accepted', 'plan'].includes(trade.result.option.decision)) {
+      stats.optionsUsed += 1;
+    }
   }
   if (args?.paperFeatures?.enableMargin) stats.marginUsed = 1;
 }
@@ -154,6 +207,10 @@ function persistSessionStats(db, stats, status = 'open', extra = {}) {
     rejectedReasons: stats.rejectedReasons,
     ordersSubmitted: stats.ordersSubmitted,
     orderStatus: stats.orderStatus,
+    providerStatus: stats.providerStatus,
+    providerCounts: stats.providerCounts,
+    batchCounts: stats.batchCounts,
+    backlogCounts: stats.backlogCounts,
     modelRequestCount: stats.modelRequestCount,
     shortsUsed: stats.shortsUsed,
     optionsUsed: stats.optionsUsed,
@@ -233,13 +290,36 @@ async function main() {
     db = openDatabase(config.databasePath);
     runMigrations(db);
 
-    let provider = null;
-    let providerSkipReason = null;
-    if (hasAlpacaNewsCreds) {
-      provider = createAlpacaNewsProvider({ fetchRawNews: createAlpacaNewsHttpTransport(config) });
-    } else {
-      providerSkipReason = 'Alpaca credentials not configured for news ingest';
-    }
+    const providerDescriptors = [];
+    const enabledProviderSet = new Set(args.enabledProviders ?? []);
+    const addProviderDescriptor = (name, hasCreds, createProvider, missingReason) => {
+      if (!enabledProviderSet.has(name)) {
+        providerDescriptors.push({ name, enabled: false, provider: null, unavailableReason: 'disabled by configuration' });
+        return;
+      }
+      if (!hasCreds) {
+        providerDescriptors.push({ name, enabled: true, provider: null, unavailableReason: missingReason });
+        return;
+      }
+      try {
+        providerDescriptors.push({ name, enabled: true, provider: createProvider(), unavailableReason: null });
+      } catch {
+        providerDescriptors.push({ name, enabled: true, provider: null, unavailableReason: 'provider initialization failed' });
+      }
+    };
+    addProviderDescriptor(
+      'alpaca',
+      hasAlpacaNewsCreds,
+      () => createAlpacaNewsProvider({ fetchRawNews: createAlpacaNewsHttpTransport(config) }),
+      'missing key'
+    );
+    addProviderDescriptor(
+      'benzinga',
+      Boolean(config.benzingaNews.apiKey),
+      () => createBenzingaNewsProvider({ fetchRawNews: createBenzingaNewsHttpTransport(config) }),
+      'missing key'
+    );
+    const providerStates = {};
     const wantsModelClassifier = ['openai', 'anthropic', 'real_model'].includes(args.classifier);
     const classifier = wantsModelClassifier
       ? buildClassifier(args.classifier, config, { onWarning: (msg) => console.error(msg) })
@@ -254,10 +334,18 @@ async function main() {
       `  symbols=${args.symbols.join(',')} mode=${args.executePaper ? 'EXECUTE-PAPER' : 'DRY-RUN'} ` +
         `interval=${args.intervalMinutes}m max-iter=${args.maxIterations ?? 'continuous'} ` +
         `${classifierLabel} ingest-limit=${args.ingestLimit} ` +
-        `classify-limit=${args.classifyLimit} lookback=${args.newsLookbackMinutes}m ` +
+        `classify-max=${args.maxEventsClassifiedPerCycle} qualify-max=${args.maxQualifyingEventsAttemptedPerCycle} ` +
+        `queue-age-max=${args.maxQueueAgeMinutes}m provider-max-pages=${args.providerMaxPagesPerCycle} ` +
+        `providers=${args.enabledProviders.join(',')} cooldown=${args.providerCooldownMinutes}m/${args.providerMaxFailuresBeforeCooldown}fail ` +
+        `dedup-window=${args.duplicateStoryWindowMinutes}m lookback=${args.newsLookbackMinutes}m ` +
         `shorts=${args.allowShorts ? 'on' : 'off'} options=${args.allowOptions ? args.optionsMode : 'off'} ` +
         `outside-hours=${args.runOutsideMarketHours ? 'yes' : 'no'}`
     );
+    console.log('  provider startup state:');
+    for (const p of providerDescriptors) {
+      const state = !p.enabled ? 'disabled' : p.provider ? 'active' : 'unavailable';
+      console.log(`    ${p.name}: ${state} reason=${p.provider ? 'configured' : p.unavailableReason}`);
+    }
     if (args.deprecatedRunOutsideMarketHours) {
       console.error('--run-outside-market-hours is deprecated and ignored: market-closed cycles never call news/model/price/options/order APIs.');
     }
@@ -277,6 +365,10 @@ async function main() {
         currentStats.rejectedReasons = parseJsonMap(existing.rejected_reason_json);
         currentStats.ordersSubmitted = Number(existing.orders_submitted) || 0;
         currentStats.orderStatus = parseJsonMap(existing.order_status_json);
+        currentStats.providerStatus = parseJsonMap(existing.provider_status_json);
+        currentStats.providerCounts = parseJsonMap(existing.provider_counts_json);
+        currentStats.batchCounts = parseJsonMap(existing.batch_counts_json);
+        currentStats.backlogCounts = parseJsonMap(existing.backlog_counts_json);
         currentStats.modelRequestCount = Number(existing.model_request_count) || 0;
         currentStats.shortsUsed = Number(existing.shorts_used) || 0;
         currentStats.optionsUsed = Number(existing.options_used) || 0;
@@ -315,7 +407,7 @@ async function main() {
       });
       const cycle = await runPaperDecisionCycle(
         db,
-        { provider, classifier, paperClient, priceSource, providerSkipReason },
+        { providers: providerDescriptors, classifier, paperClient, priceSource, providerStates },
         args,
         { nowMs, optionEntry, optionConfig: config.optionExecution }
       );

@@ -3,6 +3,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { loadConfig } from '../src/config.js';
+import { createBenzingaNewsHttpTransport } from '../src/providers/benzingaNewsHttpTransport.js';
 import { createBenzingaNewsProvider } from '../src/providers/benzingaNewsProvider.js';
 import { validateProvider, assertNormalizedNewsEvent } from '../src/providers/newsProvider.js';
 import { BENZINGA_NEWS_FIXTURES } from './fixtures/benzingaNews.js';
@@ -10,6 +12,23 @@ import { openMemoryDatabase, closeDatabase } from '../src/database/db.js';
 import { runMigrations } from '../src/database/migrations.js';
 import { findNewsEvent, countNewsEvents } from '../src/database/newsEvents.js';
 import { ingestNews } from '../src/ingestion/ingestNews.js';
+
+const FAKE_BENZINGA_KEY = 'TEST-FAKE-BENZINGA-KEY-12345';
+
+function okResponse(payload) {
+  return { ok: true, status: 200, statusText: 'OK', json: async () => payload };
+}
+
+function fakeFetch(response) {
+  const calls = [];
+  const fn = async (url, init) => {
+    calls.push({ url, init });
+    if (typeof response === 'function') return response(url, init);
+    return response;
+  };
+  fn.calls = calls;
+  return fn;
+}
 
 /** Provider wired to static fixtures instead of a network transport. */
 function fixtureProvider(items = BENZINGA_NEWS_FIXTURES) {
@@ -26,6 +45,68 @@ test('benzinga provider has no network capability by default', async () => {
   const provider = createBenzingaNewsProvider(); // no transport injected
   validateProvider(provider);
   await assert.rejects(() => provider.fetchNews(), /no transport configured/i);
+});
+
+test('benzinga HTTP transport requires config and makes zero HTTP calls when missing', () => {
+  const http = fakeFetch(okResponse([]));
+  assert.throws(() => createBenzingaNewsHttpTransport(loadConfig({}), { httpFetch: http }), /not configured/i);
+  assert.equal(http.calls.length, 0);
+});
+
+test('benzinga HTTP transport maps query params and sends the key in headers only', async () => {
+  const http = fakeFetch(okResponse(BENZINGA_NEWS_FIXTURES));
+  const transport = createBenzingaNewsHttpTransport(
+    loadConfig({ BENZINGA_API_KEY: FAKE_BENZINGA_KEY }),
+    { httpFetch: http }
+  );
+  const raw = await transport({
+    symbols: ['aapl', 'msft'],
+    since: '2026-06-09T14:00:00.000Z',
+    until: '2026-06-09T20:00:00.000Z',
+    limit: 25,
+  });
+  assert.equal(raw.length, BENZINGA_NEWS_FIXTURES.length);
+  assert.equal(http.calls.length, 1);
+  const url = new URL(http.calls[0].url);
+  assert.equal(url.origin + url.pathname, 'https://api.benzinga.com/api/v2/news');
+  assert.equal(url.searchParams.get('tickers'), 'AAPL,MSFT');
+  assert.equal(url.searchParams.get('publishedSince'), String(Date.parse('2026-06-09T14:00:00.000Z') / 1000));
+  assert.equal(url.searchParams.get('dateTo'), '2026-06-09');
+  assert.equal(url.searchParams.get('pageSize'), '25');
+  assert.equal(url.searchParams.get('displayOutput'), 'full');
+  assert.equal(url.searchParams.get('sort'), 'created:desc');
+  assert.equal(url.searchParams.get('token'), null);
+  assert.ok(!http.calls[0].url.includes(FAKE_BENZINGA_KEY));
+  assert.equal(http.calls[0].init.headers.Authorization, `token ${FAKE_BENZINGA_KEY}`);
+});
+
+test('benzinga HTTP transport failures are sanitized and status-classified', async () => {
+  const config = loadConfig({ BENZINGA_API_KEY: FAKE_BENZINGA_KEY });
+  const unauthorized = createBenzingaNewsHttpTransport(config, {
+    httpFetch: fakeFetch({ ok: false, status: 401, statusText: `Nope ${FAKE_BENZINGA_KEY}`, json: async () => ({}) }),
+  });
+  await assert.rejects(
+    () => unauthorized({}),
+    (err) => err.status === 401 && !err.message.includes(FAKE_BENZINGA_KEY) && /HTTP 401/.test(err.message)
+  );
+
+  const leakyHttp = async () => { throw new Error(`socket failed ${FAKE_BENZINGA_KEY}`); };
+  const network = createBenzingaNewsHttpTransport(config, { httpFetch: leakyHttp });
+  await assert.rejects(
+    () => network({}),
+    (err) => !err.message.includes(FAKE_BENZINGA_KEY) && /\[redacted\]/.test(err.message)
+  );
+});
+
+test('benzinga HTTP transport reports malformed payloads without leaking keys', async () => {
+  const config = loadConfig({ BENZINGA_API_KEY: FAKE_BENZINGA_KEY });
+  const transport = createBenzingaNewsHttpTransport(config, {
+    httpFetch: fakeFetch(okResponse({ unexpected: true })),
+  });
+  await assert.rejects(
+    () => transport({}),
+    (err) => err.reason === 'malformed response' && !err.message.includes(FAKE_BENZINGA_KEY)
+  );
 });
 
 test('benzinga fixture maps to canonical normalized event fields', () => {

@@ -27,12 +27,36 @@ import {
   listRecommendationAudits,
   insertUniverseSelections,
   listUniverseSelections,
+  insertEventTerminal,
+  sweepStaleQueueEvents,
+  markUnusableScoresTerminal,
+  listEventTerminals,
+  selectClassificationBacklog,
+  countScoredInWindow,
+  getProviderCursor,
+  advanceProviderCursor,
+  retainProviderCursor,
+  maxPublishedAtForEvents,
 } from '../src/database/paperRuntime.js';
 
 function freshDb() {
   const db = openMemoryDatabase();
   runMigrations(db);
   return db;
+}
+
+function insertEvent(db, { id, ticker = 'AAPL', provider = 'alpaca', publishedAt, receivedAt }) {
+  return Number(db.prepare(
+    `INSERT INTO news_events (provider, provider_event_id, ticker, headline, published_at, received_at)
+     VALUES (?, ?, ?, 'H', ?, ?)`
+  ).run(provider, id, ticker, publishedAt, receivedAt).lastInsertRowid);
+}
+
+function scoreEvent(db, eventId, { parserStatus = 'parsed', promptVersion = 'model_v1' } = {}) {
+  db.prepare(
+    `INSERT INTO sentiment_scores (news_event_id, model, prompt_version, sentiment_score, confidence, parser_status, impact_score, direction)
+     VALUES (?, 'm', ?, 0.7, 0.9, ?, 0.8, 'up')`
+  ).run(eventId, promptVersion, parserStatus);
 }
 
 test('paper option trade helper records a long call audit row and close policy outcome', () => {
@@ -306,4 +330,95 @@ test('universe selections record selected and skipped symbol rationale', () => {
   assert.deepEqual(JSON.parse(rows[1].reasons_json), ['fresh news']);
   assert.equal(rows[1].skipped_reason, 'cap reached');
   closeDatabase(db);
+});
+
+// --- durable backlog: terminal dispositions + selection ---------------------
+
+test('classification backlog selects unscored, in-window, non-terminal events oldest-first', () => {
+  const db = freshDb();
+  const older = insertEvent(db, { id: 'e1', publishedAt: '2026-06-18T13:00:00.000Z', receivedAt: '2026-06-18T13:00:05.000Z' });
+  const newer = insertEvent(db, { id: 'e2', publishedAt: '2026-06-18T13:30:00.000Z', receivedAt: '2026-06-18T13:30:05.000Z' });
+  const scored = insertEvent(db, { id: 'e3', publishedAt: '2026-06-18T13:40:00.000Z', receivedAt: '2026-06-18T13:40:05.000Z' });
+  scoreEvent(db, scored);
+  const outOfWindow = insertEvent(db, { id: 'e4', publishedAt: '2026-06-18T09:00:00.000Z', receivedAt: '2026-06-18T09:00:05.000Z' });
+  const ids = selectClassificationBacklog(db, {
+    promptVersion: 'model_v1', allowedSymbols: ['AAPL'], sinceReceivedIso: '2026-06-18T12:00:00.000Z', limit: 50,
+  }).map((r) => r.id);
+  assert.deepEqual(ids, [older, newer]); // scored + out-of-window excluded, FIFO order
+  assert.equal(countScoredInWindow(db, { promptVersion: 'model_v1', allowedSymbols: ['AAPL'], sinceReceivedIso: '2026-06-18T12:00:00.000Z' }), 1);
+});
+
+test('insertEventTerminal is idempotent and validates the terminal state', () => {
+  const db = freshDb();
+  const id = insertEvent(db, { id: 'e1', publishedAt: '2026-06-18T13:00:00.000Z', receivedAt: '2026-06-18T13:00:05.000Z' });
+  assert.equal(insertEventTerminal(db, { newsEventId: id, terminalState: 'stale_expired', reason: 'aged out' }).inserted, true);
+  assert.equal(insertEventTerminal(db, { newsEventId: id, terminalState: 'stale_expired', reason: 'aged out again' }).inserted, false);
+  assert.throws(() => insertEventTerminal(db, { newsEventId: id, terminalState: 'nonsense', reason: 'x' }), /terminalState/);
+  assert.equal(listEventTerminals(db, { state: 'stale_expired' }).length, 1);
+});
+
+test('sweepStaleQueueEvents terminalizes only the aged-out band and skips processed events', () => {
+  const db = freshDb();
+  const stale = insertEvent(db, { id: 's1', publishedAt: '2026-06-18T12:00:00.000Z', receivedAt: '2026-06-18T12:20:00.000Z' });
+  const fresh = insertEvent(db, { id: 'f1', publishedAt: '2026-06-18T14:20:00.000Z', receivedAt: '2026-06-18T14:20:00.000Z' });
+  const ancient = insertEvent(db, { id: 'a1', publishedAt: '2026-06-18T08:00:00.000Z', receivedAt: '2026-06-18T08:00:00.000Z' });
+  const result = sweepStaleQueueEvents(db, {
+    queueFloorIso: '2026-06-18T12:30:00.000Z', // now - 120m
+    lowerBoundIso: '2026-06-18T10:30:00.000Z', // now - 240m
+    queueAgeMinutes: 120,
+    promptVersion: 'model_v1',
+  });
+  assert.equal(result.count, 1); // only `stale`; `fresh` newer than floor, `ancient` below lower bound
+  const terminals = listEventTerminals(db, { state: 'stale_expired' });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].news_event_id, stale);
+  assert.match(terminals[0].reason, /exceeded max queue age 120 minutes/);
+  assert.ok([fresh, ancient].every((id) => !terminals.some((t) => t.news_event_id === id)));
+});
+
+test('markUnusableScoresTerminal records provider_invalid for unusable scores only', () => {
+  const db = freshDb();
+  const good = insertEvent(db, { id: 'g', publishedAt: '2026-06-18T13:00:00.000Z', receivedAt: '2026-06-18T13:00:00.000Z' });
+  const bad = insertEvent(db, { id: 'b', publishedAt: '2026-06-18T13:00:00.000Z', receivedAt: '2026-06-18T13:00:00.000Z' });
+  scoreEvent(db, good, { parserStatus: 'parsed' });
+  scoreEvent(db, bad, { parserStatus: 'model_error' });
+  assert.equal(markUnusableScoresTerminal(db, [good, bad], 'model_v1').count, 1);
+  const terminals = listEventTerminals(db, { state: 'provider_invalid' });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].news_event_id, bad);
+});
+
+// --- durable per-provider cursors -------------------------------------------
+
+test('advanceProviderCursor sets the watermark; retainProviderCursor keeps it', () => {
+  const db = freshDb();
+  assert.equal(getProviderCursor(db, 'alpaca'), null);
+  advanceProviderCursor(db, { provider: 'alpaca', cursorValue: '2026-06-18T14:00:00.000Z', status: 'ok', pages: 2, attemptedAt: '2026-06-18T14:30:00.000Z' });
+  let cur = getProviderCursor(db, 'alpaca');
+  assert.equal(cur.cursor_value, '2026-06-18T14:00:00.000Z');
+  assert.equal(cur.last_status, 'ok');
+  assert.equal(cur.last_pages, 2);
+  assert.equal(cur.last_advanced_at, '2026-06-18T14:30:00.000Z');
+
+  // Retain (failed): value/last_advanced_at unchanged, status updated.
+  retainProviderCursor(db, { provider: 'alpaca', status: 'failed', attemptedAt: '2026-06-18T14:45:00.000Z' });
+  cur = getProviderCursor(db, 'alpaca');
+  assert.equal(cur.cursor_value, '2026-06-18T14:00:00.000Z');
+  assert.equal(cur.last_status, 'failed');
+  assert.equal(cur.last_advanced_at, '2026-06-18T14:30:00.000Z');
+  assert.equal(cur.last_attempted_at, '2026-06-18T14:45:00.000Z');
+
+  // Empty success (null watermark): keep prior value, but mark status.
+  advanceProviderCursor(db, { provider: 'alpaca', cursorValue: null, status: 'empty', attemptedAt: '2026-06-18T15:00:00.000Z' });
+  cur = getProviderCursor(db, 'alpaca');
+  assert.equal(cur.cursor_value, '2026-06-18T14:00:00.000Z');
+  assert.equal(cur.last_status, 'empty');
+});
+
+test('maxPublishedAtForEvents returns the newest published_at among ids', () => {
+  const db = freshDb();
+  const a = insertEvent(db, { id: 'a', publishedAt: '2026-06-18T13:00:00.000Z', receivedAt: '2026-06-18T13:00:00.000Z' });
+  const b = insertEvent(db, { id: 'b', publishedAt: '2026-06-18T14:00:00.000Z', receivedAt: '2026-06-18T14:00:00.000Z' });
+  assert.equal(maxPublishedAtForEvents(db, [a, b]), '2026-06-18T14:00:00.000Z');
+  assert.equal(maxPublishedAtForEvents(db, []), null);
 });

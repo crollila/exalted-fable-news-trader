@@ -45,6 +45,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
   sizing_max_target_weight: 0.01,
   sizing_enable_confidence_scaling: true,
   sizing_enable_impact_scaling: true,
+  enabled_news_providers: ['alpaca', 'benzinga'],
+  max_events_classified_per_cycle: 10,
+  max_qualifying_events_attempted_per_cycle: 5,
+  provider_cooldown_minutes: 30,
+  provider_max_failures_before_cooldown: 2,
+  duplicate_story_window_minutes: 20,
+  max_queue_age_minutes: 120,
+  provider_max_pages_per_cycle: 3,
   interval_minutes: 15,
   max_iterations: null,
   scrape_target_groups: ['filings', 'company_news'],
@@ -72,6 +80,14 @@ export const SETTING_SPECS = Object.freeze({
   sizing_max_target_weight: { kind: 'num', min: 0.0001, max: 0.01 },
   sizing_enable_confidence_scaling: { kind: 'bool' },
   sizing_enable_impact_scaling: { kind: 'bool' },
+  enabled_news_providers: { kind: 'providers' },
+  max_events_classified_per_cycle: { kind: 'int', min: 1, max: 50 },
+  max_qualifying_events_attempted_per_cycle: { kind: 'int', min: 1, max: 25 },
+  provider_cooldown_minutes: { kind: 'int', min: 1, max: 1440 },
+  provider_max_failures_before_cooldown: { kind: 'int', min: 1, max: 20 },
+  duplicate_story_window_minutes: { kind: 'int', min: 1, max: 390 },
+  max_queue_age_minutes: { kind: 'int', min: 5, max: 1440 },
+  provider_max_pages_per_cycle: { kind: 'int', min: 1, max: 10 },
   interval_minutes: { kind: 'int', min: MIN_INTERVAL_MINUTES, max: 1440 },
   max_iterations: { kind: 'optional_int', min: 1, max: MAX_ITERATIONS_CAP },
   scrape_target_groups: { kind: 'strings' },
@@ -118,6 +134,14 @@ function coerceField(spec, value, fallback, warnings, key) {
       return Array.isArray(value)
         ? [...new Set(value.map((s) => String(s).trim()).filter(Boolean))]
         : fallback;
+    case 'providers': {
+      const allowed = new Set(['alpaca', 'benzinga']);
+      const values = Array.isArray(value) ? value : String(value ?? '').split(',');
+      const providers = [...new Set(values
+        .map((s) => String(s).trim().toLowerCase())
+        .filter((s) => allowed.has(s)))];
+      return providers.length > 0 ? providers : fallback;
+    }
     default:
       return fallback;
   }

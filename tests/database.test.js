@@ -19,6 +19,9 @@ const REQUIRED_TABLES = [
   'paper_broker_account_snapshots',
   'paper_strategy_performance_snapshots',
   'paper_equity_sizing_decisions',
+  'paper_duplicate_suppression_audits',
+  'paper_event_terminals',
+  'paper_provider_cursors',
   'paper_recommendation_audits',
   'paper_universe_selections',
   'risk_state',
@@ -98,6 +101,8 @@ test('migration 004 upgrades an existing database that already applied 001-003',
     '006_paper_broker_truth_performance',
     '007_paper_equity_sizing_decisions',
     '008_paper_cap_and_benchmark_metadata',
+    '009_paper_duplicate_suppression_audit',
+    '010_paper_backlog_and_provider_cursors',
   ]);
   const tables = listTables(db);
   assert.ok(tables.includes('paper_option_trades'));
@@ -119,9 +124,18 @@ test('migration 004 upgrades an existing database that already applied 001-003',
   assert.ok(sizingCols.includes('approved_quantity'));
   assert.ok(sizingCols.includes('manual_override'));
   assert.ok(sizingCols.includes('effective_risk_caps_json'));
+  assert.ok(tables.includes('paper_duplicate_suppression_audits'));
   const perfCols = db.prepare("PRAGMA table_info('paper_strategy_performance_snapshots')").all().map((c) => c.name);
   assert.ok(perfCols.includes('spy_current_source'));
   assert.ok(perfCols.includes('spy_current_alignment_status'));
+  const sessionCols = db.prepare("PRAGMA table_info('paper_runtime_sessions')").all().map((c) => c.name);
+  assert.ok(sessionCols.includes('provider_status_json'));
+  assert.ok(sessionCols.includes('provider_counts_json'));
+  assert.ok(sessionCols.includes('batch_counts_json'));
+  // migration 010 adds the durable backlog pipeline + provider-cursor tables.
+  assert.ok(tables.includes('paper_event_terminals'));
+  assert.ok(tables.includes('paper_provider_cursors'));
+  assert.ok(sessionCols.includes('backlog_counts_json'));
   closeDatabase(db);
 });
 
@@ -160,7 +174,11 @@ test('migration 008 preserves existing paper records and leaves new metadata nul
     .run();
 
   const result = runMigrations(db);
-  assert.deepEqual(result.applied, ['008_paper_cap_and_benchmark_metadata']);
+  assert.deepEqual(result.applied, [
+    '008_paper_cap_and_benchmark_metadata',
+    '009_paper_duplicate_suppression_audit',
+    '010_paper_backlog_and_provider_cursors',
+  ]);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_runtime_sessions').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_strategy_performance_snapshots').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_equity_sizing_decisions').get().n, 1);
@@ -261,11 +279,17 @@ test('live trading defaults to disabled', () => {
   const config = loadConfig({});
   assert.equal(config.liveTradingEnabled, false);
   assert.equal(config.paperTrading, true);
+  assert.deepEqual(config.benzingaNews, { apiKey: null });
   assert.deepEqual(config.paperCapabilities, {
     enableShorts: false,
     enableOptions: false,
     enableMargin: false,
   });
+});
+
+test('config reads Benzinga news key only through central config', () => {
+  const config = loadConfig({ BENZINGA_API_KEY: 'TEST-BZ-KEY' });
+  assert.equal(config.benzingaNews.apiKey, 'TEST-BZ-KEY');
 });
 
 test('paper feature flags default off and parse strict true values', () => {

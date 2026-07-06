@@ -206,6 +206,10 @@ const SESSION_UPDATE_COLUMNS = Object.freeze({
   rejectedReasons: 'rejected_reason_json',
   ordersSubmitted: 'orders_submitted',
   orderStatus: 'order_status_json',
+  providerStatus: 'provider_status_json',
+  providerCounts: 'provider_counts_json',
+  batchCounts: 'batch_counts_json',
+  backlogCounts: 'backlog_counts_json',
   modelRequestCount: 'model_request_count',
   shortsUsed: 'shorts_used',
   optionsUsed: 'options_used',
@@ -220,6 +224,10 @@ const JSON_SESSION_KEYS = new Set([
   'skippedReasons',
   'rejectedReasons',
   'orderStatus',
+  'providerStatus',
+  'providerCounts',
+  'batchCounts',
+  'backlogCounts',
 ]);
 
 export function updatePaperRuntimeSession(db, id, updates = {}) {
@@ -635,6 +643,82 @@ export function getPaperEventAttemptStats(db, eventId) {
   };
 }
 
+export function insertDuplicateSuppressionAudit(
+  db,
+  {
+    suppressedNewsEventId,
+    suppressedProvider,
+    suppressedProviderEventId = null,
+    keptNewsEventId,
+    keptProvider,
+    keptProviderEventId = null,
+    signalIdentityHash,
+    identitySummary,
+    duplicateWindowMinutes,
+    reason,
+  } = {}
+) {
+  const run = db
+    .prepare(
+      `INSERT INTO paper_duplicate_suppression_audits
+         (suppressed_news_event_id, suppressed_provider, suppressed_provider_event_id,
+          kept_news_event_id, kept_provider, kept_provider_event_id,
+          signal_identity_hash, identity_summary, duplicate_window_minutes, reason)
+       VALUES
+         (@suppressedNewsEventId, @suppressedProvider, @suppressedProviderEventId,
+          @keptNewsEventId, @keptProvider, @keptProviderEventId,
+          @signalIdentityHash, @identitySummary, @duplicateWindowMinutes, @reason)`
+    )
+    .run({
+      suppressedNewsEventId: positiveInt('suppressedNewsEventId', suppressedNewsEventId),
+      suppressedProvider: requiredString('suppressedProvider', suppressedProvider),
+      suppressedProviderEventId: boundedText(suppressedProviderEventId, 120),
+      keptNewsEventId: positiveInt('keptNewsEventId', keptNewsEventId),
+      keptProvider: requiredString('keptProvider', keptProvider),
+      keptProviderEventId: boundedText(keptProviderEventId, 120),
+      signalIdentityHash: requiredString('signalIdentityHash', boundedText(signalIdentityHash, 120)),
+      identitySummary: requiredString('identitySummary', boundedText(identitySummary, 500)),
+      duplicateWindowMinutes: positiveInt('duplicateWindowMinutes', duplicateWindowMinutes),
+      reason: requiredString('reason', boundedText(reason, 700)),
+    });
+  return { id: Number(run.lastInsertRowid) };
+}
+
+export function listDuplicateSuppressionAudits(db, { day = null, session = null, limit = 100 } = {}) {
+  const cap = Number.parseInt(limit, 10) || 100;
+  if (session) {
+    const end = session.ended_at ?? new Date().toISOString();
+    return db
+      .prepare(
+        `SELECT *
+           FROM paper_duplicate_suppression_audits
+          WHERE created_at >= ? AND created_at <= ?
+          ORDER BY id DESC
+          LIMIT ?`
+      )
+      .all(session.started_at, end, cap);
+  }
+  if (day) {
+    return db
+      .prepare(
+        `SELECT *
+           FROM paper_duplicate_suppression_audits
+          WHERE substr(created_at, 1, 10) = ?
+          ORDER BY id DESC
+          LIMIT ?`
+      )
+      .all(requiredString('day', day), cap);
+  }
+  return db
+    .prepare(
+      `SELECT *
+         FROM paper_duplicate_suppression_audits
+        ORDER BY id DESC
+        LIMIT ?`
+    )
+    .all(cap);
+}
+
 export function insertBrokerAccountSnapshot(
   db,
   {
@@ -862,4 +946,256 @@ export function getLatestStrategyPerformanceSnapshot(db, { runtimeSessionId = nu
         LIMIT 1`
     )
     .get() ?? null;
+}
+
+// --- Durable backlog pipeline: terminal dispositions --------------------------
+//
+// Most terminal states already have a durable home (paper_trades = submitted,
+// rejected_trades = signal/risk rejected, paper_duplicate_suppression_audits =
+// duplicate-suppressed). Only stale_expired and provider_invalid have no prior
+// home, so they get an explicit distinguishable record here.
+
+const EVENT_TERMINAL_STATES = new Set(['stale_expired', 'provider_invalid']);
+
+/** Record a durable terminal disposition for one event (idempotent per event). */
+export function insertEventTerminal(
+  db,
+  { newsEventId, provider = null, terminalState, promptVersion = null, queueAgeMinutes = null, reason } = {}
+) {
+  const state = String(terminalState ?? '');
+  if (!EVENT_TERMINAL_STATES.has(state)) {
+    throw new Error(`insertEventTerminal: terminalState must be one of ${[...EVENT_TERMINAL_STATES].join('/')}`);
+  }
+  const run = db
+    .prepare(
+      `INSERT OR IGNORE INTO paper_event_terminals
+         (news_event_id, provider, terminal_state, prompt_version, queue_age_minutes, reason)
+       VALUES (@newsEventId, @provider, @terminalState, @promptVersion, @queueAgeMinutes, @reason)`
+    )
+    .run({
+      newsEventId: positiveInt('newsEventId', newsEventId),
+      provider: boundedText(provider, 40),
+      terminalState: state,
+      promptVersion: boundedText(promptVersion, 80),
+      queueAgeMinutes: intOrNull(queueAgeMinutes),
+      reason: requiredString('reason', boundedText(reason, 500)),
+    });
+  return { id: Number(run.lastInsertRowid), inserted: run.changes === 1 };
+}
+
+/**
+ * Sweep queue entries older than the max queue age into a durable stale_expired
+ * terminal, with a persisted sanitized reason. Bounded to a recent band
+ * [lowerBoundIso, queueFloorIso) so it never mass-backfills ancient history, and
+ * idempotent (already-terminal / already-processed events are skipped).
+ * @returns {{ count: number }}
+ */
+export function sweepStaleQueueEvents(
+  db,
+  { queueFloorIso, lowerBoundIso, queueAgeMinutes, promptVersion = null } = {}
+) {
+  const floor = requiredString('queueFloorIso', queueFloorIso);
+  const lower = requiredString('lowerBoundIso', lowerBoundIso);
+  const ageMin = positiveInt('queueAgeMinutes', queueAgeMinutes);
+  const reason = `exceeded max queue age ${ageMin} minutes without a terminal paper decision`;
+  const run = db
+    .prepare(
+      `INSERT OR IGNORE INTO paper_event_terminals
+         (news_event_id, provider, terminal_state, prompt_version, queue_age_minutes, reason)
+       SELECT n.id, n.provider, 'stale_expired', @promptVersion, @ageMin, @reason
+         FROM news_events n
+        WHERE n.received_at < @floor
+          AND n.received_at >= @lower
+          AND NOT EXISTS (SELECT 1 FROM paper_trades pt WHERE pt.news_event_id = n.id)
+          AND NOT EXISTS (SELECT 1 FROM rejected_trades rt WHERE rt.news_event_id = n.id)
+          AND NOT EXISTS (SELECT 1 FROM paper_duplicate_suppression_audits d WHERE d.suppressed_news_event_id = n.id)
+          AND NOT EXISTS (SELECT 1 FROM paper_event_terminals t WHERE t.news_event_id = n.id)`
+    )
+    .run({ promptVersion: boundedText(promptVersion, 80), ageMin, reason, floor, lower });
+  return { count: run.changes };
+}
+
+/**
+ * Mark freshly-classified events whose stored score is NOT usable
+ * (parser_status other than parsed/fallback_used) as a durable provider_invalid
+ * terminal. Such events can never produce a usable paper signal.
+ * @returns {{ count: number }}
+ */
+export function markUnusableScoresTerminal(db, eventIds = [], promptVersion) {
+  const ids = (eventIds ?? []).map((id) => intOrNull(id)).filter((id) => id && id > 0);
+  if (ids.length === 0) return { count: 0 };
+  const placeholders = ids.map(() => '?').join(', ');
+  const run = db
+    .prepare(
+      `INSERT OR IGNORE INTO paper_event_terminals
+         (news_event_id, provider, terminal_state, prompt_version, queue_age_minutes, reason)
+       SELECT n.id, n.provider, 'provider_invalid', s.prompt_version, NULL,
+              'model score parser_status ' || COALESCE(s.parser_status, '(none)') || ' not usable for a paper signal'
+         FROM news_events n
+         JOIN sentiment_scores s ON s.news_event_id = n.id
+        WHERE n.id IN (${placeholders})
+          AND s.prompt_version = ?
+          AND s.parser_status NOT IN ('parsed', 'fallback_used')
+          AND NOT EXISTS (SELECT 1 FROM paper_event_terminals t WHERE t.news_event_id = n.id)`
+    )
+    .run(...ids, requiredString('promptVersion', promptVersion));
+  return { count: run.changes };
+}
+
+export function listEventTerminals(db, { day = null, session = null, state = null, limit = 500 } = {}) {
+  const cap = Number.parseInt(limit, 10) || 500;
+  const conds = [];
+  const params = [];
+  if (state) { conds.push('terminal_state = ?'); params.push(state); }
+  if (session) {
+    const end = session.ended_at ?? new Date().toISOString();
+    conds.push('created_at >= ? AND created_at <= ?');
+    params.push(session.started_at, end);
+  } else if (day) {
+    conds.push('substr(created_at, 1, 10) = ?');
+    params.push(requiredString('day', day));
+  }
+  const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+  return db.prepare(`SELECT * FROM paper_event_terminals ${where} ORDER BY id DESC LIMIT ?`).all(...params, cap);
+}
+
+/**
+ * Unscored, in-window, non-terminal events eligible for classification, oldest
+ * first (FIFO, so the closest-to-aging-out are classified before they expire).
+ * Bounded; callers derive the total-eligible count from the returned length.
+ */
+export function selectClassificationBacklog(
+  db,
+  { promptVersion, allowedSymbols = [], sinceReceivedIso = null, limit = 200 } = {}
+) {
+  const symbols = (allowedSymbols ?? []).map((s) => String(s).trim().toUpperCase()).filter(Boolean);
+  const conds = [
+    'NOT EXISTS (SELECT 1 FROM sentiment_scores s WHERE s.news_event_id = n.id AND s.prompt_version = @promptVersion)',
+    'NOT EXISTS (SELECT 1 FROM paper_event_terminals t WHERE t.news_event_id = n.id)',
+  ];
+  const params = { promptVersion: requiredString('promptVersion', promptVersion) };
+  if (sinceReceivedIso) {
+    conds.push('n.received_at >= @sinceReceivedIso');
+    params.sinceReceivedIso = sinceReceivedIso;
+  }
+  if (symbols.length > 0) {
+    conds.push(`n.ticker IN (${symbols.map((_, i) => `@sym${i}`).join(', ')})`);
+    symbols.forEach((s, i) => { params[`sym${i}`] = s; });
+  }
+  params.limit = Math.min(Math.max(Number.parseInt(limit, 10) || 200, 1), 1000);
+  return db
+    .prepare(
+      `SELECT n.id AS id, n.ticker AS ticker, n.provider AS provider, n.received_at AS received_at
+         FROM news_events n
+        WHERE ${conds.join(' AND ')}
+        ORDER BY n.received_at ASC, n.id ASC
+        LIMIT @limit`
+    )
+    .all(params);
+}
+
+/** Count scored (any status) in-window events, to distinguish already-processed. */
+export function countScoredInWindow(db, { promptVersion, allowedSymbols = [], sinceReceivedIso = null } = {}) {
+  const symbols = (allowedSymbols ?? []).map((s) => String(s).trim().toUpperCase()).filter(Boolean);
+  const conds = ['s.prompt_version = @promptVersion'];
+  const params = { promptVersion: requiredString('promptVersion', promptVersion) };
+  if (sinceReceivedIso) {
+    conds.push('n.received_at >= @sinceReceivedIso');
+    params.sinceReceivedIso = sinceReceivedIso;
+  }
+  if (symbols.length > 0) {
+    conds.push(`n.ticker IN (${symbols.map((_, i) => `@sym${i}`).join(', ')})`);
+    symbols.forEach((s, i) => { params[`sym${i}`] = s; });
+  }
+  const row = db
+    .prepare(
+      `SELECT COUNT(DISTINCT n.id) AS n
+         FROM news_events n
+         JOIN sentiment_scores s ON s.news_event_id = n.id
+        WHERE ${conds.join(' AND ')}`
+    )
+    .get(params);
+  return Number(row?.n ?? 0);
+}
+
+// --- Durable per-provider ingestion cursors ----------------------------------
+
+export function getProviderCursor(db, provider) {
+  return db
+    .prepare('SELECT * FROM paper_provider_cursors WHERE provider = ?')
+    .get(requiredString('provider', provider)) ?? null;
+}
+
+export function listProviderCursors(db) {
+  return db.prepare('SELECT * FROM paper_provider_cursors ORDER BY provider ASC').all();
+}
+
+/** Max published_at among the given event ids (the safe watermark upper bound). */
+export function maxPublishedAtForEvents(db, eventIds = []) {
+  const ids = (eventIds ?? []).map((id) => intOrNull(id)).filter((id) => id && id > 0);
+  if (ids.length === 0) return null;
+  const placeholders = ids.map(() => '?').join(', ');
+  const row = db.prepare(`SELECT MAX(published_at) AS mx FROM news_events WHERE id IN (${placeholders})`).get(...ids);
+  return row?.mx ?? null;
+}
+
+/** Advance (or create) a provider cursor after a successful, persisted ingest. */
+export function advanceProviderCursor(
+  db,
+  { provider, cursorValue = null, status = 'ok', pages = 0, truncated = false, attemptedAt = null, advancedAt = null } = {}
+) {
+  const name = requiredString('provider', provider);
+  const at = attemptedAt ?? new Date().toISOString();
+  const run = db
+    .prepare(
+      `INSERT INTO paper_provider_cursors
+         (provider, cursor_kind, cursor_value, last_status, last_pages, last_truncated, last_advanced_at, last_attempted_at)
+       VALUES (@provider, 'published_watermark', @cursorValue, @status, @pages, @truncated, @advancedAt, @attemptedAt)
+       ON CONFLICT(provider) DO UPDATE SET
+         cursor_value = COALESCE(excluded.cursor_value, paper_provider_cursors.cursor_value),
+         last_status = excluded.last_status,
+         last_pages = excluded.last_pages,
+         last_truncated = excluded.last_truncated,
+         last_advanced_at = CASE WHEN excluded.cursor_value IS NOT NULL
+                                 THEN excluded.last_advanced_at
+                                 ELSE paper_provider_cursors.last_advanced_at END,
+         last_attempted_at = excluded.last_attempted_at,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+    )
+    .run({
+      provider: name,
+      cursorValue: cursorValue ?? null,
+      status: boundedText(status, 40),
+      pages: Math.max(0, Number.parseInt(pages, 10) || 0),
+      truncated: truncated ? 1 : 0,
+      advancedAt: (cursorValue ?? null) ? (advancedAt ?? at) : null,
+      attemptedAt: at,
+    });
+  return { changes: run.changes };
+}
+
+/** Retain a provider cursor (no watermark change) after a failed/skipped attempt. */
+export function retainProviderCursor(db, { provider, status, pages = 0, truncated = false, attemptedAt = null } = {}) {
+  const name = requiredString('provider', provider);
+  const at = attemptedAt ?? new Date().toISOString();
+  const run = db
+    .prepare(
+      `INSERT INTO paper_provider_cursors
+         (provider, cursor_kind, cursor_value, last_status, last_pages, last_truncated, last_attempted_at)
+       VALUES (@provider, 'published_watermark', NULL, @status, @pages, @truncated, @attemptedAt)
+       ON CONFLICT(provider) DO UPDATE SET
+         last_status = excluded.last_status,
+         last_pages = excluded.last_pages,
+         last_truncated = excluded.last_truncated,
+         last_attempted_at = excluded.last_attempted_at,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+    )
+    .run({
+      provider: name,
+      status: boundedText(status, 40),
+      pages: Math.max(0, Number.parseInt(pages, 10) || 0),
+      truncated: truncated ? 1 : 0,
+      attemptedAt: at,
+    });
+  return { changes: run.changes };
 }

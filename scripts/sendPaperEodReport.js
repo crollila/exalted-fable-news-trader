@@ -28,7 +28,9 @@ import { createDiscordWebhookClient } from '../src/notifications/discordWebhookC
 import {
   getLatestStrategyPerformanceSnapshot,
   insertRecommendationAudit,
+  listDuplicateSuppressionAudits,
   listEquitySizingDecisions,
+  listEventTerminals,
 } from '../src/database/paperRuntime.js';
 import {
   formatReturn,
@@ -300,16 +302,27 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     effectiveRiskCaps: parseJsonObject(row.effective_risk_caps_json),
   }));
 
+  const suppressionRows = listDuplicateSuppressionAudits(db, {
+    day: session ? null : day,
+    session,
+    limit: 500,
+  });
+
   const sessions = db
     .prepare(
       `SELECT cycles, fresh_news_count, classification_count,
               classification_status_json, skipped_reason_json, rejected_reason_json,
-              orders_submitted, order_status_json, model_request_count,
+              orders_submitted, order_status_json, provider_status_json,
+              provider_counts_json, batch_counts_json, backlog_counts_json, model_request_count,
               shorts_used, options_used, margin_used, eod_report_status
          FROM paper_runtime_sessions ${session ? 'WHERE id = ?' : dayClause}
         ORDER BY id DESC`
     )
     .all(...(session ? [session.id] : dayParams));
+
+  // Durable backlog terminals (stale_expired / provider_invalid) for the window.
+  const terminalRows = listEventTerminals(db, { day: session ? null : day, session, limit: 500 });
+  const terminalCounts = countRows(terminalRows, 'terminal_state');
 
   const longCount = trades.filter((t) => t.side === 'buy').length;
   const shortCount = trades.filter((t) => t.side === 'sell').length;
@@ -352,6 +365,10 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     rejectedReasons: {},
     ordersSubmitted: 0,
     orderStatus: {},
+    providerStatus: {},
+    providerCounts: {},
+    batchCounts: {},
+    backlogCounts: {},
     modelRequestCount: 0,
     shortsUsed: 0,
     optionsUsed: 0,
@@ -367,6 +384,10 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     mergeCounts(sessionSummary.rejectedReasons, parseJsonMap(s.rejected_reason_json));
     sessionSummary.ordersSubmitted += Number(s.orders_submitted) || 0;
     mergeCounts(sessionSummary.orderStatus, parseJsonMap(s.order_status_json));
+    mergeCounts(sessionSummary.providerStatus, parseJsonMap(s.provider_status_json));
+    mergeCounts(sessionSummary.providerCounts, parseJsonMap(s.provider_counts_json));
+    mergeCounts(sessionSummary.batchCounts, parseJsonMap(s.batch_counts_json));
+    mergeCounts(sessionSummary.backlogCounts, parseJsonMap(s.backlog_counts_json));
     sessionSummary.modelRequestCount += Number(s.model_request_count) || 0;
     sessionSummary.shortsUsed += Number(s.shorts_used) || 0;
     sessionSummary.optionsUsed += Number(s.options_used) || 0;
@@ -404,6 +425,12 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     winningTrades,
     losingTrades,
     rejectedCount: rejections.length,
+    duplicateSuppressedCount: suppressionRows.length,
+    backlog: {
+      ...sessionSummary.backlogCounts,
+      staleExpired: terminalCounts.stale_expired ?? 0,
+      providerInvalid: terminalCounts.provider_invalid ?? 0,
+    },
     proposals: trades.length + rejections.length, // proxy until a learning log exists
     rejectionReasons,
     bestTicker: tickerPnl.length > 0 ? tickerPnl[0][0] : null,
@@ -447,6 +474,17 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
       warnings: [...new Set(sizingWarnings)].slice(0, LIST_CAP),
       samples: sizingSamples,
     },
+    duplicateSuppressions: suppressionRows.slice(0, LIST_CAP).map((row) => ({
+      suppressedEventId: row.suppressed_news_event_id,
+      suppressedProvider: row.suppressed_provider,
+      suppressedProviderEventId: row.suppressed_provider_event_id,
+      keptEventId: row.kept_news_event_id,
+      keptProvider: row.kept_provider,
+      keptProviderEventId: row.kept_provider_event_id,
+      signalIdentityHash: row.signal_identity_hash,
+      identitySummary: row.identity_summary,
+      reason: row.reason,
+    })),
   };
 }
 
@@ -553,6 +591,32 @@ function pctOrUnavailable(value) {
   return Number.isFinite(n) ? `${(n * 100).toFixed(2)}%` : 'unavailable';
 }
 
+/**
+ * Durable backlog / queue-pipeline section. Every qualifying story is tracked:
+ * carried-forward backlog, new inserts, classified, proposal-eligible, attempted,
+ * submitted, deferred (by classify/attempt cap), terminal rejections, duplicate
+ * suppressions, stale-expired, and provider-invalid — each shown separately.
+ */
+function backlogSection(data = {}) {
+  const b = data.backlog ?? {};
+  const g = (k) => Number(b[k] ?? 0);
+  return [
+    '— Durable backlog / queue pipeline —',
+    `  carried-forward backlog:  ${g('carriedForward')}`,
+    `  newly inserted:           ${g('newlyInserted')}`,
+    `  classified:               ${g('classified')}`,
+    `  proposal-eligible:        ${g('proposalEligible')}`,
+    `  attempted:                ${g('attempted')}`,
+    `  submitted:                ${g('submitted')}`,
+    `  deferred (classify cap):  ${g('deferredByClassificationCap')}`,
+    `  deferred (attempt cap):   ${g('deferredByAttemptCap')}`,
+    `  terminal rejections:      ${g('terminalRejections')}`,
+    `  duplicate suppressed:     ${g('duplicateSuppressions')}`,
+    `  stale-expired (terminal): ${g('staleExpired')}`,
+    `  provider-invalid (term.): ${g('providerInvalid')}`,
+  ];
+}
+
 function equitySizingSection(data = {}) {
   const sizing = data.sizing ?? {};
   const lines = ['- Equity sizing decisions (PAPER equities only) -'];
@@ -636,6 +700,7 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
       'This report still proves Discord delivery; once the paper loop runs and',
       'writes paper_trades / rejected_trades, the full narrative appears here.',
     );
+    lines.push('', ...backlogSection(data));
     lines.push('', ...optionExecutionSection(data));
     lines.push('', ...brokerTruthSection(data));
     lines.push('', ...equitySizingSection(data));
@@ -650,6 +715,9 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     `  fresh news inserted:             ${session.freshNewsCount ?? 0}`,
     `  classifications stored:          ${session.classificationCount ?? 0}`,
     `  classification outcomes:         ${fmtMap(session.classificationStatus)}`,
+    `  provider health:                 ${fmtMap(session.providerStatus)}`,
+    `  provider counts:                 ${fmtMap(session.providerCounts)}`,
+    `  batch counts:                    ${fmtMap(session.batchCounts)}`,
     `  skipped reasons:                 ${fmtMap(session.skippedReasons)}`,
     `  proposals (orders + rejections): ${data.proposals}`,
     `  orders submitted:                ${data.ordersSubmitted}`,
@@ -659,6 +727,10 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
     `  equity long / short:             ${data.longCount} / ${data.shortCount}`,
     `  options plans / orders:          ${data.optionsCount}`,
     `  rejected:                        ${data.rejectedCount}`,
+    `  duplicate suppressed:            ${data.duplicateSuppressedCount ?? 0}`,
+    `  backlog carried-forward:         ${data.backlog?.carriedForward ?? 0}`,
+    `  backlog deferred (classify/attempt): ${data.backlog?.deferredByClassificationCap ?? 0} / ${data.backlog?.deferredByAttemptCap ?? 0}`,
+    `  stale-expired (terminal):        ${data.backlog?.staleExpired ?? 0}`,
     `  realized P&L (local approx, USD): ${data.realizedPnl}`,
     `  broker-confirmed owned P&L:      ${moneyOrUnavailable(data.brokerTruth?.exposure?.realizedPnlUsd)}`,
     `  unrealized P&L (if available):   ${data.unrealizedPnl ?? 'unavailable'}`,
@@ -689,6 +761,15 @@ export function buildEodReport(data, { day = null, recommendations = null, strat
   } else {
     for (const r of data.rejectionReasons.slice(0, LIST_CAP)) lines.push(`  ${r.n}x  ${r.reason}`);
   }
+  lines.push('', '- Cross-provider duplicate suppressions -');
+  if ((data.duplicateSuppressions ?? []).length === 0) {
+    lines.push('  (none)');
+  } else {
+    for (const s of data.duplicateSuppressions.slice(0, LIST_CAP)) {
+      lines.push(`  ${s.reason} [${s.identitySummary ?? s.signalIdentityHash}]`);
+    }
+  }
+  lines.push('', ...backlogSection(data));
 
   // Narrative — templated from the figures, deliberately conservative.
   const didNothingButRefuse = data.ordersSubmitted === 0;

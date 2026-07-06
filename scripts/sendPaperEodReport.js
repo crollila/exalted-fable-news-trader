@@ -33,6 +33,7 @@ import {
   formatReturn,
   hydratePerformanceSnapshotRow,
 } from '../src/paper/brokerTruth.js';
+import { getRiskState } from '../src/paper/riskState.js';
 
 /** Short message used by --test-message (proves delivery without a full report). */
 export const EOD_TEST_MESSAGE =
@@ -334,6 +335,7 @@ export function collectEodData(db, { day = null, sessionId = null } = {}) {
     day,
     session: sessionSummary,
     evidenceScope: filter.label,
+    riskState: day ? getRiskState(db, day) : null,
     ...evidence,
     ordersSubmitted: trades.length,
     longCount,
@@ -550,6 +552,9 @@ export function buildEodReport(data, { day = null } = {}) {
     `  broker account excess vs SPY:    ${formatReturn(data.brokerTruth?.performance?.brokerAccountExcessReturn)}`,
     `  equity sizing decisions:         ${data.sizing?.decisions ?? 0}`,
     `  sizing cold/evidence/abstain:    ${data.sizing?.coldStartCount ?? 0} / ${data.sizing?.evidenceWeightedCount ?? 0} / ${data.sizing?.abstainCount ?? 0}`,
+    `  kill switch:                     ${data.riskState?.kill_switch_active === 1
+      ? `ACTIVE — ${data.riskState.kill_switch_reason ?? 'no reason recorded'}`
+      : 'inactive'}`,
     `  shorts/margin usage:             ${session.shortsUsed ?? 0} / ${session.marginUsed ?? 0}`,
     `  model requests/tokens:           ${session.modelRequestCount ?? 0} request(s); token usage unavailable`,
     `  data quality:                    ${dataQuality.status}`,

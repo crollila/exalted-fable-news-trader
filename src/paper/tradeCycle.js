@@ -43,6 +43,12 @@ import {
   scoreBucket,
   SIZING_MODES,
 } from './equitySizing.js';
+import {
+  getRiskState,
+  isKillSwitchActive,
+  tradingDay,
+  updateDailyLossState,
+} from './riskState.js';
 import { MODEL_PROMPT_VERSION } from '../sentiment/modelClassifier.js';
 
 export const DEFAULT_SYMBOLS = Object.freeze(['AAPL']);
@@ -66,6 +72,7 @@ export const PAPER_DECISION_OUTCOMES = Object.freeze({
   ALREADY_PROCESSED_EVENT: 'already_processed_event',
   RISK_REJECTION: 'risk_rejection',
   BROKER_SUBMISSION_ERROR: 'broker_submission_error',
+  KILL_SWITCH_ACTIVE: 'kill_switch_active',
 });
 
 /** Reference-price lookup window (free IEX feed is restricted for very recent data). */
@@ -704,6 +711,35 @@ export async function executeSelectedPaperTrade(
   selected,
   { args, paperClient = null, priceSource = null, nowMs = Date.now() }
 ) {
+  // KILL SWITCH (CLAUDE.md risk rule): when the day's switch is active, refuse
+  // every proposal outright — dry runs included — and log the rejection.
+  const day = tradingDay(nowMs);
+  if (isKillSwitchActive(db, day)) {
+    const state = getRiskState(db, day);
+    const reason = `kill switch active for ${day}: ${state?.kill_switch_reason ?? 'manual/daily-loss halt'}`;
+    const rejectedTradeId = insertRejectedTrade(db, {
+      newsEventId: selected.event.id,
+      ticker: selected.event.ticker,
+      side: null,
+      quantity: null,
+      reason,
+    }).id;
+    const result = {
+      mode: args.executePaper ? 'execute_paper' : 'dry_run',
+      killSwitch: { active: true, tripped: false, reason },
+      equity: null,
+    };
+    return {
+      selected,
+      result,
+      lines: [
+        'Paper trading one-shot (manual, PAPER-only — live trading disabled)',
+        `  ⛔ KILL SWITCH ACTIVE — no proposal evaluated (${reason})`,
+        `    logged:     rejected_trades id ${rejectedTradeId}`,
+      ],
+    };
+  }
+
   const { account, positions, capabilities } = await fetchAccountState(paperClient);
   const asset = await fetchAssetState(paperClient, selected.event.ticker);
   const referencePrice = await fetchReferencePrice(priceSource, selected.event.ticker, nowMs);
@@ -721,7 +757,20 @@ export async function executeSelectedPaperTrade(
     asset,
     paperFeatures: args.paperFeatures ?? DEFAULT_PAPER_FEATURES,
   });
-  return { selected, result, lines: buildPaperReport(result, selected) };
+
+  // After the attempt, refresh the day's realized-loss state and trip the
+  // switch when MAX_DAILY_LOSS_USD is breached (halts the REST of the day).
+  const lossState = updateDailyLossState(db, { day, maxDailyLossUsd: args.maxDailyLossUsd ?? null });
+  result.killSwitch = {
+    active: lossState.tripped || lossState.alreadyActive,
+    tripped: lossState.tripped,
+    reason: lossState.reason,
+  };
+  const lines = buildPaperReport(result, selected);
+  if (lossState.tripped) {
+    lines.push(`  ⛔ KILL SWITCH TRIPPED: ${lossState.reason} — no further paper trades today.`);
+  }
+  return { selected, result, lines };
 }
 
 function hasSignalPass(selected, args) {
@@ -739,6 +788,7 @@ function hasSignalPass(selected, args) {
 }
 
 function tradeOutcome(result) {
+  if (result?.killSwitch?.active && !result?.equity) return PAPER_DECISION_OUTCOMES.KILL_SWITCH_ACTIVE;
   const subs = [result?.equity].filter(Boolean);
   if (subs.some((s) => s.orderError)) return PAPER_DECISION_OUTCOMES.BROKER_SUBMISSION_ERROR;
   if (subs.some((s) => s.decision === 'rejected' && s.risk && !s.risk.approved)) {
@@ -943,6 +993,7 @@ export function buildDecisionCycleReport(cycle, nowMs = Date.now()) {
 
 /** One short sanitized summary line for loop heartbeats. */
 export function oneLineSummary(result) {
+  if (result?.killSwitch?.active && !result?.equity) return 'kill switch active — proposal refused';
   const e = result.equity;
   const sizeTxt = e?.manualQtyOverride
     ? ` manual-qty=${e?.proposal?.quantity ?? '?'}`

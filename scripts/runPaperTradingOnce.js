@@ -132,6 +132,22 @@ export function paperFeaturesFromConfig(config = {}) {
 }
 
 /**
+ * Map the .env risk knobs (config.risk) onto real cap defaults. Strategy
+ * settings and explicit CLI flags still win — these are the floor defaults:
+ *   MAX_POSITION_SIZE_USD   -> caps.maxOrderNotional
+ *   MAX_TRADES_PER_DAY      -> caps.maxDailyPaperOrders
+ *   MAX_TOTAL_EXPOSURE_USD  -> caps.maxGrossExposure
+ * (MAX_DAILY_LOSS_USD feeds the kill switch separately.)
+ */
+export function riskCapDefaultsFromConfig(config = {}) {
+  const caps = {};
+  if (parsePosNum(config?.risk?.maxPositionSizeUsd) !== null) caps.maxOrderNotional = Number(config.risk.maxPositionSizeUsd);
+  if (parsePosNum(config?.risk?.maxTradesPerDay) !== null) caps.maxDailyPaperOrders = Number(config.risk.maxTradesPerDay);
+  if (parsePosNum(config?.risk?.maxTotalExposureUsd) !== null) caps.maxGrossExposure = Number(config.risk.maxTotalExposureUsd);
+  return caps;
+}
+
+/**
  * Parse CLI args. Exported for tests. Every numeric value is validated; unknown
  * flags are ignored; execution stays OFF unless --execute-paper is present.
  */
@@ -147,6 +163,7 @@ export function parseArgs(argv, defaults = {}) {
     classifyLimit: clampInt(defaults.classifyLimit, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT),
     newsLookbackMinutes: clampInt(defaults.newsLookbackMinutes, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES),
     allowShorts: defaults.allowShorts === true,
+    maxDailyLossUsd: parsePosNum(defaults.maxDailyLossUsd),
     thresholds: { ...(defaults.thresholds ?? {}) },
     caps: { ...(defaults.caps ?? {}) },
     sizingSettings: { ...(defaults.sizingSettings ?? {}) },
@@ -173,6 +190,7 @@ export function parseArgs(argv, defaults = {}) {
     else if (flag === '--classify-limit' && next) { args.classifyLimit = clampInt(next, DEFAULT_PAPER_CLASSIFY_LIMIT, 1, MAX_PAPER_CLASSIFY_LIMIT); i += 1; }
     else if (flag === '--news-lookback-minutes' && next) { args.newsLookbackMinutes = clampInt(next, DEFAULT_NEWS_LOOKBACK_MINUTES, 1, MAX_NEWS_LOOKBACK_MINUTES); i += 1; }
     else if (flag === '--allow-shorts') { args.allowShorts = true; }
+    else if (flag === '--max-daily-loss' && next) { args.maxDailyLossUsd = parsePosNum(next); i += 1; }
     else if (flag === '--max-order-notional' && next) { setCap('maxOrderNotional', next); i += 1; }
     else if (flag === '--max-symbol-exposure' && next) { setCap('maxSymbolExposure', next); i += 1; }
     else if (flag === '--max-gross-exposure' && next) { setCap('maxGrossExposure', next); i += 1; }
@@ -190,6 +208,8 @@ async function main() {
   const defaults = strategy.source === 'runtime' ? paperDefaultsFromStrategySettings(strategy.settings) : {};
   const args = parseArgs(process.argv.slice(2), {
     ...defaults,
+    caps: { ...riskCapDefaultsFromConfig(config), ...(defaults.caps ?? {}) },
+    maxDailyLossUsd: config.risk?.maxDailyLossUsd,
     paperFeatures: paperFeaturesFromConfig(config),
   });
 

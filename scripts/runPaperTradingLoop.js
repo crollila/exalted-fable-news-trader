@@ -50,6 +50,7 @@ import {
   buildDecisionCycleReport,
   paperDefaultsFromStrategySettings,
   paperFeaturesFromConfig,
+  riskCapDefaultsFromConfig,
 } from './runPaperTradingOnce.js';
 import { buildClassifier } from './classifyNewsOnce.js';
 import { runEodReport } from './sendPaperEodReport.js';
@@ -192,6 +193,8 @@ async function main() {
   const args = parseArgs(process.argv.slice(2), {
     ...paperDefaults,
     ...loopDefaults,
+    caps: { ...riskCapDefaultsFromConfig(config), ...(paperDefaults.caps ?? {}) },
+    maxDailyLossUsd: config.risk?.maxDailyLossUsd,
     paperFeatures: paperFeaturesFromConfig(config),
   });
   const hasPaperCreds = Boolean(config.alpacaPaper.keyId && config.alpacaPaper.secretKey);

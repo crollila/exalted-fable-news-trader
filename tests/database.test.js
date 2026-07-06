@@ -14,15 +14,22 @@ const REQUIRED_TABLES = [
   'sentiment_scores',
   'price_reactions',
   'paper_trades',
-  'paper_option_trades',
   'paper_runtime_sessions',
   'paper_broker_account_snapshots',
   'paper_strategy_performance_snapshots',
   'paper_equity_sizing_decisions',
-  'paper_recommendation_audits',
-  'paper_universe_selections',
   'risk_state',
   'rejected_trades',
+];
+
+/** Tables created by earlier migrations and dropped again by 011_simplify. */
+const DROPPED_TABLES = [
+  'paper_option_trades',
+  'paper_recommendation_audits',
+  'paper_universe_selections',
+  'paper_duplicate_suppression_audits',
+  'paper_event_terminals',
+  'paper_provider_cursors',
 ];
 
 function freshMigratedDb() {
@@ -74,6 +81,9 @@ test('migration runs successfully and creates all required tables', () => {
   for (const t of REQUIRED_TABLES) {
     assert.ok(tables.includes(t), `missing table: ${t}`);
   }
+  for (const t of DROPPED_TABLES) {
+    assert.ok(!tables.includes(t), `table should be dropped by 011_simplify: ${t}`);
+  }
   assert.ok(tables.includes('schema_migrations'));
   closeDatabase(db);
 });
@@ -88,7 +98,7 @@ test('migration is idempotent (second run applies nothing)', () => {
   closeDatabase(db);
 });
 
-test('migration 004 upgrades an existing database that already applied 001-003', () => {
+test('migration 004+ upgrades an existing database that already applied 001-003', () => {
   const db = openMemoryDatabase();
   applyMigrationVersions(db, ['001_initial', '002_sentiment_scores_phase3', '003_price_reactions_event_study']);
   const result = runMigrations(db);
@@ -98,19 +108,15 @@ test('migration 004 upgrades an existing database that already applied 001-003',
     '006_paper_broker_truth_performance',
     '007_paper_equity_sizing_decisions',
     '008_paper_cap_and_benchmark_metadata',
+    '011_simplify',
   ]);
   const tables = listTables(db);
-  assert.ok(tables.includes('paper_option_trades'));
   assert.ok(tables.includes('paper_runtime_sessions'));
   assert.ok(tables.includes('paper_broker_account_snapshots'));
   assert.ok(tables.includes('paper_strategy_performance_snapshots'));
   assert.ok(tables.includes('paper_equity_sizing_decisions'));
-  // migration 005 adds the option-execution lifecycle columns additively.
-  const optionCols = db.prepare("PRAGMA table_info('paper_option_trades')").all().map((c) => c.name);
-  assert.ok(optionCols.includes('lifecycle_state'));
-  assert.ok(optionCols.includes('entry_order_id'));
-  assert.ok(optionCols.includes('realized_pnl_usd'));
-  assert.ok(optionCols.includes('entry_filled_avg_price'));
+  // 011_simplify drops the tables owned by removed features.
+  assert.ok(!tables.includes('paper_option_trades'));
   const tradeCols = db.prepare("PRAGMA table_info('paper_trades')").all().map((c) => c.name);
   assert.ok(tradeCols.includes('broker_order_id'));
   assert.ok(tradeCols.includes('broker_truth_state'));
@@ -160,7 +166,7 @@ test('migration 008 preserves existing paper records and leaves new metadata nul
     .run();
 
   const result = runMigrations(db);
-  assert.deepEqual(result.applied, ['008_paper_cap_and_benchmark_metadata']);
+  assert.deepEqual(result.applied, ['008_paper_cap_and_benchmark_metadata', '011_simplify']);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_runtime_sessions').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_strategy_performance_snapshots').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM paper_equity_sizing_decisions').get().n, 1);

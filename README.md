@@ -1,5 +1,17 @@
 # ExaltedFable
 
+<!-- project-history -->
+> ### Project history
+>
+> **Exalted Fable News Trader**  
+> **October 2025 - Present** &nbsp;|&nbsp; Independent / Paper Trading
+>
+> Developed an event-driven quantitative equity-trading system using financial news and market events to generate systematic signals. Built event-study and backtesting infrastructure, automated long/short execution, position sizing, portfolio exposure controls, daily-loss limits, trade and notional limits, and continuous performance monitoring. Deployed through paper trading.
+>
+> This repository was published to GitHub in August 2026. GitHub's repository
+> creation date reflects when the code was uploaded here, not when the work was
+> done. This was independent development and paper trading. It was not professional employment or a funded trading desk, and the strategies were not used by other professional traders.
+
 An AI news event-study and Alpaca **paper-trading** research system: ingest
 market news, score it with an LLM, paper-trade the affected stocks under hard
 risk caps, measure every outcome, and learn from the results — so the system
